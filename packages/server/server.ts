@@ -712,6 +712,207 @@ async function handleDiarize(req: Request): Promise<Response> {
 	}
 }
 
+// --- First-launch setup wizard ------------------------------------------------
+//
+// The wizard exists so a non-technical user (e.g. a Mac-using teammate watching
+// a Discord launch) can go from "I downloaded heed" to "I'm transcribing my
+// first meeting" without ever opening a terminal.
+//
+// Three things must be present before heed can do its job:
+//   1. Ollama running on :11434          (LLM backend for AI Notes)
+//   2. ffmpeg in PATH                     (audio capture and conversion)
+//   3. The hardware-default LLM pulled    (the model picker default)
+//
+// All three are detected here. The frontend reads /api/setup/check and decides
+// whether to show the wizard. The install endpoints stream stdout via SSE so
+// the user sees progress in real time.
+
+type DetectedOS = "linux-debian" | "linux-fedora" | "linux-arch" | "linux-other" | "macos" | "windows" | "unknown";
+
+function detectOS(): DetectedOS {
+	if (process.platform === "darwin") return "macos";
+	if (process.platform === "win32") return "windows";
+	if (process.platform !== "linux") return "unknown";
+	try {
+		const osRelease = readFileSync("/etc/os-release", "utf-8");
+		const idLine = osRelease.split("\n").find((l) => l.startsWith("ID="));
+		const idLikeLine = osRelease.split("\n").find((l) => l.startsWith("ID_LIKE="));
+		const id = (idLine?.split("=")[1] || "").replace(/"/g, "").toLowerCase();
+		const idLike = (idLikeLine?.split("=")[1] || "").replace(/"/g, "").toLowerCase();
+		const all = `${id} ${idLike}`;
+		if (/debian|ubuntu|mint|pop/.test(all)) return "linux-debian";
+		if (/fedora|rhel|centos|rocky|alma/.test(all)) return "linux-fedora";
+		if (/arch|manjaro|endeavour|garuda/.test(all)) return "linux-arch";
+		return "linux-other";
+	} catch {
+		return "linux-other";
+	}
+}
+
+function which(cmd: string): string | null {
+	try {
+		const r = Bun.spawnSync(["which", cmd]);
+		const out = new TextDecoder().decode(r.stdout).trim();
+		return out || null;
+	} catch {
+		return null;
+	}
+}
+
+async function isOllamaRunning(): Promise<boolean> {
+	try {
+		const res = await fetch(`${OLLAMA_HOST}/api/tags`, { signal: AbortSignal.timeout(2000) });
+		return res.ok;
+	} catch {
+		return false;
+	}
+}
+
+interface SetupCheckResult {
+	os: DetectedOS;
+	ollama: { installed: boolean; running: boolean };
+	ffmpeg: { installed: boolean; path: string | null };
+	model: { default_id: string | null; installed: boolean };
+	all_ready: boolean;
+}
+
+async function handleSetupCheck(): Promise<Response> {
+	const os = detectOS();
+
+	const ollamaPath = which("ollama");
+	const ollamaRunning = await isOllamaRunning();
+
+	const ffmpegPath = which("ffmpeg");
+
+	// Default model from current config (auto-seeded by hardware on first launch)
+	let defaultModelId: string | null = loadConfig().ollama_model || null;
+	if (!defaultModelId) {
+		// Config not seeded yet — ask Python directly
+		try {
+			const r = await fetch(`${TRANSCRIPTION_SERVER}/hardware`, { signal: AbortSignal.timeout(5000) });
+			if (r.ok) {
+				const hw = await r.json() as { default_model?: string };
+				defaultModelId = hw.default_model || null;
+			}
+		} catch {}
+	}
+
+	// Is the default model already pulled to ollama?
+	let modelInstalled = false;
+	if (defaultModelId && ollamaRunning) {
+		try {
+			const tags = await getInstalledOllamaModels();
+			modelInstalled = tags.has(defaultModelId);
+		} catch {}
+	}
+
+	const result: SetupCheckResult = {
+		os,
+		ollama: { installed: !!ollamaPath, running: ollamaRunning },
+		ffmpeg: { installed: !!ffmpegPath, path: ffmpegPath },
+		model: { default_id: defaultModelId, installed: modelInstalled },
+		all_ready: !!ollamaPath && ollamaRunning && !!ffmpegPath && modelInstalled,
+	};
+	return Response.json(result);
+}
+
+// SSE wrapper that spawns a shell command and streams stdout+stderr line by line.
+// Used by /api/setup/install-ollama and /api/setup/install-ffmpeg.
+function spawnSSEStream(command: string[], shellPipe = false): Response {
+	const encoder = new TextEncoder();
+	const stream = new ReadableStream({
+		async start(controller) {
+			let closed = false;
+			const send = (data: unknown) => {
+				if (closed) return;
+				try {
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+				} catch {
+					closed = true;
+				}
+			};
+
+			try {
+				// shellPipe=true wraps the command in `bash -c "..."` so pipes work.
+				// Used for `curl ... | sh` style installers.
+				const finalCmd = shellPipe ? ["bash", "-c", command.join(" ")] : command;
+				send({ status: "started", cmd: command.join(" ") });
+
+				const proc = Bun.spawn(finalCmd, {
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+
+				// Pipe both stdout and stderr line by line
+				const pumpStream = async (stream: ReadableStream<Uint8Array>, source: "stdout" | "stderr") => {
+					const reader = stream.getReader();
+					const dec = new TextDecoder();
+					let buf = "";
+					while (true) {
+						const { done, value } = await reader.read();
+						if (done) break;
+						buf += dec.decode(value, { stream: true });
+						const lines = buf.split("\n");
+						buf = lines.pop() || "";
+						for (const line of lines) {
+							if (line.trim()) send({ source, line });
+						}
+					}
+					if (buf.trim()) send({ source, line: buf });
+				};
+
+				await Promise.all([
+					pumpStream(proc.stdout as ReadableStream<Uint8Array>, "stdout"),
+					pumpStream(proc.stderr as ReadableStream<Uint8Array>, "stderr"),
+				]);
+
+				const code = await proc.exited;
+				send({ status: "done", code });
+			} catch (e) {
+				send({ status: "error", error: (e as Error).message });
+			} finally {
+				controller.close();
+			}
+		},
+	});
+	return new Response(stream, {
+		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+	});
+}
+
+function handleInstallOllama(): Response {
+	// Official installer: same script the Ollama docs recommend.
+	// Works on macOS (writes to /usr/local/bin) and Linux (asks for sudo password
+	// mid-execution if needed — that part will fail silently in the wizard, in
+	// which case we fall back to the copy-the-command path).
+	return spawnSSEStream(["curl", "-fsSL", "https://ollama.com/install.sh", "|", "sh"], true);
+}
+
+function handleInstallFfmpeg(): Response {
+	const os = detectOS();
+	let cmd: string[];
+	switch (os) {
+		case "linux-debian":
+			cmd = ["sudo", "apt-get", "install", "-y", "ffmpeg"];
+			break;
+		case "linux-fedora":
+			cmd = ["sudo", "dnf", "install", "-y", "ffmpeg"];
+			break;
+		case "linux-arch":
+			cmd = ["sudo", "pacman", "-S", "--noconfirm", "ffmpeg"];
+			break;
+		case "macos":
+			cmd = ["brew", "install", "ffmpeg"];
+			break;
+		default:
+			return Response.json(
+				{ error: `Auto-install of ffmpeg is not supported on ${os}. Install ffmpeg manually.` },
+				{ status: 400 },
+			);
+	}
+	return spawnSSEStream(cmd);
+}
+
 // --- Sessions CRUD ---
 function handleListSessions(): Response {
 	const files = readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".json"));
@@ -1147,6 +1348,9 @@ const server = Bun.serve({
 		if (method === "GET" && url.pathname === "/api/models") return handleListModels();
 		if (method === "POST" && url.pathname === "/api/models/select") return handleSelectModel(req);
 		if (method === "GET" && url.pathname === "/api/models/pull") return handleModelPull(url);
+		if (method === "GET" && url.pathname === "/api/setup/check") return handleSetupCheck();
+		if (method === "GET" && url.pathname === "/api/setup/install-ollama") return handleInstallOllama();
+		if (method === "GET" && url.pathname === "/api/setup/install-ffmpeg") return handleInstallFfmpeg();
 		if (method === "GET" && url.pathname === "/api/meeting-detector") return handleDetectorStream();
 		if (method === "GET" && url.pathname === "/api/download") return handleDownload(url);
 		if (method === "POST" && url.pathname === "/api/recording") return handleSaveRecording(req);

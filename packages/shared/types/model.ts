@@ -48,3 +48,31 @@ export interface PullProgress {
 	error?: string;
 	done?: boolean;
 }
+
+// --- First-launch setup wizard ----------------------------------------------
+export type DetectedOS =
+	| "linux-debian"
+	| "linux-fedora"
+	| "linux-arch"
+	| "linux-other"
+	| "macos"
+	| "windows"
+	| "unknown";
+
+export interface SetupCheckResult {
+	os: DetectedOS;
+	ollama: { installed: boolean; running: boolean };
+	ffmpeg: { installed: boolean; path: string | null };
+	model: { default_id: string | null; installed: boolean };
+	all_ready: boolean;
+}
+
+/** Streamed event from /api/setup/install-{ollama,ffmpeg}. */
+export interface InstallProgress {
+	status?: "started" | "done" | "error";
+	cmd?: string;
+	source?: "stdout" | "stderr";
+	line?: string;
+	code?: number;
+	error?: string;
+}

@@ -1,0 +1,149 @@
+.nav {
+	position: fixed;
+	top: 0;
+	left: 0;
+	right: 0;
+	z-index: 100;
+	background: rgba(248, 250, 252, 0.9);
+	backdrop-filter: blur(12px);
+	border-bottom: 1px solid var(--border-light);
+}
+
+.inner {
+	max-width: var(--container-max);
+	margin: 0 auto;
+	padding: 0 var(--space-6);
+	height: 52px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.brand {
+	font-family: var(--mono);
+	font-weight: 700;
+	font-size: 18px;
+	color: var(--blue);
+}
+
+.tabs {
+	display: flex;
+	gap: var(--space-1);
+}
+
+.tab {
+	font-family: var(--mono);
+	font-size: 12px;
+	color: var(--text-3);
+	padding: 6px 14px;
+	border-radius: var(--radius-sm);
+	cursor: pointer;
+	transition: all 150ms;
+}
+
+.tab:hover {
+	color: var(--text);
+	background: var(--border-light);
+}
+
+.tabActive {
+	color: var(--white);
+	background: var(--blue);
+}
+
+.tabActive:hover {
+	color: var(--white);
+	background: var(--blue);
+}
+
+.status {
+	display: flex;
+	gap: var(--space-2);
+	align-items: center;
+}
+
+.statusItem {
+	display: flex;
+	gap: 4px;
+	align-items: center;
+}
+
+.dot {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--text-3);
+}
+
+.dotOk {
+	background: var(--green);
+}
+
+.dotErr {
+	background: var(--red);
+}
+
+.label {
+	font-family: var(--mono);
+	font-size: 10px;
+	color: var(--text-3);
+}
+
+.modelChip {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 10px;
+	border-radius: 999px;
+	border: 1px solid var(--border-light);
+	background: var(--white);
+	font-family: var(--mono);
+	font-size: 10px;
+	color: var(--text-2);
+	cursor: pointer;
+	transition: all 150ms;
+	margin-right: var(--space-2);
+}
+
+.modelChip:hover {
+	border-color: var(--blue);
+	color: var(--text);
+	background: rgba(59, 130, 246, 0.04);
+}
+
+.modelChipDot {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--green);
+}
+
+.modelChipName {
+	font-weight: 600;
+}
+
+.modelChipBadge {
+	background: rgba(148, 163, 184, 0.25);
+	color: var(--text-3);
+	font-size: 8px;
+	font-weight: 700;
+	padding: 1px 5px;
+	border-radius: 999px;
+	letter-spacing: 0.5px;
+}
+
+.modelChipNew {
+	background: linear-gradient(90deg, #f59e0b, #ef4444);
+	color: white;
+	font-size: 8px;
+	font-weight: 700;
+	padding: 1px 5px;
+	border-radius: 999px;
+	letter-spacing: 0.5px;
+}
+
+@media (max-width: 640px) {
+	.status {
+		display: none;
+	}
+}

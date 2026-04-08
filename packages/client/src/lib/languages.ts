@@ -1,0 +1,30 @@
+/**
+ * All Whisper-supported languages, ordered by popularity.
+ */
+export const WHISPER_LANGUAGES: Array<[code: string, name: string]> = [
+	["auto", "auto-detect"],
+	["en", "English"], ["es", "Spanish"], ["pt", "Portuguese"], ["fr", "French"],
+	["de", "German"], ["it", "Italian"], ["ja", "Japanese"], ["ko", "Korean"],
+	["zh", "Chinese"], ["ru", "Russian"], ["ar", "Arabic"], ["hi", "Hindi"],
+	["nl", "Dutch"], ["pl", "Polish"], ["tr", "Turkish"], ["sv", "Swedish"],
+	["da", "Danish"], ["no", "Norwegian"], ["fi", "Finnish"], ["cs", "Czech"],
+	["el", "Greek"], ["he", "Hebrew"], ["id", "Indonesian"], ["ms", "Malay"],
+	["th", "Thai"], ["vi", "Vietnamese"], ["uk", "Ukrainian"], ["ro", "Romanian"],
+	["hu", "Hungarian"], ["bg", "Bulgarian"], ["ca", "Catalan"], ["hr", "Croatian"],
+	["sk", "Slovak"], ["sl", "Slovenian"], ["et", "Estonian"], ["lv", "Latvian"],
+	["lt", "Lithuanian"], ["fa", "Persian"], ["ur", "Urdu"], ["bn", "Bengali"],
+	["ta", "Tamil"], ["te", "Telugu"], ["mr", "Marathi"], ["ml", "Malayalam"],
+	["kn", "Kannada"], ["gu", "Gujarati"], ["pa", "Punjabi"], ["ne", "Nepali"],
+	["si", "Sinhala"], ["my", "Burmese"], ["km", "Khmer"], ["lo", "Lao"],
+	["ka", "Georgian"], ["hy", "Armenian"], ["az", "Azerbaijani"], ["kk", "Kazakh"],
+	["uz", "Uzbek"], ["mn", "Mongolian"], ["af", "Afrikaans"], ["sw", "Swahili"],
+	["am", "Amharic"], ["yo", "Yoruba"], ["ha", "Hausa"], ["so", "Somali"],
+	["mt", "Maltese"], ["cy", "Welsh"], ["ga", "Irish"], ["is", "Icelandic"],
+	["mk", "Macedonian"], ["sr", "Serbian"], ["bs", "Bosnian"], ["sq", "Albanian"],
+	["eu", "Basque"], ["gl", "Galician"], ["be", "Belarusian"], ["lb", "Luxembourgish"],
+	["fo", "Faroese"], ["oc", "Occitan"], ["br", "Breton"], ["mi", "Maori"],
+	["haw", "Hawaiian"], ["mg", "Malagasy"], ["sn", "Shona"], ["ln", "Lingala"],
+	["yi", "Yiddish"], ["la", "Latin"], ["sa", "Sanskrit"], ["ba", "Bashkir"],
+	["tt", "Tatar"], ["tk", "Turkmen"], ["tg", "Tajik"], ["ps", "Pashto"],
+	["bo", "Tibetan"], ["as", "Assamese"], ["or", "Odia"], ["nn", "Nynorsk"],
+];

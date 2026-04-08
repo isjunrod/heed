@@ -6,6 +6,7 @@ import { RecordPage } from "@/components/recording/RecordPage.tsx";
 import { SessionsPage } from "@/components/sessions/SessionsPage.tsx";
 import { ActionsPage } from "@/components/actions/ActionsPage.tsx";
 import { MeetingBanner } from "@/components/meeting-detector/MeetingBanner.tsx";
+import { SetupWizard } from "@/components/setup/SetupWizard.tsx";
 import styles from "./App.module.css";
 
 export function App() {
@@ -22,6 +23,7 @@ export function App() {
 			<Footer />
 			<Toast />
 			<MeetingBanner />
+			<SetupWizard />
 		</>
 	);
 }

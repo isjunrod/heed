@@ -1,0 +1,16 @@
+node_modules/
+.env
+*.log
+.vercel
+dist/
+.astro/
+*.tsbuildinfo
+
+# Personal working notes — never committed
+pendits.txt
+PLAN.md
+.claude/
+.vscode/
+
+# Backup of original crafter-station/trx git history (not part of heed)
+.git.backup-trx-fork/

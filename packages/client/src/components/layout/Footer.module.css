@@ -1,0 +1,23 @@
+.footer {
+	max-width: var(--container-max);
+	margin: 0 auto;
+	padding: var(--space-6);
+	border-top: 2px dashed var(--border);
+	text-align: center;
+	margin-top: auto;
+}
+
+.text {
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--text-3);
+}
+
+.text a {
+	color: var(--text-3);
+	text-decoration: none;
+}
+
+.text a:hover {
+	color: var(--blue);
+}

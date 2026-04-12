@@ -16,3 +16,6 @@ PLAN.md
 .git.backup-trx-fork/
 __pycache__/
 records/
+recordings/*.wav
+recordings/*.srt
+recordings/*.txt

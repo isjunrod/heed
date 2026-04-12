@@ -52,9 +52,30 @@
 	padding-left: 12px;
 	font-size: 14px;
 	line-height: 1.7;
-	display: flex;
-	align-items: flex-start;
-	gap: 8px;
+}
+
+.speakerLineTyping {
+	animation: fadeIn 300ms ease-out;
+}
+
+.cursor {
+	display: inline-block;
+	width: 2px;
+	height: 1em;
+	background: var(--blue);
+	margin-left: 2px;
+	vertical-align: text-bottom;
+	animation: blink 800ms step-end infinite;
+}
+
+@keyframes fadeIn {
+	from { opacity: 0; transform: translateY(4px); }
+	to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes blink {
+	0%, 100% { opacity: 1; }
+	50% { opacity: 0; }
 }
 
 .overlapBadge {

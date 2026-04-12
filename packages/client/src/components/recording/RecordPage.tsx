@@ -21,15 +21,16 @@ export function RecordPage() {
 		getLanguage: () => language,
 	});
 
-	const { recording, processing, segments, transcript } = useRecordingStore();
-	// Show result card the MOMENT recording starts. Live segments stream in
-	// progressively. The user never sees a blank waiting screen.
+	const { recording, processing, processStep, segments, transcript } = useRecordingStore();
+	// Show result card when recording (live preview) or after stop (final result)
 	const showResult = recording || processing || segments.length > 0 || !!transcript;
+	// Block recording button while processing (transcribing + diarizing after stop)
+	const canRecord = !recording && !processing;
 
 	// Listen for meeting detector trigger
 	useEffect(() => {
 		const handler = () => {
-			if (!useRecordingStore.getState().recording) start();
+			if (!useRecordingStore.getState().recording && !useRecordingStore.getState().processing) start();
 		};
 		window.addEventListener("heed:start-recording", handler);
 		return () => window.removeEventListener("heed:start-recording", handler);
@@ -43,13 +44,22 @@ export function RecordPage() {
 					<Visualizer ref={micBars} barCount={24} variant="mic" label="Microphone" />
 					<Visualizer ref={systemBars} barCount={24} variant="system" label="System" />
 				</div>
-				<RecordButton recording={recording} onClick={() => (recording ? stop() : start())} />
+				{processing ? (
+					<div className={styles.processingStatus}>
+						<div className={styles.processingDot} />
+						<span>{processStep || "Finalizing..."}</span>
+					</div>
+				) : (
+					<RecordButton recording={recording} onClick={() => (recording ? stop() : canRecord ? start() : null)} />
+				)}
 				<div className={styles.label}>
-					{recording ? "Recording... click to stop" : !showResult ? "Click to start recording" : ""}
+					{recording ? "Recording... click to stop" : processing ? "" : !showResult ? "Click to start recording" : ""}
 				</div>
-				<div className={styles.options}>
-					<LanguageSelect value={language} onChange={setLanguage} />
-				</div>
+				{!processing && (
+					<div className={styles.options}>
+						<LanguageSelect value={language} onChange={setLanguage} />
+					</div>
+				)}
 			</div>
 
 			{showResult && <ResultCard />}

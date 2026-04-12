@@ -1,10 +1,36 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import type { Segment } from "@heed/shared";
 import { speakerColor } from "@/lib/colors.ts";
 import { useUIStore } from "@/stores/ui.ts";
 import { voicesApi } from "@/api/voices.ts";
 import { SpeakerMergeMenu } from "./SpeakerMergeMenu.tsx";
 import styles from "./SpeakerView.module.css";
+
+/** Reveals text character by character with a typing effect. */
+function TypewriterText({ text, speed = 20 }: { text: string; speed?: number }) {
+	const [charCount, setCharCount] = useState(0);
+	const textRef = useRef(text);
+
+	useEffect(() => {
+		// If the text changed (new segment replaced this one), show full immediately
+		if (textRef.current !== text) {
+			textRef.current = text;
+			setCharCount(text.length);
+			return;
+		}
+		if (charCount >= text.length) return;
+		const timer = setTimeout(() => setCharCount((c) => c + 1), speed);
+		return () => clearTimeout(timer);
+	}, [charCount, text, speed]);
+
+	// Reset when component mounts with new text
+	useEffect(() => {
+		setCharCount(0);
+		textRef.current = text;
+	}, [text]);
+
+	return <>{text.slice(0, charCount)}</>;
+}
 
 interface Props {
 	segments: Segment[];
@@ -88,6 +114,7 @@ export function SpeakerView({ segments, speakers, embeddings, speakerNames, onRe
 				lastSpeaker = seg.speaker;
 				const displayName = speakerNames[seg.speaker] || seg.speaker;
 				const color = colorMap[seg.speaker] || "#94A3B8";
+				const isLast = i === segments.length - 1;
 				return (
 					<div key={i}>
 						{showHeader && (
@@ -95,7 +122,10 @@ export function SpeakerView({ segments, speakers, embeddings, speakerNames, onRe
 								{displayName}
 							</div>
 						)}
-						<div className={styles.speakerLine}>{seg.text}</div>
+						<div className={`${styles.speakerLine} ${isLast ? styles.speakerLineTyping : ""}`}>
+							{isLast ? <TypewriterText text={seg.text} speed={25} /> : seg.text}
+							{isLast && <span className={styles.cursor} />}
+						</div>
 					</div>
 				);
 			})}

@@ -59,10 +59,9 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 				try { sysLevelsRef.current = JSON.parse(e.data); } catch {}
 			};
 
-			// Live transcription via SSE — segments appear while recording.
-			// Delay 2s to ensure ffmpeg has written enough audio to the WAV.
+			// Live transcription via SSE — segments appear while recording
 			setTimeout(() => {
-				if (!useRecordingStore.getState().recording) return; // stopped already
+				if (!useRecordingStore.getState().recording) return;
 				const liveLang = encodeURIComponent(getLanguage());
 				liveEventRef.current = new EventSource(`/api/sysrecord/live?lang=${liveLang}`);
 				liveEventRef.current.addEventListener("segment", (e) => {
@@ -72,7 +71,6 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 					} catch {}
 				});
 				liveEventRef.current.onerror = () => {
-					// Don't let EventSource auto-reconnect endlessly
 					liveEventRef.current?.close();
 					liveEventRef.current = null;
 				};
@@ -166,19 +164,20 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 	const finalizeRecording = async (audioPath: string) => {
 		const lang = getLanguage();
 		const seconds = useRecordingStore.getState().seconds;
-		// Grab the live segments already in the store — NO re-transcription needed
-		const liveSegments = useRecordingStore.getState().segments;
+		// DON'T clear live segments — they stay visible in Speakers.
+		// We only need to: 1) transcribe remaining chunks, 2) run pyannote.
+		useRecordingStore.getState().setProcessing("Finishing transcription...", 30);
 
-		// Call /api/finalize: runs ONLY pyannote on sys channel for speaker reveal.
-		// Whisper already ran during live recording — we reuse those segments.
-		const res = await fetch("/api/finalize", {
+		// Send live segments + WAV to the server. It transcribes the remaining
+		// audio (what live missed) and runs pyannote for speaker reveal.
+		const res = await fetch("/api/transcribe", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ wavPath: audioPath, liveSegments, language: lang }),
+			body: JSON.stringify({ url: audioPath, language: lang, diarize: true }),
 		});
 
 		if (!res.body) {
-			showToast("Finalize failed: no response");
+			showToast("Finalize failed");
 			return;
 		}
 
@@ -199,52 +198,64 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 				} else if (line.startsWith("data: ")) {
 					try {
 						const data = JSON.parse(line.slice(6));
-						if (currentEvent === "speakers") {
-							useRecordingStore.getState().revealSpeakers(
-								data.speakers || [],
-								data.segments || [],
-								data.embeddings || {},
-							);
-						} else if (currentEvent === "result") {
-							useRecordingStore.getState().setResult(data);
-							// Save session
-							const words = (data.text || "").split(/\s+/).filter(Boolean);
-							const heuristicTitle = words.length > 0
-								? words.slice(0, 8).join(" ") + (words.length > 8 ? "..." : "")
-								: `Meeting ${fmtDate(new Date().toISOString())}`;
+						switch (currentEvent) {
+							case "step":
+								useRecordingStore.getState().setProcessing(data.message, useRecordingStore.getState().processProgress);
+								break;
+							case "segment":
+								// Append NEW segments from the full processing
+								// (these fill in what live missed)
+								useRecordingStore.getState().appendSegment(data);
+								break;
+							case "speakers":
+								// Pyannote finished — replace "???" with real names
+								useRecordingStore.getState().revealSpeakers(
+									data.speakers || [],
+									data.segments || [],
+									data.embeddings || {},
+								);
+								break;
+							case "result": {
+								useRecordingStore.getState().setResult(data);
+								const words = (data.text || "").split(/\s+/).filter(Boolean);
+								const heuristicTitle = words.length > 0
+									? words.slice(0, 8).join(" ") + (words.length > 8 ? "..." : "")
+									: `Meeting ${fmtDate(new Date().toISOString())}`;
 
-							const created = await sessionsApi.create({
-								title: heuristicTitle,
-								createdAt: new Date().toISOString(),
-								duration: seconds,
-								language: lang,
-								transcript: data.text,
-								speakers: data.speakers || [],
-								segments: data.segments || [],
-								embeddings: data.embeddings || {},
-								files: data.files,
-								aiNotes: "",
-								summary: "",
-								tags: [],
-								pinned: false,
-							});
-							useRecordingStore.getState().setSessionId(created.id);
-							reloadSessions();
-							// Background: smart title via Ollama
-							if (data.text && data.text.length > 30) {
-								notesApi.summaryLine(data.text)
-									.then((d) => {
-										if (d.summary) {
-											sessionsApi.patch(created.id, {
-												title: d.summary,
-												summary: d.summary,
-											}).then(() => reloadSessions());
-										}
-									})
-									.catch(() => {});
+								const created = await sessionsApi.create({
+									title: heuristicTitle,
+									createdAt: new Date().toISOString(),
+									duration: seconds,
+									language: lang,
+									transcript: data.text,
+									speakers: data.speakers || [],
+									segments: data.segments || [],
+									embeddings: data.embeddings || {},
+									files: data.files,
+									aiNotes: "",
+									summary: "",
+									tags: [],
+									pinned: false,
+								});
+								useRecordingStore.getState().setSessionId(created.id);
+								reloadSessions();
+								if (data.text && data.text.length > 30) {
+									notesApi.summaryLine(data.text)
+										.then((d) => {
+											if (d.summary) {
+												sessionsApi.patch(created.id, {
+													title: d.summary,
+													summary: d.summary,
+												}).then(() => reloadSessions());
+											}
+										})
+										.catch(() => {});
+								}
+								break;
 							}
-						} else if (currentEvent === "error") {
-							showToast(`Error: ${data.message}`);
+							case "error":
+								showToast(`Error: ${data.message}`);
+								break;
 						}
 					} catch {}
 				}

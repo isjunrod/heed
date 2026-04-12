@@ -1,12 +1,13 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join, resolve, extname } from "node:path";
-import { tmpdir, homedir, cpus } from "node:os";
+import { homedir, cpus } from "node:os";
 import { downloadFromUrl, normalizeAudio } from "./lib/media.ts";
 const TRANSCRIPTION_SERVER = process.env.HEED_TRANSCRIPTION_URL || "http://127.0.0.1:5002";
 
 const PORT = Number(process.env.PORT) || 5001;
 const STATIC_ROOT = join(import.meta.dir, "..", "client", "dist");
-const UPLOAD_DIR = join(tmpdir(), "heed-uploads");
+// Recordings stored in the project root
+const UPLOAD_DIR = join(import.meta.dir, "..", "..", "recordings");
 const APP_DIR = join(homedir(), ".heed-app");
 const SESSIONS_DIR = join(APP_DIR, "sessions");
 const TEMPLATES_DIR = join(APP_DIR, "templates");
@@ -366,6 +367,7 @@ async function handleTranscribe(req: Request): Promise<Response> {
 				let finalSegments: unknown[] = [];
 				let finalEmbeddings: Record<string, unknown> = {};
 				let finalLanguage = language;
+				let finalWhisperModel = "small";
 
 				while (true) {
 					const { done, value } = await reader.read();
@@ -397,6 +399,7 @@ async function handleTranscribe(req: Request): Promise<Response> {
 									case "done":
 										finalText = data.text || "";
 										finalLanguage = data.language || language;
+										finalWhisperModel = data.model || finalWhisperModel;
 										finalFiles = data.files || { wav: wavPath, srt: data.srt_path || "", txt: data.txt_path || "" };
 										break;
 									case "complete":
@@ -404,7 +407,7 @@ async function handleTranscribe(req: Request): Promise<Response> {
 											success: true,
 											text: finalText,
 											files: finalFiles,
-											metadata: { language: finalLanguage, model: "small" },
+											metadata: { language: finalLanguage, model: finalWhisperModel },
 											speakers: finalSpeakers,
 											segments: finalSegments,
 											embeddings: finalEmbeddings,
@@ -738,156 +741,6 @@ function handleModelPull(url: URL): Response {
 }
 
 // --- Speaker diarization via transcription server ---
-// --- Finalize: reuse live segments, only run pyannote for speaker reveal ---
-// Called after recording stops. The live transcription already produced all the
-// text segments. We just need pyannote to identify who said what on the sys channel.
-async function handleFinalize(req: Request): Promise<Response> {
-	const body = await req.json() as {
-		wavPath: string;
-		liveSegments: Array<{ speaker: string; start: number; end: number; text: string; channel?: string }>;
-		language?: string;
-	};
-
-	if (!body.wavPath || !body.liveSegments) {
-		return Response.json({ error: "wavPath and liveSegments required" }, { status: 400 });
-	}
-
-	const isDual = body.wavPath.includes("dual-capture-");
-	const micSegments = body.liveSegments.filter((s) => s.channel === "mic" || s.speaker === "Me");
-	const sysSegments = body.liveSegments.filter((s) => s.channel === "sys" || s.speaker === "???");
-
-	// If not dual or no sys segments, just return what we have — no pyannote needed
-	if (!isDual || sysSegments.length === 0) {
-		const text = body.liveSegments.map((s) => s.text).join("\n");
-		return Response.json({
-			success: true,
-			text,
-			speakers: [...new Set(body.liveSegments.map((s) => s.speaker))],
-			segments: body.liveSegments,
-			embeddings: {},
-			files: { wav: body.wavPath, srt: "", txt: "" },
-			metadata: { language: body.language || "es", model: "base" },
-		});
-	}
-
-	// Split stereo → extract sys channel for pyannote
-	const encoder = new TextEncoder();
-	const stream = new ReadableStream({
-		async start(controller) {
-			let closed = false;
-			const send = (event: string, data: unknown) => {
-				if (closed) return;
-				try {
-					controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-				} catch { closed = true; }
-			};
-
-			try {
-				send("step", { message: "Identifying speakers..." });
-
-				// Extract sys channel
-				const base = body.wavPath.replace(/\.wav$/, "");
-				const sysPath = `${base}-sys.wav`;
-				Bun.spawnSync([
-					"ffmpeg", "-y", "-loglevel", "error",
-					"-i", body.wavPath,
-					"-af", "pan=mono|c0=c1",
-					"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-					sysPath,
-				]);
-
-				// Run pyannote ONLY on sys channel
-				const diarRes = await fetch(`${TRANSCRIPTION_SERVER}/diarize`, {
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ wav_path: sysPath }),
-				});
-
-				let speakers = ["Me"];
-				let embeddings: Record<string, unknown> = {};
-				let finalSegments = [...micSegments];
-
-				if (diarRes.ok) {
-					const diarData = await diarRes.json() as any;
-					const diarSegs = diarData.segments || [];
-					const diarSpeakers = diarData.speakers || [];
-					embeddings = diarData.embeddings || {};
-
-					// Assign speaker labels to sys segments using pyannote output
-					if (diarSegs.length > 0 && sysSegments.length > 0) {
-						for (const seg of sysSegments) {
-							const mid = (seg.start + seg.end) / 2;
-							let bestSpeaker = diarSpeakers[0] || "Speaker 1";
-							let bestOverlap = 0;
-							for (const d of diarSegs) {
-								const ov = Math.max(0, Math.min(seg.end, d.end) - Math.max(seg.start, d.start));
-								if (ov > bestOverlap) {
-									bestOverlap = ov;
-									bestSpeaker = d.speaker;
-								}
-							}
-							if (bestOverlap === 0) {
-								// Nearest segment by time
-								let nearest = diarSegs[0];
-								let minDist = Infinity;
-								for (const d of diarSegs) {
-									const dist = Math.min(Math.abs(d.start - mid), Math.abs(d.end - mid));
-									if (dist < minDist) { minDist = dist; nearest = d; }
-								}
-								bestSpeaker = nearest?.speaker || "Speaker 1";
-							}
-							finalSegments.push({ ...seg, speaker: bestSpeaker });
-						}
-					} else {
-						// Pyannote found no speakers — label all sys as Speaker 1
-						for (const seg of sysSegments) {
-							finalSegments.push({ ...seg, speaker: "Speaker 1" });
-						}
-						if (!diarSpeakers.length) diarSpeakers.push("Speaker 1");
-					}
-
-					speakers = ["Me", ...diarSpeakers];
-				} else {
-					// Pyannote failed — keep sys segments as "Speaker 1"
-					for (const seg of sysSegments) {
-						finalSegments.push({ ...seg, speaker: "Speaker 1" });
-					}
-					speakers = ["Me", "Speaker 1"];
-				}
-
-				// Sort by timestamp
-				finalSegments.sort((a, b) => a.start - b.start);
-
-				const text = finalSegments.map((s) => s.text).join("\n");
-
-				// Speaker reveal event
-				send("speakers", { speakers, segments: finalSegments, embeddings });
-
-				// Final result
-				send("result", {
-					success: true,
-					text,
-					speakers,
-					segments: finalSegments,
-					embeddings,
-					files: { wav: body.wavPath, srt: "", txt: "" },
-					metadata: { language: body.language || "es", model: "base" },
-					wordCount: text.split(/\s+/).filter(Boolean).length,
-					timing: {},
-				});
-			} catch (e) {
-				send("error", { message: (e as Error).message });
-			} finally {
-				controller.close();
-			}
-		},
-	});
-
-	return new Response(stream, {
-		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
-	});
-}
-
 // --- First-launch setup wizard ------------------------------------------------
 //
 // The wizard exists so a non-technical user (e.g. a Mac-using teammate watching
@@ -1428,8 +1281,8 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 
 				try {
 					// Extract chunk with volume normalization.
-					// Whisper tiny is less sensitive than small — without normalization,
-					// quiet mic audio (-50dB) gets missed. dynaudnorm boosts it to ~-20dB.
+					// Whisper can miss very quiet mic audio without gain normalization;
+					// dynaudnorm boosts low-volume speech to a safer range.
 					const channelFilter = isDual ? "pan=mono|c0=c0," : "";
 					Bun.spawnSync([
 						"ffmpeg", "-y", "-loglevel", "error",
@@ -1445,7 +1298,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 						console.log(`[heed] live: chunk extraction failed or too small`);
 						return;
 					}
-					console.log(`[heed] live: chunk extracted ${Bun.file(chunkPath).size}b, sending to whisper-tiny...`);
+					console.log(`[heed] live: chunk extracted ${Bun.file(chunkPath).size}b, sending to whisper...`);
 
 					// Send to whisper and track how long it takes
 					const whisperStart = Date.now();
@@ -1496,7 +1349,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 							sysChunkPath,
 						]);
 						if (existsSync(sysChunkPath) && Bun.file(sysChunkPath).size > 1000) {
-							const sysRes = await fetch(`${TRANSCRIPTION_SERVER}/transcribe`, {
+							const sysRes = await fetch(`${TRANSCRIPTION_SERVER}/transcribe-live`, {
 								method: "POST",
 								headers: { "Content-Type": "application/json" },
 								body: JSON.stringify({ wav_path: sysChunkPath, language: lang }),
@@ -1570,6 +1423,7 @@ function stopLiveTranscribe() {
 }
 
 async function handleSysRecordStop(): Promise<Response> {
+	const offset = liveTranscribeOffset; // save before reset
 	stopLiveTranscribe();
 	if (!recorderProc || !recorderPath) return Response.json({ error: "Not recording" }, { status: 400 });
 
@@ -1585,7 +1439,7 @@ async function handleSysRecordStop(): Promise<Response> {
 
 	if (!existsSync(path)) return Response.json({ error: "Recording file not created" }, { status: 500 });
 
-	return Response.json({ path });
+	return Response.json({ path, liveOffset: offset });
 }
 
 // --- Meeting auto-detector ---
@@ -1802,6 +1656,8 @@ async function handleHealth(): Promise<Response> {
 		ollama: ollamaOk,
 		whisper: txServer.whisper || false,
 		pyannote: txServer.pyannote || false,
+		whisper_info: txServer.whisper_info || null,
+		pyannote_info: txServer.pyannote_info || null,
 	});
 }
 
@@ -1814,7 +1670,7 @@ const server = Bun.serve({
 		const method = req.method;
 
 		if (method === "POST" && url.pathname === "/api/transcribe") return handleTranscribe(req);
-		if (method === "POST" && url.pathname === "/api/finalize") return handleFinalize(req);
+		// /api/finalize removed — post-stop now uses /api/transcribe (process-stream)
 		if (method === "POST" && url.pathname === "/api/summarize") return handleSummarize(req);
 		if (method === "POST" && url.pathname === "/api/summary-line") return handleSummaryLine(req);
 		// /api/diarize removed — finalize handles speaker identification now

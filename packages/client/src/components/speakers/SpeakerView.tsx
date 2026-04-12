@@ -90,14 +90,7 @@ export function SpeakerView({ segments, speakers, embeddings, speakerNames, onRe
 								{displayName}
 							</div>
 						)}
-						<div className={styles.speakerLine}>
-							<span>{seg.text}</span>
-							{seg.overlap && (
-								<span className={styles.overlapBadge} title="Overlapping speech detected">
-									overlap
-								</span>
-							)}
-						</div>
+						<div className={styles.speakerLine}>{seg.text}</div>
 					</div>
 				);
 			})}

@@ -14,11 +14,12 @@ export async function generateNotes(
 	language: string,
 	templateId: string | undefined,
 	handlers: SummaryHandlers,
+	force_cpu = false,
 ): Promise<string> {
 	const res = await fetch(buildUrl("/api/summarize"), {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ transcript, language, templateId }),
+		body: JSON.stringify({ transcript, language, templateId, force_cpu }),
 	});
 	if (!res.ok || !res.body) {
 		const msg = `Summarize failed: ${res.status}`;

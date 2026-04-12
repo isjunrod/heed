@@ -37,7 +37,9 @@ export function SessionItem({ session, onOpen, onMenu, onTagClick }: Props) {
 						</span>
 					)}
 				</div>
-				{session.summary && <div className={styles.summary}>{session.summary}</div>}
+				{session.summary && session.summary !== session.title && (
+					<div className={styles.summary}>{session.summary}</div>
+				)}
 				<div className={styles.meta}>{meta}</div>
 			</div>
 			<div className={styles.actions}>

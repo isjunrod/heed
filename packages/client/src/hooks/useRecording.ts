@@ -172,11 +172,19 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 						});
 						useRecordingStore.getState().setSessionId(created.id);
 						reloadSessions();
-						// Generate one-line summary in background
+						// Smart auto-title: Ollama reads the transcript and generates a
+						// concrete title like "Pipeline review with Karen" instead of
+						// the placeholder "Meeting Apr 11, 2026". Also stored as summary
+						// for the subtitle line in the sessions list.
 						if (result.text && result.text.length > 30) {
 							notesApi.summaryLine(result.text)
 								.then((d) => {
-									if (d.summary) sessionsApi.patch(created.id, { summary: d.summary }).then(() => reloadSessions());
+									if (d.summary) {
+										sessionsApi.patch(created.id, {
+											title: d.summary,
+											summary: d.summary,
+										}).then(() => reloadSessions());
+									}
 								})
 								.catch(() => {});
 						}

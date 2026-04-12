@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import type { Session } from "@heed/shared";
 import { useSessionsStore } from "@/stores/sessions.ts";
 import { useTemplatesStore } from "@/stores/templates.ts";
+import { useModelsStore } from "@/stores/models.ts";
 import { useUIStore } from "@/stores/ui.ts";
 import { generateNotes } from "@/api/notes.ts";
 import { fmtDate, fmtDuration } from "@/lib/format.ts";
@@ -22,6 +23,8 @@ export function SessionDetail({ session, onBack }: Props) {
 	const update = useSessionsStore((s) => s.update);
 	const showToast = useUIStore((s) => s.showToast);
 	const { templates, load: loadTemplates } = useTemplatesStore();
+	const modelsData = useModelsStore((s) => s.data);
+	const loadModels = useModelsStore((s) => s.load);
 
 	const [activeTab, setActiveTab] = useState<TabId>("transcript");
 	const [templateId, setTemplateId] = useState<string>("general");
@@ -29,7 +32,10 @@ export function SessionDetail({ session, onBack }: Props) {
 	const [streamingNotes, setStreamingNotes] = useState("");
 	const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({});
 
-	useEffect(() => { loadTemplates(); }, [loadTemplates]);
+	useEffect(() => { loadTemplates(); loadModels(); }, [loadTemplates, loadModels]);
+
+	const currentModel = modelsData?.models.find((m) => m.id === modelsData.current?.id);
+	const fitsGpu = currentModel?.gpu_runtime_ok !== false;
 
 	const hasSpeakers = (session.segments?.length || 0) > 0;
 	const meta = [
@@ -61,7 +67,7 @@ export function SessionDetail({ session, onBack }: Props) {
 		showToast("Copied");
 	};
 
-	const handleGenerate = async () => {
+	const handleGenerate = async (forceCpu = false) => {
 		if (!session.transcript || generating) return;
 		setGenerating(true);
 		setStreamingNotes("");
@@ -148,6 +154,14 @@ export function SessionDetail({ session, onBack }: Props) {
 				/>
 			)}
 
+			{activeTab === "notes" && !fitsGpu && !generating && (
+				<div className={styles.gpuWarn}>
+					<span className={styles.gpuWarnText}>
+						{currentModel?.name || "Current model"} doesn't fit in your GPU right now. It will run on CPU (~3-4x slower).
+					</span>
+				</div>
+			)}
+
 			<div className={styles.actionsRow} style={{ marginTop: "12px" }}>
 				<button className={styles.btn} onClick={handleCopy}>Copy</button>
 				{activeTab === "notes" && (
@@ -161,9 +175,15 @@ export function SessionDetail({ session, onBack }: Props) {
 								<option key={t.id} value={t.id}>{t.name}</option>
 							))}
 						</select>
-						<button className={styles.btn} onClick={handleGenerate} disabled={generating}>
-							{generating ? "Generating..." : "Generate AI notes"}
-						</button>
+						{fitsGpu ? (
+							<button className={styles.btn} onClick={() => handleGenerate(false)} disabled={generating}>
+								{generating ? "Generating..." : "Generate AI notes"}
+							</button>
+						) : (
+							<button className={styles.btnCpu} onClick={() => handleGenerate(true)} disabled={generating}>
+								{generating ? "Generating on CPU..." : "Generate on CPU"}
+							</button>
+						)}
 					</>
 				)}
 			</div>

@@ -21,8 +21,10 @@ export function RecordPage() {
 		getLanguage: () => language,
 	});
 
-	const { recording, processing, processStep, processProgress, transcript } = useRecordingStore();
-	const showResult = !!transcript && !processing;
+	const { recording, processing, segments, transcript } = useRecordingStore();
+	// Show result card the MOMENT recording starts. Live segments stream in
+	// progressively. The user never sees a blank waiting screen.
+	const showResult = recording || processing || segments.length > 0 || !!transcript;
 
 	// Listen for meeting detector trigger
 	useEffect(() => {
@@ -43,24 +45,12 @@ export function RecordPage() {
 				</div>
 				<RecordButton recording={recording} onClick={() => (recording ? stop() : start())} />
 				<div className={styles.label}>
-					{recording ? "Recording... click to stop" : processing ? "Processing..." : "Click to start recording"}
+					{recording ? "Recording... click to stop" : !showResult ? "Click to start recording" : ""}
 				</div>
 				<div className={styles.options}>
 					<LanguageSelect value={language} onChange={setLanguage} />
 				</div>
 			</div>
-
-			{processing && (
-				<div className={styles.progressCard}>
-					<div className={styles.progressStep}>
-						<div className={styles.progressDot} />
-						<span>{processStep}</span>
-					</div>
-					<div className={styles.progressBar}>
-						<div className={styles.progressFill} style={{ width: `${processProgress}%` }} />
-					</div>
-				</div>
-			)}
 
 			{showResult && <ResultCard />}
 		</div>

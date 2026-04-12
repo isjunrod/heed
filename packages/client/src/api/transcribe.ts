@@ -11,6 +11,10 @@ export interface TranscribeOptions {
 export interface TranscribeHandlers {
 	onStep?: (msg: string) => void;
 	onProgress?: (percent: number) => void;
+	/** Progressive: each segment as whisper produces it (text appears immediately) */
+	onSegment?: (segment: { speaker: string; start: number; end: number; text: string; channel: string }) => void;
+	/** Speaker reveal: pyannote finished, here are the real names + final segments */
+	onSpeakers?: (data: { speakers: string[]; segments: unknown[]; embeddings: Record<string, unknown> }) => void;
 	onResult?: (result: TranscribeResult) => void;
 	onError?: (msg: string) => void;
 }
@@ -51,6 +55,12 @@ export async function transcribe(opts: TranscribeOptions, handlers: TranscribeHa
 							break;
 						case "progress":
 							handlers.onProgress?.(data.percent);
+							break;
+						case "segment":
+							handlers.onSegment?.(data);
+							break;
+						case "speakers":
+							handlers.onSpeakers?.(data);
 							break;
 						case "result":
 							handlers.onResult?.(data as TranscribeResult);

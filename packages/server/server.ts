@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join, resolve, extname } from "node:path";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir, homedir, cpus } from "node:os";
 import { downloadFromUrl, normalizeAudio } from "./lib/media.ts";
 const TRANSCRIPTION_SERVER = process.env.HEED_TRANSCRIPTION_URL || "http://127.0.0.1:5002";
 
@@ -333,52 +333,93 @@ async function handleTranscribe(req: Request): Promise<Response> {
 					wavPath = input;
 				}
 
-				send("step", { message: "Transcribing with Whisper (GPU)..." });
-				send("progress", { percent: 30 });
+				send("step", { message: "Processing audio..." });
 
-				// Detect dual-channel captures (L=mic, R=system) → enables overlap-aware diarization.
+				// Detect dual-channel captures (L=mic, R=system)
 				const isDualChannel = /(?:^|\/)dual-capture-/.test(wavPath);
 
-				// Call Python transcription server (auto-detect speaker count)
-				const processBody: Record<string, unknown> = {
-					wav_path: wavPath,
-					language,
-					diarize,
-					dual_channel: isDualChannel,
-				};
-
-				const txRes = await fetch(`${TRANSCRIPTION_SERVER}/process`, {
+				// Use the STREAMING endpoint: Python emits segments one by one via SSE.
+				// We forward each event to the frontend so text appears progressively.
+				const streamRes = await fetch(`${TRANSCRIPTION_SERVER}/process-stream`, {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify(processBody),
+					body: JSON.stringify({
+						wav_path: wavPath,
+						language,
+						diarize,
+						dual_channel: isDualChannel,
+					}),
 				});
 
-				if (!txRes.ok) {
-					const err = await txRes.text();
+				if (!streamRes.ok || !streamRes.body) {
+					const err = await streamRes.text();
 					throw new Error(`Transcription server error: ${err}`);
 				}
 
-				const txData = await txRes.json() as any;
-				send("progress", { percent: 100 });
+				// Parse SSE from Python and forward to frontend
+				const reader = streamRes.body.getReader();
+				const dec = new TextDecoder();
+				let buf = "";
+				let finalText = "";
+				let finalFiles: Record<string, string> = { wav: wavPath, srt: "", txt: "" };
+				let finalSpeakers: string[] = [];
+				let finalSegments: unknown[] = [];
+				let finalEmbeddings: Record<string, unknown> = {};
+				let finalLanguage = language;
 
-				const txResult = txData.transcribe || {};
-				const diarResult = txData.diarize || {};
-
-				send("result", {
-					success: true,
-					text: txResult.text || "",
-					files: {
-						wav: wavPath,
-						srt: txResult.srt_path || "",
-						txt: txResult.txt_path || "",
-					},
-					metadata: { language: txResult.language || language, model: "small" },
-					diarizedText: diarResult.text || "",
-					speakers: diarResult.speakers || [],
-					segments: diarResult.segments || [],
-					wordCount: (txResult.text || "").split(/\s+/).filter(Boolean).length,
-					timing: { total_ms: txData.total_time_ms },
-				});
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					buf += dec.decode(value, { stream: true });
+					const lines = buf.split("\n");
+					buf = lines.pop() || "";
+					let currentEvent = "";
+					for (const line of lines) {
+						if (line.startsWith("event: ")) {
+							currentEvent = line.slice(7).trim();
+						} else if (line.startsWith("data: ")) {
+							try {
+								const data = JSON.parse(line.slice(6));
+								// Forward progressive events to frontend
+								switch (currentEvent) {
+									case "segment":
+										send("segment", data);
+										break;
+									case "phase":
+										send("step", { message: data.phase === "identifying_speakers" ? "Identifying speakers..." : `Transcribing ${data.channel || ""}...` });
+										break;
+									case "speakers":
+										finalSpeakers = data.speakers || [];
+										finalSegments = data.segments || [];
+										finalEmbeddings = data.embeddings || {};
+										send("speakers", data);
+										break;
+									case "done":
+										finalText = data.text || "";
+										finalLanguage = data.language || language;
+										finalFiles = data.files || { wav: wavPath, srt: data.srt_path || "", txt: data.txt_path || "" };
+										break;
+									case "complete":
+										send("result", {
+											success: true,
+											text: finalText,
+											files: finalFiles,
+											metadata: { language: finalLanguage, model: "small" },
+											speakers: finalSpeakers,
+											segments: finalSegments,
+											embeddings: finalEmbeddings,
+											wordCount: finalText.split(/\s+/).filter(Boolean).length,
+											timing: data,
+										});
+										break;
+									case "error":
+										send("error", data);
+										break;
+								}
+							} catch {}
+						}
+					}
+				}
 			} catch (e) {
 				send("error", { message: (e as Error).message });
 			} finally {
@@ -469,6 +510,14 @@ async function handleSummarize(req: Request): Promise<Response> {
 	// force_cpu comes from the UI when the user explicitly acknowledged the warning
 	// and chose "Generate on CPU". Otherwise we use the config value.
 	const numGpu = force_cpu ? 0 : (getCurrentNumGpu() ?? undefined);
+	// When running on CPU, limit threads to half the available cores so the OS,
+	// Chrome, and the rest of the system don't freeze. Without this, Ollama
+	// saturates ALL cores and the desktop becomes unresponsive for 30-60 seconds.
+	const cpuCores = cpus().length || 4;
+	const cpuThreadLimit = Math.max(2, Math.floor(cpuCores / 2));
+	const ollamaOptions: Record<string, number> = {};
+	if (numGpu !== undefined) ollamaOptions.num_gpu = numGpu;
+	if (numGpu === 0) ollamaOptions.num_thread = cpuThreadLimit;
 	const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -476,7 +525,7 @@ async function handleSummarize(req: Request): Promise<Response> {
 			model: getCurrentModel(),
 			stream: true,
 			keep_alive: 0,
-			...(numGpu !== undefined ? { options: { num_gpu: numGpu } } : {}),
+			...(Object.keys(ollamaOptions).length > 0 ? { options: ollamaOptions } : {}),
 			messages: [
 				{ role: "system", content: systemPrompt },
 				{ role: "user", content: `Generate meeting notes from this transcript:\n\n${transcript}` },
@@ -689,26 +738,154 @@ function handleModelPull(url: URL): Response {
 }
 
 // --- Speaker diarization via transcription server ---
-async function handleDiarize(req: Request): Promise<Response> {
-	const body = await req.json();
-	if (!body.wavPath) return Response.json({ error: "No wavPath provided" }, { status: 400 });
+// --- Finalize: reuse live segments, only run pyannote for speaker reveal ---
+// Called after recording stops. The live transcription already produced all the
+// text segments. We just need pyannote to identify who said what on the sys channel.
+async function handleFinalize(req: Request): Promise<Response> {
+	const body = await req.json() as {
+		wavPath: string;
+		liveSegments: Array<{ speaker: string; start: number; end: number; text: string; channel?: string }>;
+		language?: string;
+	};
 
-	try {
-		const res = await fetch(`${TRANSCRIPTION_SERVER}/diarize`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				wav_path: body.wavPath,
-				srt_path: body.srtPath || null,
-				min_speakers: body.minSpeakers || null,
-				max_speakers: body.maxSpeakers || null,
-			}),
-		});
-		const data = await res.json();
-		return Response.json(data);
-	} catch (e) {
-		return Response.json({ error: `Diarization failed: ${(e as Error).message}` }, { status: 500 });
+	if (!body.wavPath || !body.liveSegments) {
+		return Response.json({ error: "wavPath and liveSegments required" }, { status: 400 });
 	}
+
+	const isDual = body.wavPath.includes("dual-capture-");
+	const micSegments = body.liveSegments.filter((s) => s.channel === "mic" || s.speaker === "Me");
+	const sysSegments = body.liveSegments.filter((s) => s.channel === "sys" || s.speaker === "???");
+
+	// If not dual or no sys segments, just return what we have — no pyannote needed
+	if (!isDual || sysSegments.length === 0) {
+		const text = body.liveSegments.map((s) => s.text).join("\n");
+		return Response.json({
+			success: true,
+			text,
+			speakers: [...new Set(body.liveSegments.map((s) => s.speaker))],
+			segments: body.liveSegments,
+			embeddings: {},
+			files: { wav: body.wavPath, srt: "", txt: "" },
+			metadata: { language: body.language || "es", model: "base" },
+		});
+	}
+
+	// Split stereo → extract sys channel for pyannote
+	const encoder = new TextEncoder();
+	const stream = new ReadableStream({
+		async start(controller) {
+			let closed = false;
+			const send = (event: string, data: unknown) => {
+				if (closed) return;
+				try {
+					controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+				} catch { closed = true; }
+			};
+
+			try {
+				send("step", { message: "Identifying speakers..." });
+
+				// Extract sys channel
+				const base = body.wavPath.replace(/\.wav$/, "");
+				const sysPath = `${base}-sys.wav`;
+				Bun.spawnSync([
+					"ffmpeg", "-y", "-loglevel", "error",
+					"-i", body.wavPath,
+					"-af", "pan=mono|c0=c1",
+					"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+					sysPath,
+				]);
+
+				// Run pyannote ONLY on sys channel
+				const diarRes = await fetch(`${TRANSCRIPTION_SERVER}/diarize`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ wav_path: sysPath }),
+				});
+
+				let speakers = ["Me"];
+				let embeddings: Record<string, unknown> = {};
+				let finalSegments = [...micSegments];
+
+				if (diarRes.ok) {
+					const diarData = await diarRes.json() as any;
+					const diarSegs = diarData.segments || [];
+					const diarSpeakers = diarData.speakers || [];
+					embeddings = diarData.embeddings || {};
+
+					// Assign speaker labels to sys segments using pyannote output
+					if (diarSegs.length > 0 && sysSegments.length > 0) {
+						for (const seg of sysSegments) {
+							const mid = (seg.start + seg.end) / 2;
+							let bestSpeaker = diarSpeakers[0] || "Speaker 1";
+							let bestOverlap = 0;
+							for (const d of diarSegs) {
+								const ov = Math.max(0, Math.min(seg.end, d.end) - Math.max(seg.start, d.start));
+								if (ov > bestOverlap) {
+									bestOverlap = ov;
+									bestSpeaker = d.speaker;
+								}
+							}
+							if (bestOverlap === 0) {
+								// Nearest segment by time
+								let nearest = diarSegs[0];
+								let minDist = Infinity;
+								for (const d of diarSegs) {
+									const dist = Math.min(Math.abs(d.start - mid), Math.abs(d.end - mid));
+									if (dist < minDist) { minDist = dist; nearest = d; }
+								}
+								bestSpeaker = nearest?.speaker || "Speaker 1";
+							}
+							finalSegments.push({ ...seg, speaker: bestSpeaker });
+						}
+					} else {
+						// Pyannote found no speakers — label all sys as Speaker 1
+						for (const seg of sysSegments) {
+							finalSegments.push({ ...seg, speaker: "Speaker 1" });
+						}
+						if (!diarSpeakers.length) diarSpeakers.push("Speaker 1");
+					}
+
+					speakers = ["Me", ...diarSpeakers];
+				} else {
+					// Pyannote failed — keep sys segments as "Speaker 1"
+					for (const seg of sysSegments) {
+						finalSegments.push({ ...seg, speaker: "Speaker 1" });
+					}
+					speakers = ["Me", "Speaker 1"];
+				}
+
+				// Sort by timestamp
+				finalSegments.sort((a, b) => a.start - b.start);
+
+				const text = finalSegments.map((s) => s.text).join("\n");
+
+				// Speaker reveal event
+				send("speakers", { speakers, segments: finalSegments, embeddings });
+
+				// Final result
+				send("result", {
+					success: true,
+					text,
+					speakers,
+					segments: finalSegments,
+					embeddings,
+					files: { wav: body.wavPath, srt: "", txt: "" },
+					metadata: { language: body.language || "es", model: "base" },
+					wordCount: text.split(/\s+/).filter(Boolean).length,
+					timing: {},
+				});
+			} catch (e) {
+				send("error", { message: (e as Error).message });
+			} finally {
+				controller.close();
+			}
+		},
+	});
+
+	return new Response(stream, {
+		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+	});
 }
 
 // --- First-launch setup wizard ------------------------------------------------
@@ -973,7 +1150,13 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 	const text = transcript.slice(0, 1500);
 
 	try {
-		const numGpu = getCurrentNumGpu();
+		// Smart titles are tiny (12 words) — always force CPU to avoid fighting
+		// pyannote for VRAM and to prevent the GPU-load crash we hit in production.
+		const cores = cpus().length || 4;
+		const summaryOpts: Record<string, number> = {
+			num_gpu: 0,
+			num_thread: Math.max(2, Math.floor(cores / 2)),
+		};
 		const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -981,7 +1164,7 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 				model: getCurrentModel(),
 				stream: false,
 				keep_alive: 0,
-				...(numGpu !== undefined ? { options: { num_gpu: numGpu } } : {}),
+				...(Object.keys(summaryOpts).length > 0 ? { options: summaryOpts } : {}),
 				messages: [
 					{
 						role: "system",
@@ -1000,55 +1183,45 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 	}
 }
 
-// --- File download ---
-function handleDownload(url: URL): Response {
-	const filePath = url.searchParams.get("path");
-	if (!filePath || !existsSync(filePath)) return Response.json({ error: "File not found" }, { status: 404 });
-	const content = readFileSync(filePath, "utf-8");
-	const name = filePath.split("/").pop() || "download.txt";
-	return new Response(content, {
-		headers: { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": `attachment; filename="${name}"` },
-	});
-}
-
-// --- Save recording from browser (mic) ---
-async function handleSaveRecording(req: Request): Promise<Response> {
-	const formData = await req.formData();
-	const file = formData.get("audio") as File;
-	if (!file) return Response.json({ error: "No audio" }, { status: 400 });
-	const safeName = `recording-${Date.now()}.webm`;
-	const filePath = join(UPLOAD_DIR, safeName);
-	const buffer = await file.arrayBuffer();
-	writeFileSync(filePath, Buffer.from(buffer));
-	return Response.json({ path: filePath });
-}
-
 // --- Audio recording via ffmpeg + PipeWire/PulseAudio ---
 // Uses ffmpeg -f pulse which works reliably with PipeWire's PulseAudio layer
 let recorderProc: ReturnType<typeof Bun.spawn> | null = null;
 let recorderPath: string | null = null;
 
 function getMonitorSource(): string | null {
+	// Use the default SINK's monitor — this captures whatever audio the user hears
+	// through their selected output device (headphones, speakers, USB DAC, etc.)
+	try {
+		const sinkResult = Bun.spawnSync(["pactl", "get-default-sink"]);
+		const defaultSink = new TextDecoder().decode(sinkResult.stdout).trim();
+		if (defaultSink) {
+			const monitor = `${defaultSink}.monitor`;
+			// Verify it exists
+			const listResult = Bun.spawnSync(["pactl", "list", "sources", "short"]);
+			const output = new TextDecoder().decode(listResult.stdout);
+			if (output.includes(monitor)) return monitor;
+		}
+	} catch {}
+	// Fallback: any non-suspended monitor
 	const result = Bun.spawnSync(["pactl", "list", "sources", "short"]);
 	const output = new TextDecoder().decode(result.stdout);
-	const lines = output.split("\n");
-	for (const line of lines) {
+	for (const line of output.split("\n")) {
 		if (line.includes(".monitor") && !line.includes("SUSPENDED")) return line.split("\t")[1];
 	}
-	// Fallback: any monitor
-	for (const line of lines) {
+	for (const line of output.split("\n")) {
 		if (line.includes(".monitor")) return line.split("\t")[1];
 	}
 	return null;
 }
 
 function getMicSource(): string | null {
-	const result = Bun.spawnSync(["pactl", "list", "sources", "short"]);
-	const output = new TextDecoder().decode(result.stdout);
-	const lines = output.split("\n");
-	for (const line of lines) {
-		if (!line.includes(".monitor") && line.includes("input") && !line.includes("SUSPENDED")) return line.split("\t")[1];
-	}
+	// Use PipeWire's default source — respects whatever the user selected
+	// in their system audio settings (USB mic, laptop mic, headset, etc.)
+	try {
+		const result = Bun.spawnSync(["pactl", "get-default-source"]);
+		const defaultSource = new TextDecoder().decode(result.stdout).trim();
+		if (defaultSource && !defaultSource.includes(".monitor")) return defaultSource;
+	} catch {}
 	return "default";
 }
 
@@ -1060,6 +1233,9 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 		try { recorderProc.kill("SIGKILL"); } catch {}
 		recorderProc = null;
 	}
+	// Reset live transcription state for the new recording
+	liveTranscribeOffset = 0;
+	liveChunkProcessing = false;
 
 	const ts = Date.now();
 	const mic = getMicSource() || "default";
@@ -1173,7 +1349,228 @@ function handleSysLevelsSSE(): Response {
 	});
 }
 
+// --- Live transcription during recording ---
+// Every 5 seconds, extracts the latest audio chunk from the growing WAV,
+// sends it to faster-whisper, and streams segments to the frontend via SSE.
+// The user sees their words appear in real-time while recording.
+let liveTranscribeInterval: ReturnType<typeof setInterval> | null = null;
+let liveTranscribeOffset = 0; // seconds already processed
+let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
+
+function handleLiveTranscribe(reqUrl?: URL): Response {
+	if (!recorderProc || !recorderPath) {
+		// Return an SSE stream that immediately closes instead of a JSON error.
+		// This prevents EventSource from seeing a non-SSE response and erroring.
+		const encoder = new TextEncoder();
+		return new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(encoder.encode("event: error\ndata: {\"message\":\"Not recording\"}\n\n"));
+					controller.close();
+				},
+			}),
+			{ headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } },
+		);
+	}
+
+	const wavPath = recorderPath;
+	const isDual = wavPath.includes("dual-capture-");
+	const CHUNK_DURATION = 5; // seconds per chunk
+	let interval = 6000; // ms between chunks
+	const lang = reqUrl?.searchParams.get("lang") || "es";
+	// DON'T reset offset here — if EventSource reconnects, we continue from
+	// where we left off instead of re-processing the same first chunk forever.
+	// Offset is only reset in stopLiveTranscribe() when recording actually stops.
+
+	const encoder = new TextEncoder();
+	const stream = new ReadableStream({
+		start(controller) {
+			let closed = false;
+			const send = (event: string, data: unknown) => {
+				if (closed) return;
+				try {
+					controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+				} catch {
+					closed = true;
+				}
+			};
+
+			// Send a heartbeat immediately so the client knows the connection is alive
+			send("heartbeat", { ts: Date.now() });
+
+			const processChunk = async () => {
+				if (closed || !recorderProc) {
+					if (liveTranscribeInterval) clearInterval(liveTranscribeInterval);
+					return;
+				}
+				// Lock: skip if previous chunk is still processing
+				if (liveChunkProcessing) return;
+				liveChunkProcessing = true;
+
+				// Check if the file has enough new data
+				if (!existsSync(wavPath)) {
+					console.log("[heed] live: WAV not found yet");
+					return;
+				}
+				const fileSize = Bun.file(wavPath).size;
+				const bytesPerSec = isDual ? 64000 : 32000;
+				const fileDurationS = (fileSize - 44) / bytesPerSec;
+				console.log(`[heed] live: file=${fileSize}b duration=${fileDurationS.toFixed(1)}s offset=${liveTranscribeOffset.toFixed(1)}s`);
+				if (fileDurationS < liveTranscribeOffset + 2) {
+					liveChunkProcessing = false;
+					return;
+				}
+
+				const startTime = Math.max(0, liveTranscribeOffset);
+				// Advance offset NOW so the next tick doesn't re-process the same chunk
+				liveTranscribeOffset = startTime + CHUNK_DURATION;
+				const chunkPath = join(UPLOAD_DIR, `live-chunk-${Date.now()}.wav`);
+
+				try {
+					// Extract chunk with volume normalization.
+					// Whisper tiny is less sensitive than small — without normalization,
+					// quiet mic audio (-50dB) gets missed. dynaudnorm boosts it to ~-20dB.
+					const channelFilter = isDual ? "pan=mono|c0=c0," : "";
+					Bun.spawnSync([
+						"ffmpeg", "-y", "-loglevel", "error",
+						"-i", wavPath,
+						"-af", `${channelFilter}dynaudnorm=p=0.9:m=10`,
+						"-ss", String(startTime),
+						"-t", String(CHUNK_DURATION),
+						"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+						chunkPath,
+					]);
+
+					if (!existsSync(chunkPath) || Bun.file(chunkPath).size < 1000) {
+						console.log(`[heed] live: chunk extraction failed or too small`);
+						return;
+					}
+					console.log(`[heed] live: chunk extracted ${Bun.file(chunkPath).size}b, sending to whisper-tiny...`);
+
+					// Send to whisper and track how long it takes
+					const whisperStart = Date.now();
+					const txRes = await fetch(`${TRANSCRIPTION_SERVER}/transcribe-live`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ wav_path: chunkPath, language: lang }),
+					});
+					const whisperMs = Date.now() - whisperStart;
+
+					// Adaptive interval: if whisper is slow (RAM pressure), back off
+					// to avoid queueing up chunks that pile on even more pressure.
+					if (whisperMs > 8000 && liveTranscribeInterval) {
+						clearInterval(liveTranscribeInterval);
+						interval = Math.min(interval + 3000, 15000);
+						liveTranscribeInterval = setInterval(processChunk, interval);
+						console.log(`[heed] live: whisper took ${whisperMs}ms, backing off to ${interval}ms interval`);
+					}
+
+					console.log(`[heed] live: whisper responded in ${whisperMs}ms, status=${txRes.status}`);
+					if (txRes.ok) {
+						const tx = await txRes.json() as { text?: string; srt_path?: string };
+						const text = (tx.text || "").trim();
+						console.log(`[heed] live: whisper text="${text.slice(0, 50)}" (${text.length} chars)`);
+						if (text && text.length > 3) {
+							send("segment", {
+								speaker: "Me",
+								start: Math.round(startTime * 100) / 100,
+								end: Math.round(Math.min(startTime + CHUNK_DURATION, fileDurationS) * 100) / 100,
+								text,
+								channel: "mic",
+								live: true,
+							});
+						}
+					}
+
+					// System channel live transcription (speakers labeled "???" until pyannote
+					// runs after recording stops and reveals real names)
+					if (isDual) {
+						const sysChunkPath = join(UPLOAD_DIR, `live-chunk-sys-${Date.now()}.wav`);
+						Bun.spawnSync([
+							"ffmpeg", "-y", "-loglevel", "error",
+							"-i", wavPath,
+							"-af", "pan=mono|c0=c1,dynaudnorm=p=0.9:m=10",
+							"-ss", String(startTime),
+							"-t", String(CHUNK_DURATION),
+							"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+							sysChunkPath,
+						]);
+						if (existsSync(sysChunkPath) && Bun.file(sysChunkPath).size > 1000) {
+							const sysRes = await fetch(`${TRANSCRIPTION_SERVER}/transcribe`, {
+								method: "POST",
+								headers: { "Content-Type": "application/json" },
+								body: JSON.stringify({ wav_path: sysChunkPath, language: lang }),
+							});
+							if (sysRes.ok) {
+								const sysTx = await sysRes.json() as { text?: string };
+								const sysText = (sysTx.text || "").trim();
+								if (sysText && sysText.length > 3) {
+									send("segment", {
+										speaker: "???",
+										start: Math.round(startTime * 100) / 100,
+										end: Math.round(Math.min(startTime + CHUNK_DURATION, fileDurationS) * 100) / 100,
+										text: sysText,
+										channel: "sys",
+										live: true,
+									});
+								}
+							}
+							try { unlinkSync(sysChunkPath); } catch {}
+						}
+					}
+
+					// Cleanup chunk file
+					try { unlinkSync(chunkPath); } catch {}
+				} catch (e) {
+					const errMsg = (e as Error).message;
+					console.log(`[heed] live chunk error: ${errMsg}`);
+					if (errMsg.includes("Unable to connect") || errMsg.includes("ECONNREFUSED")) {
+						console.log("[heed] live: Python unreachable, stopping");
+						if (liveTranscribeInterval) clearInterval(liveTranscribeInterval);
+						send("error", { message: "Transcription server unavailable" });
+					}
+				} finally {
+					liveChunkProcessing = false;
+				}
+			};
+
+			// First chunk after 3 seconds, then every interval
+			const firstTimeout = setTimeout(() => {
+				processChunk();
+				liveTranscribeInterval = setInterval(processChunk, interval);
+			}, 3000);
+
+			// Cleanup when connection drops
+			const checkClosed = setInterval(() => {
+				if (!recorderProc) {
+					clearInterval(checkClosed);
+					if (liveTranscribeInterval) clearInterval(liveTranscribeInterval);
+					clearTimeout(firstTimeout);
+					send("stopped", {});
+					try { controller.close(); } catch {}
+				}
+			}, 1000);
+		},
+	});
+
+	return new Response(stream, {
+		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+	});
+}
+
+function stopLiveTranscribe() {
+	if (liveTranscribeInterval) {
+		clearInterval(liveTranscribeInterval);
+		liveTranscribeInterval = null;
+	}
+	liveTranscribeOffset = 0;
+	liveChunkProcessing = false;
+	// Any in-flight whisper call will still complete but its result will be
+	// dropped because processChunk checks `!recorderProc` at the top.
+}
+
 async function handleSysRecordStop(): Promise<Response> {
+	stopLiveTranscribe();
 	if (!recorderProc || !recorderPath) return Response.json({ error: "Not recording" }, { status: 400 });
 
 	recorderProc.kill("SIGINT");
@@ -1417,9 +1814,10 @@ const server = Bun.serve({
 		const method = req.method;
 
 		if (method === "POST" && url.pathname === "/api/transcribe") return handleTranscribe(req);
+		if (method === "POST" && url.pathname === "/api/finalize") return handleFinalize(req);
 		if (method === "POST" && url.pathname === "/api/summarize") return handleSummarize(req);
 		if (method === "POST" && url.pathname === "/api/summary-line") return handleSummaryLine(req);
-		if (method === "POST" && url.pathname === "/api/diarize") return handleDiarize(req);
+		// /api/diarize removed — finalize handles speaker identification now
 		if (method === "GET" && url.pathname === "/api/sessions") return handleListSessions();
 		if (method === "POST" && url.pathname === "/api/sessions") return handleCreateSession(req);
 		if (method === "PATCH" && url.pathname === "/api/sessions") return handlePatchSession(req, url);
@@ -1437,11 +1835,11 @@ const server = Bun.serve({
 		if (method === "GET" && url.pathname === "/api/setup/install-ollama") return handleInstallOllama();
 		if (method === "GET" && url.pathname === "/api/setup/install-ffmpeg") return handleInstallFfmpeg();
 		if (method === "GET" && url.pathname === "/api/meeting-detector") return handleDetectorStream();
-		if (method === "GET" && url.pathname === "/api/download") return handleDownload(url);
-		if (method === "POST" && url.pathname === "/api/recording") return handleSaveRecording(req);
+		// /api/download and /api/recording removed — unused legacy endpoints
 		if (method === "POST" && url.pathname === "/api/sysrecord/start") return handleSysRecordStart(req);
 		if (method === "POST" && url.pathname === "/api/sysrecord/stop") return handleSysRecordStop();
 		if (method === "GET" && url.pathname === "/api/sysrecord/levels") return handleSysLevelsSSE();
+		if (method === "GET" && url.pathname === "/api/sysrecord/live") return handleLiveTranscribe(url);
 		if (method === "GET" && url.pathname === "/api/health") return handleHealth();
 		if (method === "GET" && url.pathname === "/api/recovery/list") return handleListOrphaned();
 		if (method === "DELETE" && url.pathname === "/api/recovery/discard") return handleDiscardOrphaned(url);

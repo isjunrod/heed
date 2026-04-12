@@ -1,6 +1,5 @@
 import { useEffect, useRef } from "react";
 import { recordingApi } from "@/api/recording.ts";
-import { transcribe } from "@/api/transcribe.ts";
 import { sessionsApi } from "@/api/sessions.ts";
 import { notesApi } from "@/api/notes.ts";
 import { useRecordingStore } from "@/stores/recording.ts";
@@ -26,6 +25,7 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 	const audioCtxRef = useRef<AudioContext | null>(null);
 	const analyserRef = useRef<AnalyserNode | null>(null);
 	const sysEventRef = useRef<EventSource | null>(null);
+	const liveEventRef = useRef<EventSource | null>(null);
 	const sysLevelsRef = useRef<number[]>(new Array(24).fill(0));
 	const micCurrentRef = useRef<number[]>(new Array(VIZ_BARS).fill(0));
 	const sysCurrentRef = useRef<number[]>(new Array(VIZ_BARS).fill(0));
@@ -58,6 +58,25 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 			sysEventRef.current.onmessage = (e) => {
 				try { sysLevelsRef.current = JSON.parse(e.data); } catch {}
 			};
+
+			// Live transcription via SSE — segments appear while recording.
+			// Delay 2s to ensure ffmpeg has written enough audio to the WAV.
+			setTimeout(() => {
+				if (!useRecordingStore.getState().recording) return; // stopped already
+				const liveLang = encodeURIComponent(getLanguage());
+				liveEventRef.current = new EventSource(`/api/sysrecord/live?lang=${liveLang}`);
+				liveEventRef.current.addEventListener("segment", (e) => {
+					try {
+						const seg = JSON.parse(e.data);
+						useRecordingStore.getState().appendSegment(seg);
+					} catch {}
+				});
+				liveEventRef.current.onerror = () => {
+					// Don't let EventSource auto-reconnect endlessly
+					liveEventRef.current?.close();
+					liveEventRef.current = null;
+				};
+			}, 2000);
 
 			startVisualizerLoop();
 		} catch (e) {
@@ -117,7 +136,7 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 			tickInterval.current = null;
 		}
 
-		// Stop visualizer sources
+		// Stop visualizer + live transcription sources
 		micStreamRef.current?.getTracks().forEach((t) => t.stop());
 		micStreamRef.current = null;
 		try { audioCtxRef.current?.close(); } catch {}
@@ -125,6 +144,8 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 		analyserRef.current = null;
 		sysEventRef.current?.close();
 		sysEventRef.current = null;
+		liveEventRef.current?.close();
+		liveEventRef.current = null;
 		if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
 
 		micBars.current?.forEach((b) => { if (b) b.style.height = "2px"; });
@@ -136,68 +157,99 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 
 		try {
 			const { path } = await recordingApi.stop();
-			await processRecording(path);
+			await finalizeRecording(path);
 		} catch (e) {
 			showToast(`Stop failed: ${(e as Error).message}`);
 		}
 	};
 
-	const processRecording = async (audioPath: string) => {
+	const finalizeRecording = async (audioPath: string) => {
 		const lang = getLanguage();
 		const seconds = useRecordingStore.getState().seconds;
+		// Grab the live segments already in the store — NO re-transcription needed
+		const liveSegments = useRecordingStore.getState().segments;
 
-		await transcribe(
-			{ url: audioPath, language: lang, diarize: true },
-			{
-				onStep: (msg) => useRecordingStore.getState().setProcessing(msg, useRecordingStore.getState().processProgress),
-				onProgress: (pct) => useRecordingStore.getState().setProcessing(useRecordingStore.getState().processStep, pct),
-				onResult: async (result) => {
-					useRecordingStore.getState().setResult(result);
-					// Auto-save session
+		// Call /api/finalize: runs ONLY pyannote on sys channel for speaker reveal.
+		// Whisper already ran during live recording — we reuse those segments.
+		const res = await fetch("/api/finalize", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ wavPath: audioPath, liveSegments, language: lang }),
+		});
+
+		if (!res.body) {
+			showToast("Finalize failed: no response");
+			return;
+		}
+
+		const reader = res.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		let currentEvent = "";
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split("\n");
+			buffer = lines.pop() || "";
+			for (const line of lines) {
+				if (line.startsWith("event: ")) {
+					currentEvent = line.slice(7).trim();
+				} else if (line.startsWith("data: ")) {
 					try {
-						const created = await sessionsApi.create({
-							title: `Meeting ${fmtDate(new Date().toISOString())}`,
-							createdAt: new Date().toISOString(),
-							duration: seconds,
-							language: lang,
-							transcript: result.text,
-							speakers: result.speakers || [],
-							segments: result.segments || [],
-							embeddings: result.embeddings || {},
-							files: result.files,
-							aiNotes: "",
-							summary: "",
-							tags: [],
-							pinned: false,
-						});
-						useRecordingStore.getState().setSessionId(created.id);
-						reloadSessions();
-						// Smart auto-title: Ollama reads the transcript and generates a
-						// concrete title like "Pipeline review with Karen" instead of
-						// the placeholder "Meeting Apr 11, 2026". Also stored as summary
-						// for the subtitle line in the sessions list.
-						if (result.text && result.text.length > 30) {
-							notesApi.summaryLine(result.text)
-								.then((d) => {
-									if (d.summary) {
-										sessionsApi.patch(created.id, {
-											title: d.summary,
-											summary: d.summary,
-										}).then(() => reloadSessions());
-									}
-								})
-								.catch(() => {});
+						const data = JSON.parse(line.slice(6));
+						if (currentEvent === "speakers") {
+							useRecordingStore.getState().revealSpeakers(
+								data.speakers || [],
+								data.segments || [],
+								data.embeddings || {},
+							);
+						} else if (currentEvent === "result") {
+							useRecordingStore.getState().setResult(data);
+							// Save session
+							const words = (data.text || "").split(/\s+/).filter(Boolean);
+							const heuristicTitle = words.length > 0
+								? words.slice(0, 8).join(" ") + (words.length > 8 ? "..." : "")
+								: `Meeting ${fmtDate(new Date().toISOString())}`;
+
+							const created = await sessionsApi.create({
+								title: heuristicTitle,
+								createdAt: new Date().toISOString(),
+								duration: seconds,
+								language: lang,
+								transcript: data.text,
+								speakers: data.speakers || [],
+								segments: data.segments || [],
+								embeddings: data.embeddings || {},
+								files: data.files,
+								aiNotes: "",
+								summary: "",
+								tags: [],
+								pinned: false,
+							});
+							useRecordingStore.getState().setSessionId(created.id);
+							reloadSessions();
+							// Background: smart title via Ollama
+							if (data.text && data.text.length > 30) {
+								notesApi.summaryLine(data.text)
+									.then((d) => {
+										if (d.summary) {
+											sessionsApi.patch(created.id, {
+												title: d.summary,
+												summary: d.summary,
+											}).then(() => reloadSessions());
+										}
+									})
+									.catch(() => {});
+							}
+						} else if (currentEvent === "error") {
+							showToast(`Error: ${data.message}`);
 						}
-					} catch (e) {
-						showToast(`Save failed: ${(e as Error).message}`);
-					}
-				},
-				onError: (msg) => {
-					showToast(`Error: ${msg}`);
-					useRecordingStore.getState().reset();
-				},
-			},
-		);
+					} catch {}
+				}
+			}
+		}
 	};
 
 	useEffect(() => {
@@ -206,6 +258,7 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 			if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
 			micStreamRef.current?.getTracks().forEach((t) => t.stop());
 			try { audioCtxRef.current?.close(); } catch {}
+			liveEventRef.current?.close();
 			sysEventRef.current?.close();
 		};
 	}, []);

@@ -1041,21 +1041,38 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 let recorderProc: ReturnType<typeof Bun.spawn> | null = null;
 let recorderPath: string | null = null;
 
+const IS_MAC = process.platform === "darwin";
+
 function getMonitorSource(): string | null {
-	// Use the default SINK's monitor — this captures whatever audio the user hears
-	// through their selected output device (headphones, speakers, USB DAC, etc.)
+	if (IS_MAC) {
+		// macOS: use BlackHole or built-in audio loopback if available.
+		// BlackHole creates a virtual device "BlackHole 2ch" that captures system audio.
+		// If not installed, we can't capture system audio (return null → mic-only mode).
+		try {
+			const result = Bun.spawnSync(["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""]);
+			const output = new TextDecoder().decode(result.stderr);
+			// Look for BlackHole in the device list
+			const lines = output.split("\n");
+			for (let i = 0; i < lines.length; i++) {
+				if (/blackhole/i.test(lines[i])) {
+					const match = lines[i].match(/\[(\d+)\]/);
+					if (match) return `:${match[1]}`; // avfoundation audio device index
+				}
+			}
+		} catch {}
+		return null;
+	}
+	// Linux: PipeWire/PulseAudio monitor
 	try {
 		const sinkResult = Bun.spawnSync(["pactl", "get-default-sink"]);
 		const defaultSink = new TextDecoder().decode(sinkResult.stdout).trim();
 		if (defaultSink) {
 			const monitor = `${defaultSink}.monitor`;
-			// Verify it exists
 			const listResult = Bun.spawnSync(["pactl", "list", "sources", "short"]);
 			const output = new TextDecoder().decode(listResult.stdout);
 			if (output.includes(monitor)) return monitor;
 		}
 	} catch {}
-	// Fallback: any non-suspended monitor
 	const result = Bun.spawnSync(["pactl", "list", "sources", "short"]);
 	const output = new TextDecoder().decode(result.stdout);
 	for (const line of output.split("\n")) {
@@ -1068,8 +1085,11 @@ function getMonitorSource(): string | null {
 }
 
 function getMicSource(): string | null {
-	// Use PipeWire's default source — respects whatever the user selected
-	// in their system audio settings (USB mic, laptop mic, headset, etc.)
+	if (IS_MAC) {
+		// macOS: avfoundation default input device = ":default"
+		return ":default";
+	}
+	// Linux: PipeWire default source
 	try {
 		const result = Bun.spawnSync(["pactl", "get-default-source"]);
 		const defaultSource = new TextDecoder().decode(result.stdout).trim();
@@ -1077,6 +1097,9 @@ function getMicSource(): string | null {
 	} catch {}
 	return "default";
 }
+
+// Audio format flag per platform
+const AUDIO_FMT = IS_MAC ? "avfoundation" : "pulse";
 
 async function handleSysRecordStart(req: Request): Promise<Response> {
 	let mode = "both";
@@ -1102,21 +1125,21 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 
 	if (mode === "system") {
 		if (!monitor) return Response.json({ error: "No system audio monitor found" }, { status: 500 });
-		args = ["ffmpeg", "-y", "-f", "pulse", "-i", monitor, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
+		args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", monitor, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
 	} else if (mode === "mic") {
-		args = ["ffmpeg", "-y", "-f", "pulse", "-i", mic, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
+		args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", mic, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
 	} else {
 		// both: keep mic and system in SEPARATE physical channels (L=mic, R=system).
 		// Downstream we split them and run diarization independently — this is what unlocks
 		// real overlap detection when two people speak at the same time.
 		if (!monitor) {
 			// Fallback to mic only
-			args = ["ffmpeg", "-y", "-f", "pulse", "-i", mic, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
+			args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", mic, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
 		} else {
 			args = [
 				"ffmpeg", "-y",
-				"-f", "pulse", "-i", mic,
-				"-f", "pulse", "-i", monitor,
+				"-f", AUDIO_FMT, "-i", mic,
+				"-f", AUDIO_FMT, "-i", monitor,
 				"-filter_complex", "[0:a]aresample=16000,pan=mono|c0=c0[micL];[1:a]aresample=16000,pan=mono|c0=c0[sysR];[micL][sysR]amerge=inputs=2[out]",
 				"-map", "[out]",
 				"-ar", "16000", "-ac", "2", "-c:a", "pcm_s16le",
@@ -1145,7 +1168,7 @@ function startLevelMeter() {
 
 	// ffmpeg reads the monitor and outputs raw PCM to stdout
 	levelProc = Bun.spawn([
-		"ffmpeg", "-f", "pulse", "-i", monitor,
+		"ffmpeg", "-f", AUDIO_FMT, "-i", monitor,
 		"-f", "s16le", "-ar", "16000", "-ac", "1",
 		"-"  // output to stdout
 	], { stdout: "pipe", stderr: "pipe" });

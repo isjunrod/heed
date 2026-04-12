@@ -16,7 +16,10 @@ export interface CatalogModel {
 	speed: ModelSpeed;
 	description?: string;
 	new?: boolean;
-	gpu_compatible: boolean; // computed for THIS hardware
+	/** True if the model fits in TOTAL VRAM of this GPU (stable, hardware-bound). */
+	gpu_compatible: boolean;
+	/** True if the model fits in CURRENTLY FREE VRAM (transient, depends on Chrome/Steam/etc). */
+	gpu_runtime_ok?: boolean;
 	recommended_runtime: "gpu" | "cpu";
 	installed: boolean;
 }

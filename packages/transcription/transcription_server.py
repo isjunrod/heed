@@ -208,16 +208,26 @@ def get_hardware_info():
     else:
         info["tier"] = "cpu_only"
 
-    # Annotate every model with whether it fits THIS hardware right now
+    # `gpu_compatible` is a property of the HARDWARE, not the current memory state.
+    # We compute it against TOTAL VRAM so the answer is stable across reboots and
+    # whatever Chrome / Steam / random GPU consumer is running.
+    #
+    # `gpu_runtime_ok` reflects what actually fits RIGHT NOW (free VRAM). The UI
+    # uses this to warn the user if they need to free memory before installing a
+    # large model — but it does NOT use it to hide models from the catalog.
     for m in MODEL_CATALOG:
-        gpu_ok = info["gpu_available"] and model_fits_gpu(m, free)
+        gpu_ok = info["gpu_available"] and model_fits_gpu(m, total)
+        runtime_ok = info["gpu_available"] and model_fits_gpu(m, free)
         info["models"].append({
             **m,
             "gpu_compatible": gpu_ok,
+            "gpu_runtime_ok": runtime_ok,
             "recommended_runtime": "gpu" if gpu_ok else "cpu",
         })
 
-    default = pick_default_model(free)
+    # Default model is picked against TOTAL VRAM too — what the hardware can run,
+    # not what the current Chrome state allows. Runtime issues are surfaced later.
+    default = pick_default_model(total)
     info["default_model"] = default["id"] if default else None
     return info
 

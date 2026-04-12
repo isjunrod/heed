@@ -137,16 +137,40 @@ const STRINGS: StringMap = {
 		en: "Pick your AI model",
 	},
 	"setup.model.body": {
-		es: "Detectamos tu hardware y solo te mostramos modelos que pueden correr en tu maquina sin romper la diarizacion. Recomendamos uno por defecto, pero puedes elegir otro.",
-		en: "We detected your hardware and only show models that can run on your machine without breaking diarization. We recommend one by default, but you can pick another.",
+		es: "Detectamos tu hardware y solo te mostramos modelos que pueden correr en tu maquina. Recomendamos uno por defecto, pero puedes elegir otro.",
+		en: "We detected your hardware and only show models that can run on your machine. We recommend one by default, but you can pick another.",
+	},
+	"setup.model.hardwareTitle": {
+		es: "Tu hardware",
+		en: "Your hardware",
+	},
+	"setup.model.hardwareNoGpu": {
+		es: "No detectamos GPU compatible. heed correra los modelos en CPU.",
+		en: "No compatible GPU detected. heed will run models on CPU.",
+	},
+	"setup.model.hardwareExplain": {
+		es: "Solo mostramos modelos que caben en {total}GB de VRAM. Los Llama 70B, Gemma 4 31B y Qwen 32B necesitan tarjetas mas grandes (16GB+).",
+		en: "We only show models that fit in {total}GB of VRAM. Llama 70B, Gemma 4 31B and Qwen 32B need larger cards (16GB+).",
 	},
 	"setup.model.recommended": {
-		es: "Recomendado para tu hardware",
-		en: "Recommended for your hardware",
+		es: "Recomendado para tu GPU",
+		en: "Recommended for your GPU",
 	},
 	"setup.model.others": {
-		es: "Otros que tambien caben",
-		en: "Others that also fit",
+		es: "Otros que tambien caben en GPU",
+		en: "Others that also fit in GPU",
+	},
+	"setup.model.cpuOnly": {
+		es: "Solo CPU (mejor calidad, mas lentos)",
+		en: "CPU only (better quality, slower)",
+	},
+	"setup.model.cpuHint": {
+		es: "Estos modelos no caben en tu GPU pero pueden correr en CPU. Las notas tardan 3-4 veces mas, pero la calidad es mejor.",
+		en: "These models don't fit your GPU but can run on CPU. Notes take 3-4x longer to generate, but the quality is better.",
+	},
+	"setup.model.runtimeWarn": {
+		es: "Cabe en tu hardware pero ahora mismo no hay VRAM libre suficiente. Cierra Chrome o apps que usen GPU antes de descargarlo.",
+		en: "Fits your hardware, but there's not enough free VRAM right now. Close Chrome or GPU-heavy apps before downloading.",
 	},
 	"setup.model.downloadBtn": {
 		es: "Descargar {size}",

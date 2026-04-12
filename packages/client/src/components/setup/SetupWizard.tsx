@@ -249,6 +249,7 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 	const selectModel = useModelsStore((s) => s.select);
 	const [pullingId, setPullingId] = useState<string | null>(null);
 	const [pullProgress, setPullProgress] = useState<PullProgress | null>(null);
+	const [showCpuModels, setShowCpuModels] = useState(false);
 
 	useEffect(() => {
 		loadModels();
@@ -262,21 +263,28 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 		}
 	}, [check, onComplete, forced]);
 
-	// Filter the catalog by hardware compatibility — same logic as ModelPicker
-	// but trimmed: we only show GPU-compatible models so the wizard stays focused.
-	const compatible = useMemo<CatalogModel[]>(() => {
+	// Three groups:
+	//   1. recommended  → the suggested default for this hardware
+	//   2. otherGpu     → other models that fit the GPU
+	//   3. cpuOnly      → models that don't fit the GPU but can run on CPU (slower, often higher quality)
+	const gpuCompatible = useMemo<CatalogModel[]>(() => {
 		if (!modelsData) return [];
 		return modelsData.models.filter((m) => m.gpu_compatible);
 	}, [modelsData]);
 
+	const cpuOnly = useMemo<CatalogModel[]>(() => {
+		if (!modelsData) return [];
+		return modelsData.models.filter((m) => !m.gpu_compatible);
+	}, [modelsData]);
+
 	const recommended = useMemo<CatalogModel | null>(() => {
 		if (!modelsData?.default_model) return null;
-		return compatible.find((m) => m.id === modelsData.default_model) || compatible[0] || null;
-	}, [compatible, modelsData]);
+		return gpuCompatible.find((m) => m.id === modelsData.default_model) || gpuCompatible[0] || null;
+	}, [gpuCompatible, modelsData]);
 
-	const others = useMemo<CatalogModel[]>(
-		() => compatible.filter((m) => m.id !== recommended?.id),
-		[compatible, recommended],
+	const otherGpu = useMemo<CatalogModel[]>(
+		() => gpuCompatible.filter((m) => m.id !== recommended?.id),
+		[gpuCompatible, recommended],
 	);
 
 	const handleDownload = (m: CatalogModel) => {
@@ -312,22 +320,26 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 		const pct = pullProgress?.total
 			? Math.min(100, Math.round(((pullProgress.completed || 0) / pullProgress.total) * 100))
 			: 0;
+		// Models that fit the hardware but not the current free VRAM get a soft warning.
+		const showRuntimeWarn = m.gpu_compatible && m.gpu_runtime_ok === false;
 		return (
 			<div
 				key={m.id}
-				className={`${styles.modelCard} ${isRecommended ? styles.modelCardRec : ""}`}
+				className={`${styles.modelCard} ${isRecommended ? styles.modelCardRec : ""} ${!m.gpu_compatible ? styles.modelCardCpu : ""}`}
 			>
 				<div className={styles.modelHead}>
 					<span className={styles.modelName}>{m.name}</span>
-					{isRecommended && (
-						<span className={styles.modelRecBadge}>★</span>
-					)}
+					{isRecommended && <span className={styles.modelRecBadge}>★</span>}
 					{m.new && <span className={styles.modelNewBadge}>NEW</span>}
+					{!m.gpu_compatible && <span className={styles.modelCpuBadge}>CPU</span>}
 				</div>
 				<div className={styles.modelMeta}>
-					{m.vendor} · {fmtMb(m.size_mb)} · {fmtMb(m.vram_mb)} VRAM
+					{m.vendor} · {fmtMb(m.size_mb)} · {m.gpu_compatible ? `${fmtMb(m.vram_mb)} VRAM` : "CPU"}
 				</div>
 				{m.description && <div className={styles.modelDesc}>{m.description}</div>}
+				{showRuntimeWarn && (
+					<div className={styles.runtimeWarn}>{t("setup.model.runtimeWarn", locale)}</div>
+				)}
 				{isPulling ? (
 					<div className={styles.pullBar}>
 						<div className={styles.pullBarFill} style={{ width: `${pct}%` }} />
@@ -360,12 +372,34 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 		);
 	};
 
+	const totalGb = modelsData ? (modelsData.total_vram_mb / 1024).toFixed(1) : "?";
+	const freeGb = modelsData ? (modelsData.free_vram_mb / 1024).toFixed(1) : "?";
+
 	return (
 		<div className={styles.step}>
 			<h3 className={styles.stepTitle}>{t("setup.model.title", locale)}</h3>
 			<p className={styles.stepBody}>{t("setup.model.body", locale)}</p>
 
 			{!modelsData && <div className={styles.loading}>...</div>}
+
+			{modelsData && (
+				<div className={styles.hardwareBox}>
+					<div className={styles.hardwareLabel}>{t("setup.model.hardwareTitle", locale)}</div>
+					{modelsData.gpu_available ? (
+						<>
+							<div className={styles.hardwareName}>
+								{modelsData.gpu_name} · {totalGb} GB VRAM
+								<span className={styles.hardwareFree}> ({freeGb} GB free now)</span>
+							</div>
+							<div className={styles.hardwareExplain}>
+								{t("setup.model.hardwareExplain", locale, { total: totalGb })}
+							</div>
+						</>
+					) : (
+						<div className={styles.hardwareExplain}>{t("setup.model.hardwareNoGpu", locale)}</div>
+					)}
+				</div>
+			)}
 
 			{recommended && (
 				<>
@@ -374,19 +408,27 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 				</>
 			)}
 
-			{others.length > 0 && (
+			{otherGpu.length > 0 && (
 				<>
 					<div className={styles.sectionLabel}>{t("setup.model.others", locale)}</div>
-					<div className={styles.modelGrid}>{others.map((m) => renderCard(m))}</div>
+					<div className={styles.modelGrid}>{otherGpu.map((m) => renderCard(m))}</div>
 				</>
 			)}
 
-			{modelsData && compatible.length === 0 && (
-				<div className={styles.warnBox}>
-					{locale === "es"
-						? "No hay modelos GPU-compatibles en tu hardware. Tendras que correr en CPU desde la configuracion."
-						: "No GPU-compatible models for your hardware. You'll need to run in CPU mode from settings."}
-				</div>
+			{cpuOnly.length > 0 && (
+				<>
+					<div className={styles.sectionLabel}>
+						<button className={styles.expandBtn} onClick={() => setShowCpuModels((v) => !v)}>
+							{showCpuModels ? "▾" : "▸"} {t("setup.model.cpuOnly", locale)} ({cpuOnly.length})
+						</button>
+					</div>
+					{showCpuModels && (
+						<>
+							<div className={styles.cpuHint}>{t("setup.model.cpuHint", locale)}</div>
+							<div className={styles.modelGrid}>{cpuOnly.map((m) => renderCard(m))}</div>
+						</>
+					)}
+				</>
 			)}
 		</div>
 	);

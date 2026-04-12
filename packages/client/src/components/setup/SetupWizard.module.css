@@ -312,6 +312,96 @@
 	background: rgba(59, 130, 246, 0.04);
 }
 
+.modelCardCpu {
+	background: rgba(148, 163, 184, 0.04);
+	border-style: dashed;
+}
+
+.modelCpuBadge {
+	background: rgba(148, 163, 184, 0.25);
+	color: var(--text-3);
+	font-family: var(--mono);
+	font-size: 8px;
+	font-weight: 700;
+	padding: 2px 5px;
+	border-radius: 999px;
+	letter-spacing: 0.5px;
+}
+
+.runtimeWarn {
+	font-family: var(--mono);
+	font-size: 10px;
+	color: #92400E;
+	background: #FEF3C7;
+	border-left: 3px solid #F59E0B;
+	padding: 6px 8px;
+	border-radius: 4px;
+	line-height: 1.45;
+}
+
+.hardwareBox {
+	background: var(--bg, #F8FAFC);
+	border: 1px solid var(--border-light);
+	border-radius: var(--radius-md);
+	padding: 12px 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.hardwareLabel {
+	font-family: var(--mono);
+	font-size: 9px;
+	font-weight: 700;
+	color: var(--text-3);
+	text-transform: uppercase;
+	letter-spacing: 0.6px;
+}
+
+.hardwareName {
+	font-family: var(--mono);
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text);
+}
+
+.hardwareFree {
+	color: var(--text-3);
+	font-weight: 400;
+}
+
+.hardwareExplain {
+	font-size: 11px;
+	color: var(--text-2);
+	line-height: 1.5;
+}
+
+.expandBtn {
+	font-family: var(--mono);
+	font-size: 10px;
+	font-weight: 700;
+	color: var(--text-2);
+	text-transform: uppercase;
+	letter-spacing: 0.6px;
+	background: transparent;
+	border: none;
+	padding: 0;
+	cursor: pointer;
+	transition: color 150ms;
+}
+
+.expandBtn:hover {
+	color: var(--blue);
+}
+
+.cpuHint {
+	font-size: 11px;
+	color: var(--text-3);
+	line-height: 1.5;
+	font-style: italic;
+	margin-bottom: 8px;
+}
+
 .modelHead {
 	display: flex;
 	align-items: center;

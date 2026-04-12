@@ -26,7 +26,12 @@ export function SpeakerView({ segments, speakers, embeddings, speakerNames, onRe
 	}, [speakers]);
 
 	if (!segments?.length) {
-		return <div className={styles.placeholder}>No speakers detected</div>;
+		return (
+			<div className={styles.placeholder}>
+				<span className={styles.placeholderDot} />
+				Listening...
+			</div>
+		);
 	}
 
 	const handleRename = async (speaker: string) => {

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import styles from "./SpeakerMergeMenu.module.css";
 
 interface Props {
@@ -27,7 +28,7 @@ export function SpeakerMergeMenu({ x, y, currentSpeaker, speakers, speakerNames,
 
 	const currentName = speakerNames[currentSpeaker] || currentSpeaker;
 
-	return (
+	return createPortal(
 		<div ref={ref} className={styles.menu} style={{ top: y, left: x }}>
 			<div className={styles.header}>Merge "{currentName}" into:</div>
 			<div className={styles.divider} />
@@ -36,6 +37,7 @@ export function SpeakerMergeMenu({ x, y, currentSpeaker, speakers, speakerNames,
 					{speakerNames[s] || s}
 				</div>
 			))}
-		</div>
+		</div>,
+		document.body,
 	);
 }

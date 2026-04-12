@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CatalogModel, InstallProgress, PullProgress, SetupCheckResult } from "@heed/shared";
 import { setupApi } from "@/api/setup.ts";
@@ -242,7 +242,7 @@ interface StepModelProps {
 	forced?: boolean;
 }
 
-function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
+function StepModel({ check, locale, onComplete, forced, onFinish }: StepModelProps & { onFinish: () => void }) {
 	const showToast = useUIStore((s) => s.showToast);
 	const modelsData = useModelsStore((s) => s.data);
 	const loadModels = useModelsStore((s) => s.load);
@@ -255,13 +255,13 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 		loadModels();
 	}, [loadModels]);
 
-	// If the default model is already pulled, jump straight ahead.
+	// If the default model is already pulled, close the wizard — setup is done.
 	useEffect(() => {
 		if (check.model.installed && check.model.default_id && !forced) {
-			const id = setTimeout(onComplete, 800);
+			const id = setTimeout(onFinish, 800);
 			return () => clearTimeout(id);
 		}
-	}, [check, onComplete, forced]);
+	}, [check, onFinish, forced]);
 
 	// Three groups:
 	//   1. recommended  → the suggested default for this hardware
@@ -305,7 +305,7 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 					showToast(t("wizard.installed", locale));
 					setPullingId(null);
 					setPullProgress(null);
-					onComplete();
+					onFinish();
 				} catch (err) {
 					showToast(`${t("wizard.installFailed", locale)}: ${(err as Error).message}`);
 					setPullingId(null);
@@ -352,8 +352,7 @@ function StepModel({ check, locale, onComplete, forced }: StepModelProps) {
 						className={styles.btnPrimary}
 						onClick={() => {
 							selectModel(m.id).then(() => {
-								showToast(t("wizard.installed", locale));
-								onComplete();
+								onFinish();
 							});
 						}}
 					>
@@ -439,7 +438,16 @@ export function SetupWizard() {
 	const { check, needsWizard, refresh, skip } = useSetup();
 	const [locale, setLocaleState] = useState<Locale>(detectLocale);
 	const [activeStep, setActiveStep] = useState<StepId>("ollama");
+	const [dismissed, setDismissed] = useState(false);
 	const forced = typeof window !== "undefined" && window.location.search.includes("wizard=force");
+
+	// When the user finishes setup (picks a model), close the wizard.
+	// In forced mode skip() alone won't work because `forced || ...` is always true.
+	// So we track a local `dismissed` state that overrides everything.
+	const finishWizard = useCallback(() => {
+		skip(); // persist to localStorage so it never auto-shows again
+		setDismissed(true); // close immediately, even in forced mode
+	}, [skip]);
 
 	const handleLocaleSwitch = () => {
 		const next: Locale = locale === "es" ? "en" : "es";
@@ -468,7 +476,7 @@ export function SetupWizard() {
 		}
 	}, [check, activeStep, forced]);
 
-	if (!needsWizard || !check) return null;
+	if (dismissed || !needsWizard || !check) return null;
 
 	const stepIndex = STEP_ORDER.indexOf(activeStep);
 
@@ -505,32 +513,28 @@ export function SetupWizard() {
 				<div className={styles.body}>
 					{activeStep === "ollama" && <StepOllama check={check} locale={locale} onComplete={advance} forced={forced} />}
 					{activeStep === "ffmpeg" && <StepFfmpeg check={check} locale={locale} onComplete={advance} forced={forced} />}
-					{activeStep === "model" && <StepModel check={check} locale={locale} onComplete={advance} forced={forced} />}
+					{activeStep === "model" && <StepModel check={check} locale={locale} onComplete={advance} forced={forced} onFinish={finishWizard} />}
 				</div>
 
 				{forced && (
 					<div className={styles.devNav}>
-						<button
-							className={styles.btnGhost}
-							onClick={() => {
-								const idx = STEP_ORDER.indexOf(activeStep);
-								if (idx > 0) setActiveStep(STEP_ORDER[idx - 1]);
-							}}
-							disabled={stepIndex === 0}
-						>
-							← {t("wizard.back", locale)}
-						</button>
-						<span className={styles.devNavHint}>?wizard=force preview mode</span>
-						<button
-							className={styles.btnGhost}
-							onClick={() => {
-								const idx = STEP_ORDER.indexOf(activeStep);
-								if (idx < STEP_ORDER.length - 1) setActiveStep(STEP_ORDER[idx + 1]);
-							}}
-							disabled={stepIndex === STEP_ORDER.length - 1}
-						>
-							{t("wizard.next", locale)} →
-						</button>
+						{stepIndex > 0 && (
+							<button
+								className={styles.btnGhost}
+								onClick={() => setActiveStep(STEP_ORDER[stepIndex - 1])}
+							>
+								← {t("wizard.back", locale)}
+							</button>
+						)}
+						<span />
+						{stepIndex < STEP_ORDER.length - 1 && (
+							<button
+								className={styles.btnGhost}
+								onClick={() => setActiveStep(STEP_ORDER[stepIndex + 1])}
+							>
+								{t("wizard.next", locale)} →
+							</button>
+						)}
 					</div>
 				)}
 			</div>

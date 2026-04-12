@@ -59,6 +59,7 @@ export function Nav() {
 								key={t.id}
 								className={`${styles.tab} ${currentPage === t.id ? styles.tabActive : ""}`}
 								onClick={() => setPage(t.id)}
+								data-tour={t.id === "sessions" ? "sessions-tab" : undefined}
 							>
 								{t.label}
 							</button>
@@ -72,6 +73,7 @@ export function Nav() {
 							className={styles.modelChip}
 							onClick={() => setPickerOpen(true)}
 							title="Click to switch AI model"
+							data-tour="model-chip"
 						>
 							<span className={styles.modelChipDot} />
 							<span className={styles.modelChipName}>

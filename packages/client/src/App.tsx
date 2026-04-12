@@ -6,6 +6,7 @@ import { RecordPage } from "@/components/recording/RecordPage.tsx";
 import { SessionsPage } from "@/components/sessions/SessionsPage.tsx";
 import { RecoveryBanner } from "@/components/recovery/RecoveryBanner.tsx";
 import { SetupWizard } from "@/components/setup/SetupWizard.tsx";
+import { AppTour } from "@/components/tour/AppTour.tsx";
 import styles from "./App.module.css";
 
 export function App() {
@@ -22,6 +23,7 @@ export function App() {
 			<Footer />
 			<Toast />
 			<SetupWizard />
+			<AppTour />
 		</>
 	);
 }

@@ -225,9 +225,12 @@ def get_hardware_info():
             "recommended_runtime": "gpu" if gpu_ok else "cpu",
         })
 
-    # Default model is picked against TOTAL VRAM too — what the hardware can run,
-    # not what the current Chrome state allows. Runtime issues are surfaced later.
-    default = pick_default_model(total)
+    # Default model is picked against FREE VRAM — the one that works RIGHT NOW.
+    # If we recommend a model that doesn't fit free VRAM, the user downloads it,
+    # Ollama loads it, steals VRAM from pyannote, and everything OOMs.
+    # The catalog still uses TOTAL (so we don't hide models), but "recommended"
+    # must be something that runs on first click without closing anything.
+    default = pick_default_model(free)
     info["default_model"] = default["id"] if default else None
     return info
 

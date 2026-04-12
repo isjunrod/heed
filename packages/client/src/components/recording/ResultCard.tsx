@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useRecordingStore } from "@/stores/recording.ts";
 import { useSessionsStore } from "@/stores/sessions.ts";
 import { useTemplatesStore } from "@/stores/templates.ts";
+import { useModelsStore } from "@/stores/models.ts";
 import { useUIStore } from "@/stores/ui.ts";
 import { generateNotes } from "@/api/notes.ts";
 import { sessionsApi } from "@/api/sessions.ts";
@@ -19,6 +20,8 @@ export function ResultCard() {
 	const showToast = useUIStore((s) => s.showToast);
 	const reloadSessions = useSessionsStore((s) => s.load);
 	const { templates, load: loadTemplates } = useTemplatesStore();
+	const modelsData = useModelsStore((s) => s.data);
+	const loadModels = useModelsStore((s) => s.load);
 
 	const hasSpeakers = segments.length > 0;
 	const [activeTab, setActiveTab] = useState<Tab>("transcript");
@@ -27,8 +30,12 @@ export function ResultCard() {
 	const [streamingNotes, setStreamingNotes] = useState("");
 	const [templateId, setTemplateId] = useState<string>("general");
 
-	// Load templates on mount
-	useEffect(() => { loadTemplates(); }, [loadTemplates]);
+	// Load templates + models on mount (models needed for GPU runtime check)
+	useEffect(() => { loadTemplates(); loadModels(); }, [loadTemplates, loadModels]);
+
+	// Check if the current model fits in free VRAM right now
+	const currentModel = modelsData?.models.find((m) => m.id === modelsData.current?.id);
+	const fitsGpu = currentModel?.gpu_runtime_ok !== false; // true if ok or undefined (no data yet)
 
 	// Reset speaker names when speakers change (new recording)
 	useEffect(() => {
@@ -52,7 +59,7 @@ export function ResultCard() {
 		showToast("Copied");
 	};
 
-	const handleGenerate = async () => {
+	const handleGenerate = async (forceCpu = false) => {
 		if (!transcript || generating) return;
 		setGenerating(true);
 		setStreamingNotes("");
@@ -77,6 +84,7 @@ export function ResultCard() {
 						}
 					},
 				},
+				forceCpu,
 			);
 		} catch (e) {
 			showToast(`Error: ${(e as Error).message}`);
@@ -138,6 +146,14 @@ export function ResultCard() {
 				/>
 			)}
 
+			{activeTab === "notes" && !fitsGpu && !generating && (
+				<div className={styles.gpuWarn}>
+					<span className={styles.gpuWarnText}>
+						{currentModel?.name || "Current model"} doesn't fit in your GPU right now. It will run on CPU (~3-4x slower).
+					</span>
+				</div>
+			)}
+
 			<div className={styles.actions}>
 				<button className={styles.btn} onClick={handleCopy}>Copy</button>
 				{activeTab === "notes" && (
@@ -151,9 +167,15 @@ export function ResultCard() {
 								<option key={t.id} value={t.id}>{t.name}</option>
 							))}
 						</select>
-						<button className={styles.btn} onClick={handleGenerate} disabled={generating}>
-							{generating ? "Generating..." : "Generate AI notes"}
-						</button>
+						{fitsGpu ? (
+							<button className={styles.btn} onClick={() => handleGenerate(false)} disabled={generating}>
+								{generating ? "Generating..." : "Generate AI notes"}
+							</button>
+						) : (
+							<button className={styles.btnCpu} onClick={() => handleGenerate(true)} disabled={generating}>
+								{generating ? "Generating on CPU..." : "Generate on CPU"}
+							</button>
+						)}
 					</>
 				)}
 			</div>

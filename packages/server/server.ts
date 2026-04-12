@@ -449,7 +449,7 @@ function handleDeleteTemplate(url: URL): Response {
 
 // --- Ollama summarization (SSE) ---
 async function handleSummarize(req: Request): Promise<Response> {
-	const { transcript, language, templateId } = await req.json();
+	const { transcript, language, templateId, force_cpu } = await req.json();
 	if (!transcript) return Response.json({ error: "No transcript provided" }, { status: 400 });
 
 	// Load template (default to "general" if not specified)
@@ -466,17 +466,16 @@ async function handleSummarize(req: Request): Promise<Response> {
 		systemPrompt = `You are a meeting notes assistant. Generate structured notes with sections: Summary, Key Points, Action Items, Decisions.`;
 	}
 
-	const numGpu = getCurrentNumGpu();
+	// force_cpu comes from the UI when the user explicitly acknowledged the warning
+	// and chose "Generate on CPU". Otherwise we use the config value.
+	const numGpu = force_cpu ? 0 : (getCurrentNumGpu() ?? undefined);
 	const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
 			model: getCurrentModel(),
 			stream: true,
-			// keep_alive: 0 → unload model from VRAM right after generation finishes.
-			// Critical on small GPUs (3-4GB) where pyannote competes with Ollama for memory.
 			keep_alive: 0,
-			// num_gpu: 0 forces CPU-only when the user picked a model that doesn't fit in GPU
 			...(numGpu !== undefined ? { options: { num_gpu: numGpu } } : {}),
 			messages: [
 				{ role: "system", content: systemPrompt },
@@ -986,7 +985,7 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 				messages: [
 					{
 						role: "system",
-						content: "You generate ONE single sentence (max 12 words) that captures the main topic of a meeting transcript. Output ONLY the sentence, no quotes, no prefixes, no explanation. Be concrete and specific.",
+						content: "You generate ONE single sentence (max 12 words) that captures the main topic of a meeting transcript. Output ONLY the sentence, no quotes, no prefixes, no explanation. Be concrete and specific. IMPORTANT: respond in the SAME language as the transcript — if it's in Spanish, your sentence must be in Spanish. If English, respond in English.",
 					},
 					{ role: "user", content: text },
 				],
@@ -1304,6 +1303,92 @@ function handleDetectorStream(): Response {
 	});
 }
 
+// --- Auto-recovery for orphaned recordings ---
+// When heed crashes mid-recording, ffmpeg has already written the WAV to disk.
+// On next startup, we scan the uploads dir for WAVs that don't belong to any
+// session and surface them to the frontend as recoverable.
+interface OrphanedRecording {
+	path: string;
+	filename: string;
+	size_mb: number;
+	created: string; // ISO date
+	duration_estimate_s: number; // estimated from file size (16kHz 16-bit mono ≈ 32KB/s, stereo ≈ 64KB/s)
+	is_dual: boolean;
+}
+
+function handleListOrphaned(): Response {
+	if (!existsSync(UPLOAD_DIR)) return Response.json({ recordings: [] });
+
+	// Collect all WAV files in uploads
+	const wavFiles = readdirSync(UPLOAD_DIR)
+		.filter((f) => f.endsWith(".wav") && (f.startsWith("capture-") || f.startsWith("dual-capture-")))
+		.filter((f) => {
+			// Exclude sub-files created by the Python split (mic/sys channels)
+			return !f.includes("-mic.wav") && !f.includes("-sys.wav");
+		});
+
+	// Collect all WAV paths referenced by existing sessions
+	const sessionPaths = new Set<string>();
+	if (existsSync(SESSIONS_DIR)) {
+		for (const sf of readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".json"))) {
+			try {
+				const session = JSON.parse(readFileSync(join(SESSIONS_DIR, sf), "utf-8"));
+				if (session.files?.wav) sessionPaths.add(session.files.wav);
+			} catch {}
+		}
+	}
+
+	// An orphan = WAV exists but no session references it
+	const orphans: OrphanedRecording[] = [];
+	for (const f of wavFiles) {
+		const fullPath = join(UPLOAD_DIR, f);
+		if (sessionPaths.has(fullPath)) continue;
+
+		const stat = Bun.file(fullPath);
+		const sizeBytes = stat.size;
+		const isDual = f.startsWith("dual-capture-");
+		// Estimate duration: 16kHz × 16-bit × channels = bytes/sec
+		const bytesPerSec = isDual ? 64000 : 32000; // stereo vs mono
+		const durationS = Math.round(sizeBytes / bytesPerSec);
+
+		// Extract timestamp from filename: capture-{ts}.wav or dual-capture-{ts}.wav
+		const tsMatch = f.match(/(\d+)\.wav$/);
+		const ts = tsMatch ? parseInt(tsMatch[1]) : Date.now();
+
+		orphans.push({
+			path: fullPath,
+			filename: f,
+			size_mb: Math.round(sizeBytes / 1024 / 1024 * 10) / 10,
+			created: new Date(ts).toISOString(),
+			duration_estimate_s: durationS,
+			is_dual: isDual,
+		});
+	}
+
+	// Sort newest first
+	orphans.sort((a, b) => new Date(b.created).getTime() - new Date(a.created).getTime());
+	return Response.json({ recordings: orphans });
+}
+
+function handleDiscardOrphaned(url: URL): Response {
+	const path = url.searchParams.get("path");
+	if (!path) return Response.json({ error: "No path" }, { status: 400 });
+	// Safety: only allow deleting files inside UPLOAD_DIR
+	if (!path.startsWith(UPLOAD_DIR)) return Response.json({ error: "Invalid path" }, { status: 400 });
+	try {
+		if (existsSync(path)) unlinkSync(path);
+		// Also clean up any split files
+		const base = path.replace(/\.wav$/, "");
+		for (const suffix of ["-mic.wav", "-sys.wav", "-mic.wav.srt", "-sys.wav.srt", "-mic.txt", "-sys.txt"]) {
+			const f = base + suffix;
+			if (existsSync(f)) unlinkSync(f);
+		}
+		return Response.json({ ok: true });
+	} catch (e) {
+		return Response.json({ error: (e as Error).message }, { status: 500 });
+	}
+}
+
 // --- Health check ---
 async function handleHealth(): Promise<Response> {
 	let ollamaOk = false;
@@ -1358,6 +1443,8 @@ const server = Bun.serve({
 		if (method === "POST" && url.pathname === "/api/sysrecord/stop") return handleSysRecordStop();
 		if (method === "GET" && url.pathname === "/api/sysrecord/levels") return handleSysLevelsSSE();
 		if (method === "GET" && url.pathname === "/api/health") return handleHealth();
+		if (method === "GET" && url.pathname === "/api/recovery/list") return handleListOrphaned();
+		if (method === "DELETE" && url.pathname === "/api/recovery/discard") return handleDiscardOrphaned(url);
 
 		return serveStatic(url.pathname) || new Response("Not Found", { status: 404 });
 	},

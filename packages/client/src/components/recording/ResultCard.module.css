@@ -163,8 +163,8 @@
 	border: 1px solid #FDE68A;
 	border-left: 3px solid #F59E0B;
 	border-radius: var(--radius-md);
-	padding: 8px 12px;
-	margin-top: 8px;
+	padding: 10px 14px;
+	margin: 12px 0;
 }
 
 .gpuWarnText {

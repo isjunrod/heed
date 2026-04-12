@@ -17,7 +17,7 @@ interface Props {
 	onBack: () => void;
 }
 
-type TabId = "transcript" | "speakers" | "notes";
+type TabId = "speakers" | "notes";
 
 export function SessionDetail({ session, onBack }: Props) {
 	const update = useSessionsStore((s) => s.update);
@@ -26,7 +26,7 @@ export function SessionDetail({ session, onBack }: Props) {
 	const modelsData = useModelsStore((s) => s.data);
 	const loadModels = useModelsStore((s) => s.load);
 
-	const [activeTab, setActiveTab] = useState<TabId>("transcript");
+	const [activeTab, setActiveTab] = useState<TabId>("speakers");
 	const [templateId, setTemplateId] = useState<string>("general");
 	const [generating, setGenerating] = useState(false);
 	const [streamingNotes, setStreamingNotes] = useState("");
@@ -37,7 +37,6 @@ export function SessionDetail({ session, onBack }: Props) {
 	const currentModel = modelsData?.models.find((m) => m.id === modelsData.current?.id);
 	const fitsGpu = currentModel?.gpu_runtime_ok !== false;
 
-	const hasSpeakers = (session.segments?.length || 0) > 0;
 	const meta = [
 		fmtDate(session.createdAt),
 		session.duration ? fmtDuration(session.duration) : null,
@@ -46,8 +45,7 @@ export function SessionDetail({ session, onBack }: Props) {
 	].filter(Boolean).join(" · ");
 
 	const tabs = [
-		{ id: "transcript", label: "Transcript" },
-		{ id: "speakers", label: "Speakers", disabled: !hasSpeakers, disabledReason: "No speakers detected" },
+		{ id: "speakers", label: "Speakers" },
 		{ id: "notes", label: "AI Notes" },
 	];
 
@@ -57,14 +55,18 @@ export function SessionDetail({ session, onBack }: Props) {
 	};
 
 	const handleCopy = () => {
-		let text = session.transcript || "";
-		if (activeTab === "speakers" && session.segments) {
-			text = session.segments.map((s) => `${speakerNames[s.speaker] || s.speaker}: ${s.text}`).join("\n");
-		} else if (activeTab === "notes") {
-			text = session.aiNotes || "";
+		if (activeTab === "notes") {
+			navigator.clipboard.writeText(session.aiNotes || "");
+		} else if (session.segments) {
+			const text = session.segments.map((s) => `${speakerNames[s.speaker] || s.speaker}: ${s.text}`).join("\n");
+			navigator.clipboard.writeText(text);
 		}
-		navigator.clipboard.writeText(text);
 		showToast("Copied");
+	};
+
+	const handleCopyPlain = () => {
+		navigator.clipboard.writeText(session.transcript || "");
+		showToast("Copied plain text");
 	};
 
 	const handleGenerate = async (forceCpu = false) => {
@@ -133,8 +135,6 @@ export function SessionDetail({ session, onBack }: Props) {
 
 			<Tabs tabs={tabs} active={activeTab} onChange={(id) => setActiveTab(id as TabId)} />
 
-			{activeTab === "transcript" && <div className={styles.text}>{session.transcript || ""}</div>}
-
 			{activeTab === "speakers" && (
 				<SpeakerView
 					segments={session.segments || []}
@@ -164,6 +164,9 @@ export function SessionDetail({ session, onBack }: Props) {
 
 			<div className={styles.actionsRow} style={{ marginTop: "12px" }}>
 				<button className={styles.btn} onClick={handleCopy}>Copy</button>
+				{activeTab === "speakers" && (
+					<button className={styles.btn} onClick={handleCopyPlain}>Copy plain text</button>
+				)}
 				{activeTab === "notes" && (
 					<>
 						<select

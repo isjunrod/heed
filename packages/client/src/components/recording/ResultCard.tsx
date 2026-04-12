@@ -11,7 +11,7 @@ import { SpeakerView } from "@/components/speakers/SpeakerView.tsx";
 import { NotesView } from "@/components/ai-notes/NotesView.tsx";
 import styles from "./ResultCard.module.css";
 
-type Tab = "transcript" | "speakers" | "notes";
+type Tab = "speakers" | "notes";
 
 export function ResultCard() {
 	const {
@@ -23,8 +23,7 @@ export function ResultCard() {
 	const modelsData = useModelsStore((s) => s.data);
 	const loadModels = useModelsStore((s) => s.load);
 
-	const hasSpeakers = segments.length > 0;
-	const [activeTab, setActiveTab] = useState<Tab>("transcript");
+	const [activeTab, setActiveTab] = useState<Tab>("speakers");
 	const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({});
 	const [generating, setGenerating] = useState(false);
 	const [streamingNotes, setStreamingNotes] = useState("");
@@ -43,20 +42,24 @@ export function ResultCard() {
 	}, [segments]);
 
 	const tabs = [
-		{ id: "transcript", label: "Transcript" },
-		{ id: "speakers", label: "Speakers", disabled: !hasSpeakers, disabledReason: "No speakers detected" },
+		{ id: "speakers", label: "Speakers" },
 		{ id: "notes", label: "AI Notes" },
 	];
 
 	const handleCopy = () => {
-		let text = transcript;
-		if (activeTab === "speakers") {
-			text = segments.map((s) => `${speakerNames[s.speaker] || s.speaker}: ${s.text}`).join("\n");
-		} else if (activeTab === "notes") {
-			text = notesText;
+		if (activeTab === "notes") {
+			navigator.clipboard.writeText(notesText);
+		} else {
+			// Copy with speaker labels
+			const text = segments.map((s) => `${speakerNames[s.speaker] || s.speaker}: ${s.text}`).join("\n");
+			navigator.clipboard.writeText(text);
 		}
-		navigator.clipboard.writeText(text);
 		showToast("Copied");
+	};
+
+	const handleCopyPlain = () => {
+		navigator.clipboard.writeText(transcript);
+		showToast("Copied plain text");
 	};
 
 	const handleGenerate = async (forceCpu = false) => {
@@ -123,11 +126,7 @@ export function ResultCard() {
 		<div className={styles.card}>
 			<Tabs tabs={tabs} active={activeTab} onChange={(id) => setActiveTab(id as Tab)} />
 
-			{activeTab === "transcript" && (
-				<div className={styles.text}>{transcript}</div>
-			)}
-
-			{activeTab === "speakers" && hasSpeakers && (
+			{activeTab === "speakers" && (
 				<SpeakerView
 					segments={segments}
 					speakers={speakers}
@@ -156,6 +155,9 @@ export function ResultCard() {
 
 			<div className={styles.actions}>
 				<button className={styles.btn} onClick={handleCopy}>Copy</button>
+				{activeTab === "speakers" && (
+					<button className={styles.btn} onClick={handleCopyPlain}>Copy plain text</button>
+				)}
 				{activeTab === "notes" && (
 					<>
 						<select

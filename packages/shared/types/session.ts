@@ -1,4 +1,4 @@
-import type { Speaker, Segment } from "./speaker.ts";
+import type { Segment } from "./speaker.ts";
 
 export interface SessionFiles {
 	wav?: string;

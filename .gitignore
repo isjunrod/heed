@@ -14,3 +14,5 @@ PLAN.md
 
 # Backup of original crafter-station/trx git history (not part of heed)
 .git.backup-trx-fork/
+__pycache__/
+records/

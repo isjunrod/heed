@@ -4,7 +4,6 @@ import { Toast } from "@/components/layout/Toast.tsx";
 import { Footer } from "@/components/layout/Footer.tsx";
 import { RecordPage } from "@/components/recording/RecordPage.tsx";
 import { SessionsPage } from "@/components/sessions/SessionsPage.tsx";
-import { MeetingBanner } from "@/components/meeting-detector/MeetingBanner.tsx";
 import { RecoveryBanner } from "@/components/recovery/RecoveryBanner.tsx";
 import { SetupWizard } from "@/components/setup/SetupWizard.tsx";
 import styles from "./App.module.css";
@@ -22,7 +21,6 @@ export function App() {
 			</main>
 			<Footer />
 			<Toast />
-			<MeetingBanner />
 			<SetupWizard />
 		</>
 	);

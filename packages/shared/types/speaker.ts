@@ -9,12 +9,6 @@ export interface Segment {
 	channel?: "mic" | "sys";
 }
 
-export interface Speaker {
-	id: string;
-	displayName: string;
-	color?: string;
-}
-
 export interface DiarizationResult {
 	speakers: string[];
 	speaker_count: number;

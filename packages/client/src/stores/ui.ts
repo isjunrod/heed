@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type Page = "record" | "sessions" | "actions";
+export type Page = "record" | "sessions";
 
 interface UIState {
 	currentPage: Page;

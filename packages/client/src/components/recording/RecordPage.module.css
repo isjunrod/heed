@@ -78,10 +78,27 @@
 	color: var(--text-2);
 }
 
+.processingText {
+	display: inline-block;
+	animation: processingTextFade 280ms ease;
+	will-change: opacity, transform;
+}
+
 .processingDot {
 	width: 10px;
 	height: 10px;
 	background: var(--blue);
 	border-radius: 50%;
 	animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes processingTextFade {
+	from {
+		opacity: 0;
+		transform: translateY(3px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
 }

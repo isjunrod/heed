@@ -83,8 +83,11 @@
 }
 
 .actions {
-	opacity: 0;
+	opacity: 1;
 	transition: opacity 150ms;
+	display: flex;
+	gap: 6px;
+	align-items: center;
 }
 
 .item:hover .actions {
@@ -92,17 +95,20 @@
 }
 
 .actionBtn {
-	background: none;
-	border: 1px solid transparent;
+	background: var(--white);
+	border: 1px solid var(--border-light);
 	color: var(--text-3);
-	width: 28px;
+	min-width: 28px;
 	height: 28px;
+	padding: 0 8px;
 	border-radius: var(--radius-sm);
 	cursor: pointer;
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	font-size: 16px;
+	font-family: var(--mono);
+	font-size: 10px;
+	font-weight: 600;
 	line-height: 1;
 }
 
@@ -110,4 +116,16 @@
 	background: var(--border-light);
 	color: var(--text);
 	border-color: var(--border-light);
+}
+
+.actionBtnDanger {
+	color: #b91c1c;
+	border-color: rgba(239, 68, 68, 0.26);
+	background: rgba(239, 68, 68, 0.06);
+}
+
+.actionBtnDanger:hover {
+	color: #991b1b;
+	border-color: rgba(239, 68, 68, 0.34);
+	background: rgba(239, 68, 68, 0.12);
 }

@@ -1,4 +1,4 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState } from "react";
 import { useRecording } from "@/hooks/useRecording.ts";
 import { useRecordingStore } from "@/stores/recording.ts";
 import { useLocalStorage } from "@/hooks/useLocalStorage.ts";
@@ -9,6 +9,15 @@ import vizStyles from "./Visualizer.module.css";
 import { LanguageSelect } from "./LanguageSelect.tsx";
 import { ResultCard } from "./ResultCard.tsx";
 import styles from "./RecordPage.module.css";
+
+const FAST_PROCESS_MESSAGES_EN = [
+	"Transcribing mic...",
+	"Transcribing sys...",
+	"Transcribing pyannote...",
+	"Aligning speaker timeline...",
+	"Merging segments...",
+	"It's almost ready!",
+];
 
 export function RecordPage() {
 	const micBars = useRef<HTMLDivElement[]>([]);
@@ -26,6 +35,8 @@ export function RecordPage() {
 	const showResult = recording || processing || segments.length > 0 || !!transcript;
 	// Block recording button while processing (transcribing + diarizing after stop)
 	const canRecord = !recording && !processing;
+	const [rotatingStep, setRotatingStep] = useState("");
+	const [rotatingStepKey, setRotatingStepKey] = useState(0);
 
 	// Listen for meeting detector trigger
 	useEffect(() => {
@@ -35,6 +46,33 @@ export function RecordPage() {
 		window.addEventListener("heed:start-recording", handler);
 		return () => window.removeEventListener("heed:start-recording", handler);
 	}, [start]);
+
+	useEffect(() => {
+		if (!processing) {
+			setRotatingStep("");
+			return;
+		}
+
+		const liveStep = (processStep || "").trim();
+		const poolRaw = [liveStep, ...FAST_PROCESS_MESSAGES_EN].filter(Boolean);
+		const uniquePool = Array.from(new Map(poolRaw.map((msg) => [msg.toLowerCase(), msg])).values());
+
+		const updateMessage = (msg: string) => {
+			setRotatingStep(msg);
+			setRotatingStepKey((k) => k + 1);
+		};
+
+		let idx = 0;
+		updateMessage(uniquePool[0] || "It's almost ready!");
+
+		const id = window.setInterval(() => {
+			if (!uniquePool.length) return;
+			idx = (idx + 1) % uniquePool.length;
+			updateMessage(uniquePool[idx]);
+		}, 2000);
+
+		return () => clearInterval(id);
+	}, [processing, processStep]);
 
 	return (
 		<div>
@@ -47,7 +85,9 @@ export function RecordPage() {
 				{processing ? (
 					<div className={styles.processingStatus}>
 						<div className={styles.processingDot} />
-						<span>{processStep || "Finalizing..."}</span>
+						<span key={rotatingStepKey} className={styles.processingText}>
+							{rotatingStep || processStep || "Finalizing..."}
+						</span>
 					</div>
 				) : (
 					<RecordButton recording={recording} onClick={() => (recording ? stop() : canRecord ? start() : null)} />

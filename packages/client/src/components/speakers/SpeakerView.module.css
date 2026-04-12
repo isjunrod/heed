@@ -115,7 +115,16 @@
 	height: 8px;
 	border-radius: 50%;
 	background: var(--blue);
+	flex-shrink: 0;
+}
+
+.placeholderDotPulse {
 	animation: pulse 1.2s ease-in-out infinite;
+}
+
+.placeholderDotStatic {
+	background: var(--text-3);
+	opacity: 0.45;
 }
 
 @keyframes pulse {

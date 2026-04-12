@@ -22,6 +22,10 @@ interface RecordingState {
 	tick: () => void;
 	stopRecording: () => void;
 	setProcessing: (step: string, percent: number) => void;
+	/** Progressive: append a single segment as whisper produces it */
+	appendSegment: (seg: Segment) => void;
+	/** Speaker reveal: replace all segments + speakers with final pyannote result */
+	revealSpeakers: (speakers: string[], segments: Segment[], embeddings: Record<string, number[]>) => void;
 	setResult: (result: TranscribeResult) => void;
 	setNotes: (text: string) => void;
 	setSessionId: (id: string | null) => void;
@@ -62,6 +66,17 @@ export const useRecordingStore = create<RecordingState>((set) => ({
 	stopRecording: () => set({ recording: false, processing: true, processStep: "Processing...", processProgress: 0 }),
 
 	setProcessing: (step, percent) => set({ processStep: step, processProgress: percent }),
+
+	appendSegment: (seg) =>
+		set((s) => {
+			const newSegments = [...s.segments, seg];
+			const newSpeakers = s.speakers.includes(seg.speaker) ? s.speakers : [...s.speakers, seg.speaker];
+			const newTranscript = s.transcript ? `${s.transcript}\n${seg.text}` : seg.text;
+			return { segments: newSegments, speakers: newSpeakers, transcript: newTranscript };
+		}),
+
+	revealSpeakers: (speakers, segments, embeddings) =>
+		set({ speakers, segments, embeddings }),
 
 	setResult: (result) =>
 		set({

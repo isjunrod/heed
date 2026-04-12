@@ -18,16 +18,28 @@ import warnings
 import threading
 import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from socketserver import ThreadingMixIn
+from concurrent.futures import ThreadPoolExecutor
+
+# Threading HTTP server so health/hardware checks don't block while whisper is processing.
+# Without this, the server is single-threaded and ANY request during transcription hangs.
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+# Locks to prevent concurrent calls to the same whisper model (not thread-safe).
+# Different models (small vs base) CAN run concurrently.
+whisper_lock = threading.Lock()
+whisper_live_lock = threading.Lock()
 
 warnings.filterwarnings("ignore")
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# HF_HUB_OFFLINE is set AFTER model loading in load_models() so that
+# first-time downloads (whisper small + tiny) can reach HuggingFace.
 
 PORT = int(os.environ.get("HEED_TRANSCRIPTION_PORT", "5002"))
 
 # --- Model loading (once, kept in memory) ---
-whisper_model = None
+whisper_model = None       # "small" — high quality, used for final processing after stop
+whisper_model_live = None   # "tiny" — fast, used for live chunks during recording (~6x faster)
 diarize_pipeline = None
 models_ready = {"whisper": False, "pyannote": False}
 
@@ -272,21 +284,48 @@ def get_device_config():
 
 
 def load_models():
-    global whisper_model, diarize_pipeline
+    global whisper_model, whisper_model_live, diarize_pipeline
 
     devices = get_device_config()
 
-    # --- Whisper ---
-    print(f"[heed] Loading whisper small on {devices['whisper']}...", flush=True)
+    # --- Whisper small (final processing) + base (live chunks) ---
+    whisper_device = devices["whisper"]
+    compute_type = "float16" if whisper_device == "cuda" else "int8"
+    print(f"[heed] Loading faster-whisper small on {whisper_device} ({compute_type})...", flush=True)
     t = time.time()
-    os.environ.pop("HF_HUB_OFFLINE", None)
-    os.environ.pop("TRANSFORMERS_OFFLINE", None)
-    import whisper
-    whisper_model = whisper.load_model("small", device=devices["whisper"])
+    from faster_whisper import WhisperModel
+    whisper_model = WhisperModel("small", device=whisper_device, compute_type=compute_type)
+    # Warm-up JIT
+    print(f"[heed] Warming up whisper (JIT compile)...", flush=True)
+    _warmup_path = os.path.join(os.path.dirname(__file__), "_warmup.wav")
+    try:
+        import struct, wave
+        with wave.open(_warmup_path, "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(struct.pack("<" + "h" * 8000, *([0] * 8000)))
+        list(whisper_model.transcribe(_warmup_path, language="en")[0])
+        os.remove(_warmup_path)
+    except Exception as e:
+        print(f"[heed] Warmup failed (non-critical): {e}", flush=True)
+    models_ready["whisper"] = True
+    print(f"[heed] Whisper small ready in {time.time()-t:.1f}s ({whisper_device}, {compute_type})", flush=True)
+
+    # Whisper base for live transcription during recording (~800ms per 5s chunk)
+    print(f"[heed] Loading faster-whisper base for live mode...", flush=True)
+    t2 = time.time()
+    whisper_model_live = WhisperModel("base", device=whisper_device, compute_type=compute_type)
+    try:
+        if os.path.exists(_warmup_path):
+            list(whisper_model_live.transcribe(_warmup_path, language="en")[0])
+    except Exception:
+        pass
+    print(f"[heed] Whisper base (live) ready in {time.time()-t2:.1f}s", flush=True)
+
+    # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    models_ready["whisper"] = True
-    print(f"[heed] Whisper ready in {time.time()-t:.1f}s ({devices['whisper']})", flush=True)
 
     # --- Pyannote ---
     print(f"[heed] Loading pyannote on {devices['pyannote']}...", flush=True)
@@ -308,22 +347,26 @@ def load_models():
     print("[heed] All models ready!", flush=True)
 
 
-# --- Transcription ---
+# --- Transcription (faster-whisper) ---
 def transcribe(wav_path, language="auto", srt_output=None):
     lang = None if language == "auto" else language
-    result = whisper_model.transcribe(wav_path, language=lang)
+    # Lock: whisper model is not thread-safe — serialize access.
+    with whisper_lock:
+        segments_gen, info = whisper_model.transcribe(wav_path, language=lang)
+        # MUST consume the generator inside the lock (it holds model state)
+        segments_list = list(segments_gen)
 
     srt_lines = []
     plain_lines = []
-    for idx, seg in enumerate(result.get("segments", []), 1):
-        start_ts = format_ts(seg["start"])
-        end_ts = format_ts(seg["end"])
-        text = seg["text"].strip()
+    for idx, seg in enumerate(segments_list, 1):
+        start_ts = format_ts(seg.start)
+        end_ts = format_ts(seg.end)
+        text = seg.text.strip()
         srt_lines.append(f"{idx}\n{start_ts} --> {end_ts}\n{text}\n")
         plain_lines.append(text)
 
     srt_content = "\n".join(srt_lines)
-    text = "\n".join(plain_lines) if plain_lines else result.get("text", "").strip()
+    text = "\n".join(plain_lines) if plain_lines else ""
 
     srt_path = srt_output or wav_path + ".srt"
     with open(srt_path, "w") as f:
@@ -337,7 +380,7 @@ def transcribe(wav_path, language="auto", srt_output=None):
         "text": text,
         "srt_path": srt_path,
         "txt_path": txt_path,
-        "language": result.get("language", language),
+        "language": info.language if info else language,
     }
 
 
@@ -518,19 +561,25 @@ def assign_speakers(diar_segs, srt_segs):
     result = []
     for seg in srt_segs:
         mid = (seg["start"] + seg["end"]) / 2
-        best_speaker = "Speaker ?"
+        best_speaker = None
         best_overlap = 0
         for d in diar_segs:
             ov = max(0, min(seg["end"], d["end"]) - max(seg["start"], d["start"]))
             if ov > best_overlap:
                 best_overlap = ov
                 best_speaker = d["speaker"]
-        if best_overlap == 0:
+        # Fallback 1: midpoint inside a diarization segment
+        if not best_speaker:
             for d in diar_segs:
                 if d["start"] <= mid <= d["end"]:
                     best_speaker = d["speaker"]
                     break
-        result.append({"speaker": best_speaker, "start": seg["start"], "end": seg["end"], "text": seg["text"]})
+        # Fallback 2: nearest diarization segment by time distance.
+        # Eliminates "Speaker ?" — pyannote had a small gap but someone WAS talking.
+        if not best_speaker and diar_segs:
+            nearest = min(diar_segs, key=lambda d: min(abs(d["start"] - mid), abs(d["end"] - mid)))
+            best_speaker = nearest["speaker"]
+        result.append({"speaker": best_speaker or "Speaker ?", "start": seg["start"], "end": seg["end"], "text": seg["text"]})
     return result
 
 
@@ -559,167 +608,69 @@ def process_full(wav_path, language="auto", do_diarize=False, min_speakers=None,
 # Input is a stereo WAV where L=mic (you) and R=system (other party).
 # We split, transcribe each independently, run pyannote ONLY on system
 # (your mic is always you = "Me"), then merge timelines and flag overlaps.
+#
+# PERFORMANCE ARCHITECTURE (optimized):
+#
+#   split_stereo ──┬──► mic.wav ──► whisper(mic) ──► "Me" segments     ← CPU
+#                  │                                                     (sequential,
+#                  └──► sys.wav ──► whisper(sys) ──► sys SRT             whisper not
+#                         │                            │                 thread-safe)
+#                         │                            ▼
+#                         └──► pyannote(sys) ─────► assign_speakers     ← GPU
+#                              (PARALLEL with           │                (runs at the
+#                               whisper above)          ▼                same time as
+#                                                  sys segments          whisper!)
+#
+#   Total time ≈ max(whisper_mic + whisper_sys, pyannote_sys) instead of
+#                    whisper_mic + whisper_sys + pyannote_sys
+#
+#   On a GTX 1650: pyannote ~5s GPU, whisper ~10s CPU × 2 = ~20s
+#   Old: 20 + 5 = 25s.  New: max(20, 5) = 20s.  Saves ~5s.
+#   On bigger recordings: pyannote scales to 15-25s, savings grow to 10-20s.
+
 def split_stereo(wav_path):
-    """Split a stereo WAV into two mono WAVs (mic, sys). Returns (mic_path, sys_path)."""
+    """Split a stereo WAV into two mono WAVs in ONE ffmpeg call (reads input once).
+    Returns (mic_path, sys_path, mic_has_audio, sys_has_audio)."""
     base = wav_path.rsplit(".", 1)[0]
     mic_path = f"{base}-mic.wav"
     sys_path = f"{base}-sys.wav"
-    # pan filter is the most reliable way to extract a single channel as mono
-    for out, channel in ((mic_path, "c0"), (sys_path, "c1")):
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", wav_path,
-                "-af", f"pan=mono|c0={channel}",
-                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                out,
-            ],
-            check=True,
-        )
-    return mic_path, sys_path
-
-
-def channel_has_audio(wav_path, threshold_db=-50.0):
-    """Quick energy check — skip transcription on a silent channel to save time."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-i", wav_path, "-af", "volumedetect", "-f", "null", "-"],
-            capture_output=True, text=True,
-        )
-        for line in result.stderr.split("\n"):
-            if "mean_volume:" in line:
+    # Single ffmpeg call: split + volumedetect on both channels simultaneously.
+    # Reads the input WAV once, writes two outputs + prints volume stats to stderr.
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "info",
+            "-i", wav_path,
+            "-filter_complex",
+            "[0:a]pan=mono|c0=c0,volumedetect[micout];"
+            "[0:a]pan=mono|c0=c1,volumedetect[sysout]",
+            "-map", "[micout]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", mic_path,
+            "-map", "[sysout]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", sys_path,
+        ],
+        capture_output=True, text=True,
+    )
+    # Parse volume from stderr to detect silent channels
+    mic_has = True
+    sys_has = True
+    volumes = []
+    for line in proc.stderr.split("\n"):
+        if "mean_volume:" in line:
+            try:
                 db = float(line.split("mean_volume:")[1].strip().split()[0])
-                return db > threshold_db
-    except Exception:
-        pass
-    return True  # if check fails, assume audio present
+                volumes.append(db)
+            except (ValueError, IndexError):
+                pass
+    if len(volumes) >= 2:
+        mic_has = volumes[0] > -50.0
+        sys_has = volumes[1] > -50.0
+    elif len(volumes) == 1:
+        mic_has = volumes[0] > -50.0
+
+    return mic_path, sys_path, mic_has, sys_has
 
 
-def process_dual(wav_path, language="auto", min_speakers=None, max_speakers=None):
-    """Channel-based diarization for dual-channel captures.
-
-    L=mic → always labeled "Me", no diarization needed (it's your voice).
-    R=sys → whisper + pyannote, labels become Speaker 1, 2, …
-    Then we merge by timestamp and flag overlaps.
-    """
-    mic_path, sys_path = split_stereo(wav_path)
-
-    mic_has = channel_has_audio(mic_path)
-    sys_has = channel_has_audio(sys_path)
-
-    # Step 1: Transcribe both channels SEQUENTIALLY.
-    # Whisper's nn.Module is NOT thread-safe — running two model.transcribe() calls
-    # concurrently on the same instance corrupts internal tensors and one of them
-    # silently dies with "Linear(in_features=768, ...)" errors.
-    # Sequential is also faster on CPU since BLAS already parallelizes inside one call.
-    mic_tx = {"text": "", "srt_path": None, "language": language}
-    sys_tx = {"text": "", "srt_path": None, "language": language}
-
-    if mic_has:
-        try:
-            mic_tx = transcribe(mic_path, language)
-        except Exception as e:
-            print(f"[heed] dual mic transcribe failed: {e}", flush=True)
-
-    if sys_has:
-        try:
-            sys_tx = transcribe(sys_path, language)
-        except Exception as e:
-            print(f"[heed] dual sys transcribe failed: {e}", flush=True)
-
-    # Step 2: Build mic segments (all "Me")
-    mic_segments = []
-    if mic_tx.get("srt_path") and os.path.exists(mic_tx["srt_path"]):
-        for s in parse_srt(mic_tx["srt_path"]):
-            mic_segments.append({
-                "speaker": "Me",
-                "start": s["start"],
-                "end": s["end"],
-                "text": s["text"],
-                "channel": "mic",
-            })
-
-    # Step 3: Diarize sys channel (only this needs pyannote)
-    sys_segments = []
-    sys_speakers_meta = {"speakers": [], "embeddings": {}}
-    sys_diar_ok = False
-    if sys_has and sys_tx.get("srt_path"):
-        try:
-            sys_diar = diarize(sys_path, sys_tx["srt_path"], min_speakers, max_speakers)
-            for s in sys_diar.get("segments", []):
-                sys_segments.append({
-                    "speaker": s["speaker"],
-                    "start": s["start"],
-                    "end": s["end"],
-                    "text": s.get("text", ""),
-                    "channel": "sys",
-                })
-            sys_speakers_meta["speakers"] = sys_diar.get("speakers", [])
-            sys_speakers_meta["embeddings"] = sys_diar.get("embeddings", {})
-            sys_diar_ok = True
-        except Exception as e:
-            print(f"[heed] sys diarize failed (falling back to single speaker): {e}", flush=True)
-
-    # Fallback: if diarize failed, still emit the sys transcript as a single "Speaker 1".
-    # This is critical — losing the entire other party's transcript because pyannote OOM'd
-    # would be a brutal user experience.
-    if sys_has and not sys_diar_ok and sys_tx.get("srt_path") and os.path.exists(sys_tx["srt_path"]):
-        for s in parse_srt(sys_tx["srt_path"]):
-            sys_segments.append({
-                "speaker": "Speaker 1",
-                "start": s["start"],
-                "end": s["end"],
-                "text": s["text"],
-                "channel": "sys",
-            })
-        sys_speakers_meta["speakers"] = ["Speaker 1"]
-
-    # Step 4: Merge by timestamp + detect overlaps
-    all_segments = sorted(mic_segments + sys_segments, key=lambda s: s["start"])
-    OVERLAP_MIN = 0.3  # 300ms — ignore tiny crossings
-    for ms in mic_segments:
-        for ss in sys_segments:
-            ov = max(0, min(ms["end"], ss["end"]) - max(ms["start"], ss["start"]))
-            if ov >= OVERLAP_MIN:
-                ms["overlap"] = True
-                ss["overlap"] = True
-
-    # Step 5: Build chronological transcript with speaker headers
-    lines = []
-    last = None
-    for seg in all_segments:
-        if seg["speaker"] != last:
-            lines.append(f"\n{seg['speaker']}:")
-            last = seg["speaker"]
-        marker = "  ⟳" if seg.get("overlap") else ""
-        lines.append(f"  {seg['text']}{marker}")
-    diar_text = "\n".join(lines).strip()
-
-    plain_text = "\n".join(seg["text"] for seg in all_segments if seg["text"]).strip()
-
-    speakers = []
-    if mic_segments:
-        speakers.append("Me")
-    speakers.extend(sys_speakers_meta["speakers"])
-    # Dedupe preserving order
-    seen = set()
-    speakers = [s for s in speakers if not (s in seen or seen.add(s))]
-
-    return {
-        "transcribe": {
-            "text": plain_text,
-            "srt_path": sys_tx.get("srt_path") or mic_tx.get("srt_path") or "",
-            "txt_path": (sys_tx.get("txt_path") or mic_tx.get("txt_path") or ""),
-            "language": (sys_tx.get("language") or mic_tx.get("language") or language),
-        },
-        "diarize": {
-            "speakers": speakers,
-            "speaker_count": len(speakers),
-            "segments": all_segments,
-            "text": diar_text,
-            "embeddings": sys_speakers_meta["embeddings"],
-        },
-    }
+# process_dual was removed — replaced by _stream_dual in the Handler class
+# and /api/finalize in the Bun server. The live transcription pipeline handles
+# all dual-channel processing now.
 
 
 # --- HTTP Server ---
@@ -770,6 +721,41 @@ class Handler(BaseHTTPRequestHandler):
             result["time_ms"] = int((time.time() - t) * 1000)
             self._json(result)
 
+        elif self.path == "/transcribe-live":
+            # Fast transcription using the base model — for live chunks during recording.
+            if not whisper_model_live:
+                self._json({"error": "live whisper not loaded"}, 503)
+                return
+            # Quick RMS energy check: skip whisper entirely for silent chunks.
+            # Saves 3-9 seconds per silent chunk (whisper wastes time on silence).
+            try:
+                import wave as _wave, struct as _struct, math as _math
+                with _wave.open(body["wav_path"]) as _wf:
+                    _frames = _wf.readframes(min(_wf.getnframes(), 48000))  # first 3s max
+                    _samples = _struct.unpack('<' + 'h' * (len(_frames) // 2), _frames)
+                    _rms = _math.sqrt(sum(s*s for s in _samples) / max(len(_samples), 1))
+                if _rms < 300:
+                    self._json({"text": "", "language": "auto", "time_ms": 0, "skipped": "silence"})
+                    return
+            except Exception:
+                pass  # if check fails, proceed with whisper
+            t = time.time()
+            lang = body.get("language", "auto")
+            lang = None if lang == "auto" else lang
+            with whisper_live_lock:
+                segments_gen, info = whisper_model_live.transcribe(body["wav_path"], language=lang)
+                segments_list = list(segments_gen)
+            lines = []
+            for seg in segments_list:
+                text = seg.text.strip()
+                if text:
+                    lines.append(text)
+            self._json({
+                "text": " ".join(lines),
+                "language": info.language if info else "auto",
+                "time_ms": int((time.time() - t) * 1000),
+            })
+
         elif self.path == "/diarize":
             if not models_ready["pyannote"]:
                 self._json({"error": "pyannote not loaded"}, 503)
@@ -784,33 +770,45 @@ class Handler(BaseHTTPRequestHandler):
             result["time_ms"] = int((time.time() - t) * 1000)
             self._json(result)
 
-        elif self.path == "/process":
-            t = time.time()
-            if body.get("dual_channel"):
-                # Channel-based diarization for stereo captures (L=mic, R=system)
-                if not models_ready["whisper"] or not models_ready["pyannote"]:
-                    self._json({"error": "models not ready"}, 503)
-                    return
-                try:
-                    result = process_dual(
-                        body["wav_path"],
-                        body.get("language", "auto"),
-                        body.get("min_speakers"),
-                        body.get("max_speakers"),
-                    )
-                except Exception as e:
-                    self._json({"error": f"process_dual failed: {e}"}, 500)
-                    return
-            else:
-                result = process_full(
-                    body["wav_path"],
-                    body.get("language", "auto"),
-                    body.get("diarize", False),
-                    body.get("min_speakers"),
-                    body.get("max_speakers"),
-                )
-            result["total_time_ms"] = int((time.time() - t) * 1000)
-            self._json(result)
+        elif self.path == "/process-stream":
+            # Streaming version: emits SSE events as whisper produces segments.
+            # Frontend sees text from second 1 instead of waiting for the full pipeline.
+            if not models_ready["whisper"] or not models_ready["pyannote"]:
+                self._json({"error": "models not ready"}, 503)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            def sse(event, data):
+                self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+                self.wfile.flush()
+
+            try:
+                t_start = time.time()
+                wav_path = body["wav_path"]
+                language = body.get("language", "auto")
+                is_dual = body.get("dual_channel", False)
+
+                if is_dual:
+                    self._stream_dual(sse, wav_path, language, body.get("min_speakers"), body.get("max_speakers"))
+                else:
+                    # Non-dual: process_full and emit result at end
+                    result = process_full(wav_path, language, body.get("diarize", False), body.get("min_speakers"), body.get("max_speakers"))
+                    tx = result.get("transcribe", {})
+                    diar = result.get("diarize", {})
+                    for seg in diar.get("segments", []):
+                        sse("segment", seg)
+                    sse("speakers", {"speakers": diar.get("speakers", []), "embeddings": diar.get("embeddings", {})})
+                    sse("done", {"text": tx.get("text", ""), "language": tx.get("language", language), "srt_path": tx.get("srt_path", ""), "txt_path": tx.get("txt_path", "")})
+
+                sse("complete", {"total_time_ms": int((time.time() - t_start) * 1000)})
+            except Exception as e:
+                sse("error", {"message": str(e)})
 
         elif self.path == "/voices/save":
             # body: { name: "Junior", embedding: [...] }
@@ -835,13 +833,140 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+    def _stream_dual(self, sse, wav_path, language, min_speakers, max_speakers):
+        """Stream dual-channel processing with progressive segment emission."""
+        mic_path, sys_path, mic_has, sys_has = split_stereo(wav_path)
+
+        # Launch pyannote on GPU immediately (parallel with whisper)
+        pyannote_future = None
+        if sys_has:
+            pyannote_future = ThreadPoolExecutor(max_workers=1).submit(
+                diarize, sys_path, None, min_speakers, max_speakers
+            )
+
+        sse("phase", {"phase": "transcribing", "channel": "mic"})
+
+        # Stream mic segments as they come from faster-whisper
+        lang = None if language == "auto" else language
+        mic_srt_lines = []
+        mic_segments_raw = []
+        mic_info = None
+        if mic_has:
+            segments_gen, mic_info = whisper_model.transcribe(mic_path, language=lang)
+            for idx, seg in enumerate(segments_gen, 1):
+                text = seg.text.strip()
+                if not text:
+                    continue
+                segment_data = {
+                    "speaker": "Me",
+                    "start": round(seg.start, 2),
+                    "end": round(seg.end, 2),
+                    "text": text,
+                    "channel": "mic",
+                }
+                sse("segment", segment_data)
+                mic_srt_lines.append(f"{idx}\n{format_ts(seg.start)} --> {format_ts(seg.end)}\n{text}\n")
+                mic_segments_raw.append(segment_data)
+
+        sse("phase", {"phase": "transcribing", "channel": "sys"})
+
+        # Stream sys segments (speaker = "???" until pyannote finishes)
+        sys_srt_lines = []
+        sys_raw_segs = []
+        sys_info = None
+        if sys_has:
+            segments_gen, sys_info = whisper_model.transcribe(sys_path, language=lang)
+            for idx, seg in enumerate(segments_gen, 1):
+                text = seg.text.strip()
+                if not text:
+                    continue
+                segment_data = {
+                    "speaker": "???",
+                    "start": round(seg.start, 2),
+                    "end": round(seg.end, 2),
+                    "text": text,
+                    "channel": "sys",
+                }
+                sse("segment", segment_data)
+                sys_srt_lines.append(f"{idx}\n{format_ts(seg.start)} --> {format_ts(seg.end)}\n{text}\n")
+                sys_raw_segs.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": text})
+
+        # Write SRT files
+        mic_srt_path = mic_path + ".srt"
+        with open(mic_srt_path, "w") as f:
+            f.write("\n".join(mic_srt_lines))
+        sys_srt_path = sys_path + ".srt"
+        with open(sys_srt_path, "w") as f:
+            f.write("\n".join(sys_srt_lines))
+
+        # Wait for pyannote (been running on GPU this whole time)
+        sse("phase", {"phase": "identifying_speakers"})
+
+        speakers_list = []
+        embeddings = {}
+        final_sys_segments = []
+        if pyannote_future:
+            try:
+                raw_diar = pyannote_future.result(timeout=300)
+                diar_segs = raw_diar.get("segments", [])
+                speakers_list = raw_diar.get("speakers", [])
+                embeddings = raw_diar.get("embeddings", {})
+                if sys_raw_segs and diar_segs:
+                    merged = assign_speakers(diar_segs, sys_raw_segs)
+                    for s in merged:
+                        final_sys_segments.append({
+                            "speaker": s["speaker"],
+                            "start": s["start"],
+                            "end": s["end"],
+                            "text": s.get("text", ""),
+                            "channel": "sys",
+                        })
+            except Exception as e:
+                print(f"[heed] stream diarize failed: {e}", flush=True)
+
+        if sys_has and not final_sys_segments and sys_raw_segs:
+            for s in sys_raw_segs:
+                final_sys_segments.append({
+                    "speaker": "Speaker 1", "start": s["start"],
+                    "end": s["end"], "text": s["text"], "channel": "sys",
+                })
+            speakers_list = ["Speaker 1"]
+
+        all_speakers = []
+        if mic_segments_raw:
+            all_speakers.append("Me")
+        all_speakers.extend(speakers_list)
+        seen = set()
+        all_speakers = [s for s in all_speakers if not (s in seen or seen.add(s))]
+        all_segments = sorted(mic_segments_raw + final_sys_segments, key=lambda s: s["start"])
+
+        sse("speakers", {
+            "speakers": all_speakers,
+            "segments": all_segments,
+            "embeddings": embeddings,
+        })
+
+        plain_text = "\n".join(seg["text"] for seg in all_segments if seg.get("text"))
+        detected_lang = language
+        if mic_has and mic_info:
+            detected_lang = mic_info.language
+        elif sys_has and sys_info:
+            detected_lang = sys_info.language
+        sse("done", {
+            "text": plain_text,
+            "language": detected_lang,
+            "srt_path": sys_srt_path or mic_srt_path,
+            "txt_path": "",
+            "files": {"wav": wav_path, "srt": sys_srt_path or mic_srt_path, "txt": ""},
+        })
+
 
 if __name__ == "__main__":
     # Load models in background
     loader = threading.Thread(target=load_models, daemon=True)
     loader.start()
 
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"[heed] Transcription server on :{PORT}", flush=True)
 
     try:

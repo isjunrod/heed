@@ -26,6 +26,7 @@ export function Tabs({ tabs, active, onChange }: Props) {
 						className={cls.join(" ")}
 						title={t.disabled ? t.disabledReason : undefined}
 						onClick={() => !t.disabled && onChange(t.id)}
+						data-tour={t.id === "speakers" ? "speakers-tab" : undefined}
 					>
 						{t.label}
 					</div>

@@ -105,7 +105,7 @@ export function SpeakerView({
 	return (
 		<div className={styles.container}>
 			<div className={styles.hint}>Click to rename · Right-click to merge with another speaker</div>
-			<div className={styles.chips}>
+			<div className={styles.chips} data-tour="speaker-chips">
 				{speakers.map((s) => (
 					<div
 						key={s}

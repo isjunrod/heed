@@ -37,14 +37,20 @@ warnings.filterwarnings("ignore")
 
 PORT = int(os.environ.get("HEED_TRANSCRIPTION_PORT", "5002"))
 
+# Stable-by-default profile to prioritize transcript quality/reliability.
+# Set HEED_TRANSCRIPTION_PROFILE=adaptive to re-enable aggressive auto-tuning.
+TRANSCRIPTION_PROFILE = (os.environ.get("HEED_TRANSCRIPTION_PROFILE", "stable") or "stable").strip().lower()
+if TRANSCRIPTION_PROFILE not in {"stable", "adaptive"}:
+    TRANSCRIPTION_PROFILE = "stable"
+
 # --- Model loading (once, kept in memory) ---
-whisper_model = None  # final transcription model (auto-picked by hardware, defaults to small)
-whisper_model_live = None  # live chunk model (auto-picked by hardware, defaults to small)
+whisper_model = None  # final transcription model
+whisper_model_live = None  # live chunk model
 whisper_model_name = "small"
-whisper_model_live_name = "small"
+whisper_model_live_name = "base"
 whisper_runtime_info = {
     "final_model": "small",
-    "live_model": "small",
+    "live_model": "base",
     "device": "cpu",
     "quality": "very_good",
     "speed": "fast",
@@ -352,13 +358,21 @@ def get_system_ram_mb():
 
 
 def pick_whisper_models(device_cfg):
-    """Select Whisper models based on hardware.
+    """Select Whisper models.
 
-    Rules:
-      - Default final and live models are both "small".
-      - Stronger hardware upgrades BOTH models.
-      - Final can scale one step above live on ultra GPUs.
+    Stable profile (default):
+      - final="small", live="base" (known-good baseline)
+
+    Adaptive profile (opt-in):
+      - scales models based on hardware tiers.
     """
+    if TRANSCRIPTION_PROFILE != "adaptive":
+        return {
+            "final": "small",
+            "live": "base",
+            "reason": "stable profile (known-good): final=small, live=base",
+        }
+
     final_model = "small"
     live_model = "small"
     reason = "default small (live + final)"
@@ -398,11 +412,23 @@ def pick_whisper_models(device_cfg):
 
 
 def pick_pyannote_tuning(device_cfg):
-    """Tune pyannote aggressively but safely for current hardware."""
+    """Pick pyannote tuning profile.
+
+    Stable profile (default): conservative known-good batch size.
+    Adaptive profile (opt-in): scales aggressively with hardware.
+    """
     device = device_cfg.get("pyannote", "cpu")
     free_mb = int(device_cfg.get("free_vram_mb", 0) or 0)
     cpu_count = int(device_cfg.get("cpu_count", os.cpu_count() or 0) or 0)
     ram_mb = int(device_cfg.get("ram_mb", get_system_ram_mb()) or 0)
+
+    if TRANSCRIPTION_PROFILE != "adaptive":
+        return {
+            "device": device,
+            "profile": "stable",
+            "batch_size": 8,
+            "reason": "stable profile (known-good, conservative batch=8)",
+        }
 
     if device == "cuda":
         if free_mb >= 14000:
@@ -462,6 +488,7 @@ def load_models():
     global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info
 
     devices = get_device_config()
+    print(f"[heed] Transcription profile: {TRANSCRIPTION_PROFILE}", flush=True)
     whisper_pick = pick_whisper_models(devices)
     whisper_model_name = whisper_pick["final"]
     whisper_model_live_name = whisper_pick["live"]

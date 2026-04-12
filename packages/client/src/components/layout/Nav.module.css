@@ -14,9 +14,30 @@
 	margin: 0 auto;
 	padding: 0 var(--space-6);
 	height: 52px;
-	display: flex;
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) auto;
+	column-gap: clamp(10px, 2vw, 30px);
 	align-items: center;
-	justify-content: space-between;
+}
+
+.leftBlock {
+	min-width: 0;
+	display: flex;
+	justify-content: flex-start;
+}
+
+.centerBlock {
+	display: flex;
+	justify-content: flex-start;
+	min-width: 0;
+	padding-left: clamp(6px, 1.2vw, 16px);
+}
+
+.rightBlock {
+	min-width: 0;
+	display: flex;
+	justify-content: flex-end;
+	padding-left: clamp(22px, 3vw, 56px);
 }
 
 .brand {
@@ -24,6 +45,7 @@
 	font-weight: 700;
 	font-size: 18px;
 	color: var(--blue);
+	justify-self: start;
 }
 
 .tabs {
@@ -58,8 +80,9 @@
 
 .status {
 	display: flex;
-	gap: var(--space-2);
+	gap: 6px;
 	align-items: center;
+	white-space: nowrap;
 }
 
 .statusItem {
@@ -70,7 +93,21 @@
 
 .statusItemInfo {
 	position: relative;
-	cursor: default;
+	cursor: help;
+	padding: 3px 7px 3px 6px;
+	border-radius: 999px;
+	border: 1px solid var(--border-light);
+	background: rgba(255, 255, 255, 0.92);
+	transition: transform 150ms ease, border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
+}
+
+.statusItemInfo:hover,
+.statusItemInfo:focus-visible {
+	transform: translateY(-1px);
+	border-color: rgba(37, 99, 235, 0.34);
+	background: rgba(37, 99, 235, 0.04);
+	box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+	outline: none;
 }
 
 .dot {
@@ -94,16 +131,38 @@
 	color: var(--text-3);
 }
 
+.statusItemInfo .label {
+	color: var(--text-2);
+	font-weight: 600;
+}
+
+.statusItemChevron {
+	font-family: var(--mono);
+	font-size: 10px;
+	line-height: 1;
+	color: var(--text-3);
+	font-weight: 700;
+	margin-left: 2px;
+	transition: transform 140ms ease, color 140ms ease;
+}
+
+
+.statusItemInfo:hover .statusItemChevron,
+.statusItemInfo:focus-visible .statusItemChevron {
+	transform: translateY(1px);
+	color: var(--blue);
+}
+
 .infoTooltip {
 	position: absolute;
-	top: calc(100% + 8px);
+	top: calc(100% + 10px);
 	right: 0;
-	width: 280px;
-	padding: 10px;
+	width: 300px;
+	padding: 12px;
 	border-radius: 10px;
 	background: var(--white);
 	border: 1px solid var(--border-light);
-	box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+	box-shadow: 0 20px 44px rgba(15, 23, 42, 0.15);
 	z-index: 220;
 	opacity: 0;
 	transform: translateY(-4px);
@@ -111,25 +170,60 @@
 	transition: opacity 140ms ease, transform 140ms ease;
 }
 
+.infoTooltip::before {
+	content: "";
+	position: absolute;
+	top: -7px;
+	right: 20px;
+	width: 10px;
+	height: 10px;
+	background: var(--white);
+	border-top: 1px solid var(--border-light);
+	border-left: 1px solid var(--border-light);
+	transform: rotate(45deg);
+}
+
 .statusItemInfo:hover .infoTooltip,
-.statusItemInfo:focus-within .infoTooltip {
+.statusItemInfo:focus-visible .infoTooltip {
 	opacity: 1;
 	transform: translateY(0);
 }
 
+.infoTooltipHead {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 7px;
+}
+
 .infoTooltipTitle {
 	font-family: var(--mono);
-	font-size: 11px;
+	font-size: 10px;
 	font-weight: 700;
 	color: var(--text);
-	margin-bottom: 6px;
+	letter-spacing: 0.45px;
+	text-transform: uppercase;
+}
+
+.infoTooltipBadge {
+	font-family: var(--mono);
+	font-size: 8px;
+	font-weight: 700;
+	padding: 2px 6px;
+	border-radius: 999px;
+	letter-spacing: 0.35px;
+	text-transform: uppercase;
+	background: rgba(16, 185, 129, 0.12);
+	color: #047857;
 }
 
 .infoTooltipLine {
 	font-family: var(--mono);
 	font-size: 10px;
-	line-height: 1.45;
+	line-height: 1.5;
 	color: var(--text-2);
+	padding: 2px 0;
 }
 
 .infoTooltipReason {
@@ -146,22 +240,32 @@
 	display: flex;
 	align-items: center;
 	gap: 6px;
-	padding: 4px 10px;
+	padding: 3px 8px 3px 7px;
 	border-radius: 999px;
 	border: 1px solid var(--border-light);
-	background: var(--white);
+	background: rgba(255, 255, 255, 0.92);
 	font-family: var(--mono);
 	font-size: 10px;
 	color: var(--text-2);
 	cursor: pointer;
-	transition: all 150ms;
-	margin-right: var(--space-2);
+	transition: transform 150ms ease, border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
+	margin-right: 6px;
 }
 
 .modelChip:hover {
+	transform: translateY(-1px);
 	border-color: var(--blue);
 	color: var(--text);
 	background: rgba(59, 130, 246, 0.04);
+	box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+}
+
+.modelChip:focus-visible {
+	outline: none;
+	transform: translateY(-1px);
+	border-color: var(--blue);
+	background: rgba(59, 130, 246, 0.06);
+	box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
 }
 
 .modelChipDot {
@@ -173,6 +277,7 @@
 
 .modelChipName {
 	font-weight: 600;
+	color: var(--text-2);
 }
 
 .modelChipBadge {
@@ -180,19 +285,40 @@
 	color: var(--text-3);
 	font-size: 8px;
 	font-weight: 700;
-	padding: 1px 5px;
+	padding: 2px 5px;
 	border-radius: 999px;
 	letter-spacing: 0.5px;
 }
 
 .modelChipNew {
-	background: linear-gradient(90deg, #f59e0b, #ef4444);
-	color: white;
+	display: inline-flex;
+	align-items: center;
+	background: linear-gradient(135deg, rgba(37, 99, 235, 0.12) 0%, rgba(16, 185, 129, 0.16) 100%);
+	border: 1px solid rgba(37, 99, 235, 0.22);
+	color: #1d4ed8;
 	font-size: 8px;
 	font-weight: 700;
-	padding: 1px 5px;
+	padding: 2px 6px;
 	border-radius: 999px;
-	letter-spacing: 0.5px;
+	letter-spacing: 0.45px;
+	text-transform: uppercase;
+	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+}
+
+.modelChipChevron {
+	font-family: var(--mono);
+	font-size: 10px;
+	line-height: 1;
+	color: var(--text-3);
+	font-weight: 700;
+	margin-left: 1px;
+	transition: transform 140ms ease, color 140ms ease;
+}
+
+.modelChip:hover .modelChipChevron,
+.modelChip:focus-visible .modelChipChevron {
+	transform: translateY(1px);
+	color: var(--blue);
 }
 
 @media (max-width: 640px) {

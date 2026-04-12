@@ -14,6 +14,8 @@ export function SessionsPage() {
 	const [search, setSearch] = useState("");
 	const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
 	const [menuState, setMenuState] = useState<{ x: number; y: number; session: Session } | null>(null);
+	const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
+	const [deleting, setDeleting] = useState(false);
 
 	useEffect(() => {
 		load();
@@ -50,6 +52,25 @@ export function SessionsPage() {
 	if (viewing) {
 		return <SessionDetail session={viewing} onBack={() => view(null)} />;
 	}
+
+	const openDeletePanel = (session: Session) => {
+		setMenuState(null);
+		setDeleteTarget(session);
+	};
+
+	const confirmDelete = async () => {
+		if (!deleteTarget || deleting) return;
+		setDeleting(true);
+		try {
+			await remove(deleteTarget.id);
+			showToast("Session deleted");
+			setDeleteTarget(null);
+		} catch {
+			showToast("Failed to delete session");
+		} finally {
+			setDeleting(false);
+		}
+	};
 
 	return (
 		<div>
@@ -93,6 +114,7 @@ export function SessionsPage() {
 						key={s.id}
 						session={s}
 						onOpen={() => view(s)}
+						onDelete={() => openDeletePanel(s)}
 						onMenu={(e, sess) => {
 							const rect = (e.target as HTMLElement).getBoundingClientRect();
 							setMenuState({ x: rect.right, y: rect.bottom + 4, session: sess });
@@ -112,12 +134,35 @@ export function SessionsPage() {
 						await update(menuState.session.id, { pinned: !menuState.session.pinned });
 						showToast(menuState.session.pinned ? "Unpinned" : "Pinned");
 					}}
-					onDelete={async () => {
-						if (!confirm(`Delete "${menuState.session.title}"? This cannot be undone.`)) return;
-						await remove(menuState.session.id);
-						showToast("Deleted");
-					}}
+					onDelete={() => openDeletePanel(menuState.session)}
 				/>
+			)}
+
+			{deleteTarget && (
+				<div className={styles.confirmOverlay} onClick={() => !deleting && setDeleteTarget(null)}>
+					<div className={styles.confirmPanel} onClick={(e) => e.stopPropagation()}>
+						<div className={styles.confirmTitle}>Delete session?</div>
+						<div className={styles.confirmBody}>
+							"{deleteTarget.title || "Untitled"}" will be permanently removed. This cannot be undone.
+						</div>
+						<div className={styles.confirmActions}>
+							<button
+								className={styles.confirmCancel}
+								onClick={() => setDeleteTarget(null)}
+								disabled={deleting}
+							>
+								Cancel
+							</button>
+							<button
+								className={styles.confirmDelete}
+								onClick={confirmDelete}
+								disabled={deleting}
+							>
+								{deleting ? "Deleting..." : "Delete"}
+							</button>
+						</div>
+					</div>
+				</div>
 			)}
 		</div>
 	);

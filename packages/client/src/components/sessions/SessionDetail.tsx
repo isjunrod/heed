@@ -143,6 +143,8 @@ export function SessionDetail({ session, onBack }: Props) {
 					speakerNames={speakerNames}
 					onRename={handleSpeakerRename}
 					onMerge={handleSpeakerMerge}
+					emptyMessage="No speaker segments in this session yet."
+					animateEmpty={false}
 				/>
 			)}
 

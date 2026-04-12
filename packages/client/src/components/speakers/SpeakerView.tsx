@@ -39,9 +39,20 @@ interface Props {
 	speakerNames: Record<string, string>;
 	onRename: (original: string, newName: string) => void;
 	onMerge: (from: string, into: string) => void;
+	emptyMessage?: string;
+	animateEmpty?: boolean;
 }
 
-export function SpeakerView({ segments, speakers, embeddings, speakerNames, onRename, onMerge }: Props) {
+export function SpeakerView({
+	segments,
+	speakers,
+	embeddings,
+	speakerNames,
+	onRename,
+	onMerge,
+	emptyMessage = "Listening...",
+	animateEmpty = true,
+}: Props) {
 	const showToast = useUIStore((s) => s.showToast);
 	const [mergeMenu, setMergeMenu] = useState<{ x: number; y: number; speaker: string } | null>(null);
 
@@ -54,8 +65,10 @@ export function SpeakerView({ segments, speakers, embeddings, speakerNames, onRe
 	if (!segments?.length) {
 		return (
 			<div className={styles.placeholder}>
-				<span className={styles.placeholderDot} />
-				Listening...
+				<span
+					className={`${styles.placeholderDot} ${animateEmpty ? styles.placeholderDotPulse : styles.placeholderDotStatic}`}
+				/>
+				{emptyMessage}
 			</div>
 		);
 	}

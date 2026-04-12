@@ -1,0 +1,15 @@
+{
+	"name": "create-heed",
+	"version": "0.1.0",
+	"description": "Set up heed — local-first meeting transcription with speaker diarization. One command, everything installs.",
+	"bin": {
+		"create-heed": "./bin/cli.mjs"
+	},
+	"type": "module",
+	"license": "MIT",
+	"keywords": ["meeting", "transcription", "whisper", "pyannote", "diarization", "local-first", "privacy"],
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/isjunrod/heed"
+	}
+}

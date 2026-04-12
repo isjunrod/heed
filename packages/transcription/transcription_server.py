@@ -287,8 +287,21 @@ def get_device_config():
     cpu_count = os.cpu_count() or 0
     ram_mb = get_system_ram_mb()
 
+    # Apple Silicon MPS (Metal Performance Shaders) support
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print(f"[heed] Apple Silicon MPS detected ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
+        print("[heed] Strategy: pyannote on MPS, whisper on CPU", flush=True)
+        return {
+            "whisper": "cpu",  # faster-whisper uses CTranslate2, not PyTorch — CPU is fastest
+            "pyannote": "mps",
+            "gpu_available": True,
+            "gpu_name": "Apple Silicon (MPS)",
+            "total_vram_mb": ram_mb,  # MPS shares system RAM
+            "free_vram_mb": ram_mb // 2,  # conservative estimate
+        }
+
     if not torch.cuda.is_available():
-        print(f"[heed] No CUDA — using CPU for all models ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
+        print(f"[heed] No CUDA/MPS — using CPU for all models ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
         return {
             "whisper": "cpu",
             "pyannote": "cpu",
@@ -570,8 +583,8 @@ def load_models():
     from pyannote.audio import Pipeline
     diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
     pyannote_tuning = pick_pyannote_tuning(devices)
-    if devices["pyannote"] == "cuda":
-        diarize_pipeline.to(torch.device("cuda"))
+    if devices["pyannote"] in ("cuda", "mps"):
+        diarize_pipeline.to(torch.device(devices["pyannote"]))
     else:
         cpu_threads = int(pyannote_tuning.get("cpu_threads", 0) or 0)
         if cpu_threads > 0:

@@ -4,6 +4,22 @@ export interface HealthResponse {
 	ollama: boolean;
 	whisper: boolean;
 	pyannote: boolean;
+	whisper_info?: {
+		final_model: string;
+		live_model: string;
+		device: "cpu" | "cuda";
+		quality: "very_good" | "excellent" | "best";
+		speed: "fast" | "medium" | "slower";
+		reason: string;
+	} | null;
+	pyannote_info?: {
+		model: string;
+		device: "cpu" | "cuda";
+		profile: string;
+		batch_size: number;
+		reason: string;
+		cpu_threads?: number;
+	} | null;
 }
 
 export interface TranscribeResult {

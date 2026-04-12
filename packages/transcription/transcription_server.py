@@ -27,19 +27,36 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 # Locks to prevent concurrent calls to the same whisper model (not thread-safe).
-# Different models (small vs base) CAN run concurrently.
+# Different model instances (final vs live) CAN run concurrently.
 whisper_lock = threading.Lock()
 whisper_live_lock = threading.Lock()
 
 warnings.filterwarnings("ignore")
 # HF_HUB_OFFLINE is set AFTER model loading in load_models() so that
-# first-time downloads (whisper small + tiny) can reach HuggingFace.
+# first-time downloads (auto-picked whisper models) can reach HuggingFace.
 
 PORT = int(os.environ.get("HEED_TRANSCRIPTION_PORT", "5002"))
 
 # --- Model loading (once, kept in memory) ---
-whisper_model = None       # "small" — high quality, used for final processing after stop
-whisper_model_live = None   # "tiny" — fast, used for live chunks during recording (~6x faster)
+whisper_model = None  # final transcription model (auto-picked by hardware, defaults to small)
+whisper_model_live = None  # live chunk model (auto-picked by hardware, defaults to small)
+whisper_model_name = "small"
+whisper_model_live_name = "small"
+whisper_runtime_info = {
+    "final_model": "small",
+    "live_model": "small",
+    "device": "cpu",
+    "quality": "very_good",
+    "speed": "fast",
+    "reason": "initializing",
+}
+pyannote_runtime_info = {
+    "model": "pyannote/speaker-diarization-3.1",
+    "device": "cpu",
+    "profile": "balanced",
+    "batch_size": 8,
+    "reason": "initializing",
+}
 diarize_pipeline = None
 models_ready = {"whisper": False, "pyannote": False}
 
@@ -261,9 +278,21 @@ def get_device_config():
     """
     import torch
 
+    cpu_count = os.cpu_count() or 0
+    ram_mb = get_system_ram_mb()
+
     if not torch.cuda.is_available():
-        print("[heed] No CUDA — using CPU for all models", flush=True)
-        return {"whisper": "cpu", "pyannote": "cpu"}
+        print(f"[heed] No CUDA — using CPU for all models ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
+        return {
+            "whisper": "cpu",
+            "pyannote": "cpu",
+            "gpu_available": False,
+            "gpu_name": None,
+            "free_vram_mb": 0,
+            "total_vram_mb": 0,
+            "cpu_count": cpu_count,
+            "ram_mb": ram_mb,
+        }
 
     free_bytes, total_bytes = torch.cuda.mem_get_info(0)
     free_mb = free_bytes // 1024 // 1024
@@ -273,28 +302,197 @@ def get_device_config():
 
     if free_mb >= 6000:
         print("[heed] Strategy: both models on GPU", flush=True)
-        return {"whisper": "cuda", "pyannote": "cuda"}
+        return {
+            "whisper": "cuda",
+            "pyannote": "cuda",
+            "gpu_available": True,
+            "gpu_name": gpu_name,
+            "free_vram_mb": int(free_mb),
+            "total_vram_mb": int(total_mb),
+            "cpu_count": cpu_count,
+            "ram_mb": ram_mb,
+        }
     elif free_mb >= 1500:
         # Pyannote benefits MORE from GPU than whisper (25s→5s vs 9s→5s)
         print(f"[heed] Strategy: pyannote on GPU, whisper on CPU ({free_mb}MB free)", flush=True)
-        return {"whisper": "cpu", "pyannote": "cuda"}
+        return {
+            "whisper": "cpu",
+            "pyannote": "cuda",
+            "gpu_available": True,
+            "gpu_name": gpu_name,
+            "free_vram_mb": int(free_mb),
+            "total_vram_mb": int(total_mb),
+            "cpu_count": cpu_count,
+            "ram_mb": ram_mb,
+        }
     else:
         print(f"[heed] Strategy: both on CPU (only {free_mb}MB free, need >=1500MB for pyannote on GPU)", flush=True)
-        return {"whisper": "cpu", "pyannote": "cpu"}
+        return {
+            "whisper": "cpu",
+            "pyannote": "cpu",
+            "gpu_available": True,
+            "gpu_name": gpu_name,
+            "free_vram_mb": int(free_mb),
+            "total_vram_mb": int(total_mb),
+            "cpu_count": cpu_count,
+            "ram_mb": ram_mb,
+        }
+
+
+def get_system_ram_mb():
+    """Best-effort total system RAM (MB) without external deps like psutil."""
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size and phys_pages:
+            return int((page_size * phys_pages) // 1024 // 1024)
+    except Exception:
+        pass
+    return 0
+
+
+def pick_whisper_models(device_cfg):
+    """Select Whisper models based on hardware.
+
+    Rules:
+      - Default final and live models are both "small".
+      - Stronger hardware upgrades BOTH models.
+      - Final can scale one step above live on ultra GPUs.
+    """
+    final_model = "small"
+    live_model = "small"
+    reason = "default small (live + final)"
+
+    whisper_device = device_cfg.get("whisper", "cpu")
+    free_mb = int(device_cfg.get("free_vram_mb", 0) or 0)
+
+    # GPU tiers are conservative because pyannote may run in parallel.
+    if whisper_device == "cuda":
+        if free_mb >= 18000:
+            final_model = "large-v3"
+            live_model = "medium"
+            reason = f"GPU ultra tier ({free_mb}MB free VRAM, both scaled)"
+        elif free_mb >= 9000:
+            final_model = "medium"
+            live_model = "medium"
+            reason = f"GPU high tier ({free_mb}MB free VRAM, both scaled)"
+        else:
+            reason = f"GPU baseline tier ({free_mb}MB free VRAM, both small)"
+    else:
+        cpu_count = int(device_cfg.get("cpu_count", os.cpu_count() or 0) or 0)
+        ram_mb = int(device_cfg.get("ram_mb", get_system_ram_mb()) or 0)
+
+        # CPU-only upgrades require genuinely strong hardware to avoid painful latency.
+        if cpu_count >= 16 and ram_mb >= 24000:
+            final_model = "medium"
+            live_model = "medium"
+            reason = f"CPU high tier ({cpu_count} cores, {ram_mb}MB RAM, both scaled)"
+        else:
+            reason = f"CPU baseline tier ({cpu_count} cores, {ram_mb}MB RAM, both small)"
+
+    return {
+        "final": final_model,
+        "live": live_model,
+        "reason": reason,
+    }
+
+
+def pick_pyannote_tuning(device_cfg):
+    """Tune pyannote aggressively but safely for current hardware."""
+    device = device_cfg.get("pyannote", "cpu")
+    free_mb = int(device_cfg.get("free_vram_mb", 0) or 0)
+    cpu_count = int(device_cfg.get("cpu_count", os.cpu_count() or 0) or 0)
+    ram_mb = int(device_cfg.get("ram_mb", get_system_ram_mb()) or 0)
+
+    if device == "cuda":
+        if free_mb >= 14000:
+            return {
+                "device": "cuda",
+                "profile": "max",
+                "batch_size": 32,
+                "reason": f"high free VRAM ({free_mb}MB)",
+            }
+        if free_mb >= 9000:
+            return {
+                "device": "cuda",
+                "profile": "high",
+                "batch_size": 24,
+                "reason": f"mid-high free VRAM ({free_mb}MB)",
+            }
+        if free_mb >= 5000:
+            return {
+                "device": "cuda",
+                "profile": "balanced",
+                "batch_size": 16,
+                "reason": f"mid free VRAM ({free_mb}MB)",
+            }
+        if free_mb >= 2500:
+            return {
+                "device": "cuda",
+                "profile": "safe",
+                "batch_size": 10,
+                "reason": f"low free VRAM ({free_mb}MB)",
+            }
+        return {
+            "device": "cuda",
+            "profile": "minimum",
+            "batch_size": 8,
+            "reason": f"very low free VRAM ({free_mb}MB)",
+        }
+
+    cpu_threads = max(2, min(16, cpu_count))
+    if cpu_count >= 16 and ram_mb >= 24000:
+        return {
+            "device": "cpu",
+            "profile": "cpu-max",
+            "batch_size": 12,
+            "cpu_threads": cpu_threads,
+            "reason": f"strong CPU ({cpu_count} cores, {ram_mb}MB RAM)",
+        }
+    return {
+        "device": "cpu",
+        "profile": "cpu-balanced",
+        "batch_size": 8,
+        "cpu_threads": max(2, min(12, cpu_threads)),
+        "reason": f"standard CPU ({cpu_count} cores, {ram_mb}MB RAM)",
+    }
 
 
 def load_models():
-    global whisper_model, whisper_model_live, diarize_pipeline
+    global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info
 
     devices = get_device_config()
+    whisper_pick = pick_whisper_models(devices)
+    whisper_model_name = whisper_pick["final"]
+    whisper_model_live_name = whisper_pick["live"]
+    whisper_quality = "very_good"
+    whisper_speed = "fast"
+    if whisper_model_name == "medium":
+        whisper_quality = "excellent"
+        whisper_speed = "medium"
+    elif whisper_model_name == "large-v3":
+        whisper_quality = "best"
+        whisper_speed = "slower"
+    whisper_runtime_info = {
+        "final_model": whisper_model_name,
+        "live_model": whisper_model_live_name,
+        "device": devices.get("whisper", "cpu"),
+        "quality": whisper_quality,
+        "speed": whisper_speed,
+        "reason": whisper_pick["reason"],
+    }
+    print(
+        f"[heed] Whisper auto-pick: final={whisper_model_name}, live={whisper_model_live_name} ({whisper_pick['reason']})",
+        flush=True,
+    )
 
-    # --- Whisper small (final processing) + base (live chunks) ---
+    # --- Whisper (hardware-aware auto-pick) ---
     whisper_device = devices["whisper"]
     compute_type = "float16" if whisper_device == "cuda" else "int8"
-    print(f"[heed] Loading faster-whisper small on {whisper_device} ({compute_type})...", flush=True)
+    print(f"[heed] Loading faster-whisper {whisper_model_name} on {whisper_device} ({compute_type})...", flush=True)
     t = time.time()
     from faster_whisper import WhisperModel
-    whisper_model = WhisperModel("small", device=whisper_device, compute_type=compute_type)
+    whisper_model = WhisperModel(whisper_model_name, device=whisper_device, compute_type=compute_type)
     # Warm-up JIT
     print(f"[heed] Warming up whisper (JIT compile)...", flush=True)
     _warmup_path = os.path.join(os.path.dirname(__file__), "_warmup.wav")
@@ -306,22 +504,33 @@ def load_models():
             wf.setframerate(16000)
             wf.writeframes(struct.pack("<" + "h" * 8000, *([0] * 8000)))
         list(whisper_model.transcribe(_warmup_path, language="en")[0])
-        os.remove(_warmup_path)
     except Exception as e:
         print(f"[heed] Warmup failed (non-critical): {e}", flush=True)
     models_ready["whisper"] = True
-    print(f"[heed] Whisper small ready in {time.time()-t:.1f}s ({whisper_device}, {compute_type})", flush=True)
+    print(f"[heed] Whisper {whisper_model_name} ready in {time.time()-t:.1f}s ({whisper_device}, {compute_type})", flush=True)
 
-    # Whisper base for live transcription during recording (~800ms per 5s chunk)
-    print(f"[heed] Loading faster-whisper base for live mode...", flush=True)
+    # Live model for chunk transcription during recording
+    print(f"[heed] Loading faster-whisper {whisper_model_live_name} for live mode...", flush=True)
     t2 = time.time()
-    whisper_model_live = WhisperModel("base", device=whisper_device, compute_type=compute_type)
+    whisper_model_live = WhisperModel(whisper_model_live_name, device=whisper_device, compute_type=compute_type)
     try:
-        if os.path.exists(_warmup_path):
-            list(whisper_model_live.transcribe(_warmup_path, language="en")[0])
+        if not os.path.exists(_warmup_path):
+            import struct, wave
+            with wave.open(_warmup_path, "w") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(struct.pack("<" + "h" * 8000, *([0] * 8000)))
+        list(whisper_model_live.transcribe(_warmup_path, language="en")[0])
     except Exception:
         pass
-    print(f"[heed] Whisper base (live) ready in {time.time()-t2:.1f}s", flush=True)
+    finally:
+        try:
+            if os.path.exists(_warmup_path):
+                os.remove(_warmup_path)
+        except Exception:
+            pass
+    print(f"[heed] Whisper {whisper_model_live_name} (live) ready in {time.time()-t2:.1f}s", flush=True)
 
     # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -333,15 +542,39 @@ def load_models():
     import torch
     from pyannote.audio import Pipeline
     diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+    pyannote_tuning = pick_pyannote_tuning(devices)
     if devices["pyannote"] == "cuda":
         diarize_pipeline.to(torch.device("cuda"))
-        # Lower batch size for GPUs with limited VRAM (4GB)
-        vram = torch.cuda.get_device_properties(0).total_memory // 1024 // 1024
-        if vram < 6000:
-            diarize_pipeline._segmentation.batch_size = 8
-            if hasattr(diarize_pipeline, '_embedding'):
-                diarize_pipeline._embedding.batch_size = 8
-            print(f"[heed] Reduced batch_size to 8 for {vram}MB VRAM", flush=True)
+    else:
+        cpu_threads = int(pyannote_tuning.get("cpu_threads", 0) or 0)
+        if cpu_threads > 0:
+            try:
+                torch.set_num_threads(cpu_threads)
+                torch.set_num_interop_threads(max(1, cpu_threads // 2))
+                print(f"[heed] Pyannote CPU threads tuned: {cpu_threads}", flush=True)
+            except Exception as e:
+                print(f"[heed] Could not tune pyannote CPU threads: {e}", flush=True)
+
+    bs = int(pyannote_tuning.get("batch_size", 8) or 8)
+    try:
+        diarize_pipeline._segmentation.batch_size = bs
+        if hasattr(diarize_pipeline, '_embedding'):
+            diarize_pipeline._embedding.batch_size = bs
+    except Exception as e:
+        print(f"[heed] Could not apply pyannote batch_size={bs}: {e}", flush=True)
+
+    pyannote_runtime_info = {
+        "model": "pyannote/speaker-diarization-3.1",
+        "device": pyannote_tuning.get("device", devices["pyannote"]),
+        "profile": pyannote_tuning.get("profile", "balanced"),
+        "batch_size": bs,
+        "reason": pyannote_tuning.get("reason", "auto"),
+        **({"cpu_threads": pyannote_tuning.get("cpu_threads")} if pyannote_tuning.get("cpu_threads") else {}),
+    }
+    print(
+        f"[heed] Pyannote tuning: profile={pyannote_runtime_info['profile']}, batch={pyannote_runtime_info['batch_size']} ({pyannote_runtime_info['reason']})",
+        flush=True,
+    )
     models_ready["pyannote"] = True
     print(f"[heed] Pyannote ready in {time.time()-t:.1f}s ({devices['pyannote']})", flush=True)
     print("[heed] All models ready!", flush=True)
@@ -381,6 +614,7 @@ def transcribe(wav_path, language="auto", srt_output=None):
         "srt_path": srt_path,
         "txt_path": txt_path,
         "language": info.language if info else language,
+        "model": whisper_model_name,
     }
 
 
@@ -696,7 +930,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json({"ready": all(models_ready.values()), **models_ready})
+            self._json({
+                "ready": all(models_ready.values()),
+                **models_ready,
+                "whisper_info": whisper_runtime_info,
+                "pyannote_info": pyannote_runtime_info,
+            })
         elif self.path == "/voices":
             self._json({"voices": list(load_voices().keys())})
         elif self.path == "/hardware":
@@ -722,7 +961,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(result)
 
         elif self.path == "/transcribe-live":
-            # Fast transcription using the base model — for live chunks during recording.
+            # Live transcription using the auto-picked live model.
             if not whisper_model_live:
                 self._json({"error": "live whisper not loaded"}, 503)
                 return
@@ -753,6 +992,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({
                 "text": " ".join(lines),
                 "language": info.language if info else "auto",
+                "model": whisper_model_live_name,
                 "time_ms": int((time.time() - t) * 1000),
             })
 
@@ -804,7 +1044,13 @@ class Handler(BaseHTTPRequestHandler):
                     for seg in diar.get("segments", []):
                         sse("segment", seg)
                     sse("speakers", {"speakers": diar.get("speakers", []), "embeddings": diar.get("embeddings", {})})
-                    sse("done", {"text": tx.get("text", ""), "language": tx.get("language", language), "srt_path": tx.get("srt_path", ""), "txt_path": tx.get("txt_path", "")})
+                    sse("done", {
+                        "text": tx.get("text", ""),
+                        "language": tx.get("language", language),
+                        "model": tx.get("model", whisper_model_name),
+                        "srt_path": tx.get("srt_path", ""),
+                        "txt_path": tx.get("txt_path", ""),
+                    })
 
                 sse("complete", {"total_time_ms": int((time.time() - t_start) * 1000)})
             except Exception as e:
@@ -955,6 +1201,7 @@ class Handler(BaseHTTPRequestHandler):
         sse("done", {
             "text": plain_text,
             "language": detected_lang,
+            "model": whisper_model_name,
             "srt_path": sys_srt_path or mic_srt_path,
             "txt_path": "",
             "files": {"wav": wav_path, "srt": sys_srt_path or mic_srt_path, "txt": ""},

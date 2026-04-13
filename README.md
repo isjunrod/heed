@@ -312,7 +312,7 @@ PRs welcome. The codebase is clean and typed. Start with `bun run dev` and explo
 
 ## License
 
-MIT
+[MIT](LICENSE) — free to use, modify, and distribute.
 
 ---
 

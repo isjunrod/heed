@@ -61,7 +61,7 @@ jobs:
 
       - name: Install Python deps
         run: |
-          pip3 install faster-whisper pyannote-audio
+          pip3 install --break-system-packages faster-whisper pyannote-audio
 
       - name: Verify Python server syntax
         run: python3 -c "import py_compile; py_compile.compile('packages/transcription/transcription_server.py', doraise=True)"

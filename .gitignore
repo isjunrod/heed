@@ -21,3 +21,5 @@ recordings/*.srt
 recordings/*.txt
 pendints.txt
 _warmup.wav
+CLAUDE.md
+docs/competitive-analysis.md

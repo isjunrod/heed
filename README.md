@@ -19,45 +19,11 @@
 
 ---
 
-<br/>
+<p align="center">
+  <img src="assets/screenshot-hero.png" alt="heed — live transcription with 4 speakers identified" width="100%" />
+</p>
 
-```
-  Speakers                                            AI Notes
-
-  ● Me   ● Sarah Chen   ● Marcus Rivera   ● Alex Kim
-
-  Sarah Chen
-    The Q3 numbers are in. We hit 142% of target across all regions.
-
-  Me
-    That's incredible. What drove the spike in LATAM?
-
-  Marcus Rivera
-    Two things — the referral program we launched in August, and the
-    partnership with Banco Nacional finally closing. That alone brought
-    340 new enterprise accounts.
-
-  Alex Kim
-    On the product side, the self-serve dashboard reduced onboarding
-    time by 60%. Support tickets dropped from 2,300 to 890 per week.
-
-  Me
-    Let's double down on LATAM Q4. Marcus, can you draft a proposal
-    for expanding the Banco Nacional model to Colombia and Chile?
-
-  Marcus Rivera
-    Already on it. I'll have something by Friday.
-
-  Sarah Chen
-    Perfect. Alex, what's the timeline on the API v2 rollout?
-
-  Alex Kim
-    Beta in two weeks. Full launch mid-November if QA signs off.
-```
-
-<br/>
-
-> *4 speakers. Identified by voice, not by login. Overlapping speech detected. AI notes generated with one click. Everything processed by YOUR GPU. $0/month.*
+> *4 speakers. Identified by voice, not by login. Live transcription while recording. AI notes with one click. Everything processed by YOUR GPU. $0/month.*
 
 ---
 

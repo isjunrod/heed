@@ -1,6 +1,6 @@
 {
 	"name": "create-heed",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"description": "Set up heed — local-first meeting transcription with real speaker diarization. One command, everything installs.",
 	"author": "Junior Rodriguez <junrodpro@gmail.com> (https://github.com/isjunrod)",
 	"license": "MIT",

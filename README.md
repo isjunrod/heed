@@ -231,21 +231,48 @@ This is why heed detects overlapping voices that other tools miss — they mix e
 
 ## Key features
 
-**Live transcription** — Text appears in real-time as you record. Speakers are identified progressively.
+**Live transcription** — Text appears in real-time as you record. You don't wait until the meeting ends to know what was said. Speakers are identified progressively while you're still talking.
 
-**Hardware-aware model picker** — heed detects your GPU/CPU and recommends the best AI model. 14 models from Llama, Qwen, Gemma families. Download in-app with one click.
+**Overlap detection** — Two people talking at once? heed catches it. Because mic and system audio live in separate channels, it knows exactly when voices collide. Every other tool mixes to mono first and loses this information forever.
 
-**Voice memory** — Rename a speaker once, heed remembers their voice forever. Next meeting, automatic recognition.
+**Voice memory** — Rename a speaker once. heed saves their voice embedding and recognizes them automatically in every future meeting. No training, no setup. It just remembers.
 
-**Smart auto-titles** — Ollama generates a descriptive title from the transcript. No more "Meeting Apr 12, 2026".
+**Hardware-aware model picker** — On first launch, heed reads your GPU, VRAM, CPU, and RAM. Then it recommends the best AI model that actually fits your machine. 14 models from Llama, Qwen, Gemma families. Download in-app, one click, no terminal needed.
 
-**Auto-recovery** — If heed crashes mid-recording, your audio is safe on disk. On next launch, one click to recover and transcribe.
+**Smart auto-titles** — "Q3 Revenue Review with Sarah and Marcus" instead of "Meeting Apr 12, 2026". Ollama generates a real title from the transcript content, in whatever language was spoken.
 
-**Bilingual setup wizard** — First-time users get a guided 3-step setup (Ollama, ffmpeg, AI model) in English or Spanish.
+**Note templates** — Choose a prompt template before generating notes: general summary, sales call, 1-on-1, retrospective, or write your own. Same transcript, different output depending on what you need.
 
-**GPU/CPU transparency** — If your model doesn't fit in VRAM, heed tells you and offers CPU mode instead of silently crashing.
+<details>
+<summary><strong>All features</strong></summary>
 
-**In-app tour** — 5-step interactive tour for new users. Spotlight style, works in English and Spanish.
+<br/>
+
+**Smart rename = merge** — Rename "Speaker 2" to "Sarah Chen". If Sarah already exists from a previous identification, heed merges them automatically. No duplicate chips, no manual cleanup. Right-click still works for explicit merges.
+
+**Inline `#tag` autocomplete** — Type `#` in the session title and get tag suggestions. Organize sessions by project, client, or topic without leaving the recording screen.
+
+**Meeting auto-detector** — heed listens to your system's audio stack (PipeWire on Linux) and detects when Zoom, Meet, Teams, or Discord are active. It can prompt you to start recording automatically when a meeting begins.
+
+**VRAM intelligence** — When Ollama generates notes, it holds your GPU's memory hostage. heed forces `keep_alive: 0` so the model unloads immediately after generation, freeing VRAM for pyannote's next diarization pass. On 4GB GPUs, this is the difference between working and crashing.
+
+**Auto-recovery** — heed crashed mid-recording? Your audio is safe on disk. On next launch, one click recovers the session and transcribes everything. Nothing is lost.
+
+**GPU/CPU split** — heed auto-detects your free VRAM and splits work intelligently. Less than 1.5GB free: everything on CPU. 1.5-6GB: pyannote on GPU, whisper on CPU. 6GB+: both on GPU. No manual configuration.
+
+**Offline capable** — No internet connection needed after initial setup. All models run locally. Record a meeting on a plane, transcribe it on a train.
+
+**Works with everything** — Zoom, Google Meet, Teams, Discord, a YouTube video, a podcast, a voice memo. If audio plays on your computer, heed captures it. Nobody in the call installs anything, nobody knows you're recording.
+
+**Bilingual setup wizard** — First-time users get a guided 3-step setup (Ollama, ffmpeg, AI model) in English or Spanish. The app detects your system language automatically.
+
+**In-app tour** — 5-step interactive walkthrough for new users. Spotlight-style highlights, contextual explanations. Skippable, never shown again.
+
+**GPU/CPU transparency** — If your selected model doesn't fit in VRAM, heed tells you exactly why and offers CPU mode. No silent crashes, no cryptic CUDA errors. You always know what's running and where.
+
+**Ollama auto-retry** — If the AI model crashes from RAM exhaustion (it happens), heed waits 3 seconds and retries automatically. You see notes, not error messages.
+
+</details>
 
 ---
 

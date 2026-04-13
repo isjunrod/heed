@@ -123,11 +123,8 @@ async function main() {
 
   // ==================== SCENE 2: Record ====================
   console.log("[demo] Starting recording...");
-  const recordBtn = page.locator("[data-tour='record']");
-  await recordBtn.click();
-  await sleep(400);
-
-  // Mock recording state
+  // DON'T click the real button — it tries to record and fails without audio devices
+  // Mock the entire recording state visually
   await page.evaluate(() => {
     const btn = document.querySelector("[data-tour='record']");
     if (btn) {
@@ -149,26 +146,42 @@ async function main() {
     });
   });
 
-  // Bar animation
+  // Bar animation — runs INSIDE the browser, reacts to who is speaking
+  // window.__demoActiveSpeaker: "me" = mic bars active, "other" = system bars active, "idle" = both low
   console.log("[demo] Animating visualizer bars...");
-  const barAnimation = setInterval(async () => {
-    await page.evaluate(() => {
+  await page.evaluate(() => {
+    window.__demoActiveSpeaker = "idle";
+    let lastTimerTick = Date.now();
+    window.__demoBarAnimation = setInterval(() => {
+      const who = window.__demoActiveSpeaker || "idle";
       document.querySelectorAll("[class*='bar']").forEach((bar) => {
         const isSys = bar.style.background?.includes("16, 185, 129") || bar.className?.includes("System") || bar.style.backgroundColor?.includes("rgb(16, 185, 129)");
-        const maxH = isSys ? 45 : 75;
-        const minH = isSys ? 4 : 6;
+        let maxH, minH;
+        if (isSys) {
+          // System bars: strong when others speak, quiet when "me" speaks
+          maxH = who === "other" ? 68 : who === "idle" ? 12 : 8;
+          minH = who === "other" ? 15 : 3;
+        } else {
+          // Mic bars: strong when "me" speaks, quiet when others speak
+          maxH = who === "me" ? 80 : who === "idle" ? 12 : 8;
+          minH = who === "me" ? 18 : 3;
+        }
         bar.style.height = Math.floor(Math.random() * (maxH - minH) + minH) + "px";
       });
-      // Tick timer
-      document.querySelectorAll("*").forEach((el) => {
-        if (el.childNodes.length === 1 && el.childNodes[0].nodeType === 3 && /^\d{2}:\d{2}$/.test(el.textContent.trim())) {
-          const [m, s] = el.textContent.trim().split(":").map(Number);
-          const t = m * 60 + s + 1;
-          el.textContent = `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
-        }
-      });
-    });
-  }, 120);
+      // Tick timer every ~1s
+      const now = Date.now();
+      if (now - lastTimerTick >= 1000) {
+        lastTimerTick = now;
+        document.querySelectorAll("*").forEach((el) => {
+          if (el.childNodes.length === 1 && el.childNodes[0].nodeType === 3 && /^\d{2}:\d{2}$/.test(el.textContent.trim())) {
+            const [m, s] = el.textContent.trim().split(":").map(Number);
+            const t = m * 60 + s + 1;
+            el.textContent = `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
+          }
+        });
+      }
+    }, 80);
+  });
 
   await sleep(1200);
 
@@ -202,6 +215,11 @@ async function main() {
   for (let i = 0; i < CONVERSATION.length; i++) {
     const line = CONVERSATION[i];
     const speaker = SPEAKERS[line.speaker];
+
+    // Set active speaker for visualizer bars (0 = "Me" = mic, others = system)
+    await page.evaluate(({ isMe }) => {
+      window.__demoActiveSpeaker = isMe ? "me" : "other";
+    }, { isMe: line.speaker === 0 });
 
     // Add chip
     await page.evaluate(({ sp, idx }) => {
@@ -245,18 +263,23 @@ async function main() {
       const el = document.getElementById("demo-current-line");
       if (el) el.textContent = final;
       el?.removeAttribute("id");
+      // Brief idle between speakers
+      window.__demoActiveSpeaker = "idle";
     }, { final: text });
 
     await sleep(250);
   }
 
+  // Set to idle before stopping
+  await page.evaluate(() => { window.__demoActiveSpeaker = "idle"; });
   await sleep(1200);
 
   // ==================== SCENE 4: Stop recording ====================
   console.log("[demo] Stopping recording...");
-  clearInterval(barAnimation);
 
   await page.evaluate(() => {
+    // Stop the in-browser bar animation
+    if (window.__demoBarAnimation) clearInterval(window.__demoBarAnimation);
     document.querySelectorAll("[class*='bar']").forEach((bar) => {
       bar.style.height = "2px";
       bar.style.transition = "height 0.5s ease";

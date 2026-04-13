@@ -314,6 +314,12 @@ MIT
 
 ---
 
+## Acknowledgments
+
+Inspired by [trx](https://github.com/crafter-station/trx) by CrafterStation.
+
+---
+
 <p align="center">
   <em>Built for the people who believe their conversations belong to them.</em>
 </p>

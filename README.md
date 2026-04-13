@@ -22,7 +22,7 @@
 ---
 
 <p align="center">
-  <img src="assets/screenshot-hero.png" alt="heed — live transcription with 4 speakers identified" width="100%" />
+  <img src="assets/demo.gif" alt="heed demo — record, live transcription, AI notes, session tags" width="100%" />
 </p>
 
 > *4 speakers. Identified by voice, not by login. Live transcription while recording. AI notes with one click. Everything processed by YOUR GPU. $0/month.*

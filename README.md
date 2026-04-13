@@ -232,12 +232,6 @@ From anywhere:
 npx create-heed update
 ```
 
-Or inside the project:
-
-```bash
-bun run update
-```
-
 Only downloads what changed. Auto-reinstalls dependencies if needed.
 
 ---
@@ -315,12 +309,11 @@ packages/
 ## Commands
 
 ```bash
-bun run dev           # Start all services (server + client + python)
-bun run build         # Build frontend for production
-bun run desktop       # Open floating desktop panel
-bun run update        # Pull latest changes
-npx create-heed       # First-time install
-npx create-heed update  # Update from anywhere
+bun run dev              # Start all services (server + client + python)
+bun run build            # Build frontend for production
+bun run desktop          # Open floating desktop panel
+npx create-heed          # First-time install
+npx create-heed update   # Update from anywhere
 ```
 
 ---
@@ -345,7 +338,7 @@ If you're here because Meetily didn't compile on your Linux distro — welcome. 
 
 ## Contributing
 
-PRs welcome. The codebase is clean, typed, and documented. Start with `bun run dev` and read `CLAUDE.md` for architecture details.
+PRs welcome. The codebase is clean and typed. Start with `bun run dev` and explore the `packages/` structure.
 
 ---
 

@@ -3,11 +3,11 @@
 /**
  * create-heed CLI
  *
- * Interactive installer for heed — local-first meeting transcription.
- * Detects OS, checks dependencies, installs what's missing, clones the
- * repo, and opens the app in the browser.
+ * Interactive installer + updater for heed.
  *
- * Usage: npx create-heed
+ * Usage:
+ *   npx create-heed           # install heed (first time)
+ *   npx create-heed update    # pull latest changes (from anywhere)
  */
 
 import { execSync, spawn } from "node:child_process";
@@ -210,29 +210,165 @@ async function main() {
 	log("");
 	log(`${C.bold}${C.green}  All set!${C.reset}`);
 	log("");
-	log(`  ${C.dim}Starting heed...${C.reset}`);
-	log(`  ${C.dim}Open ${C.cyan}http://localhost:5000${C.dim} in your browser${C.reset}`);
-	log("");
 
-	// Start in foreground so user sees logs
-	const child = spawn("bun", ["run", "dev"], {
-		cwd: targetDir,
-		stdio: "inherit",
-		shell: true,
-	});
+	const useDesktop = await ask("Open as floating desktop panel? (recommended)");
 
-	child.on("exit", (code) => {
-		if (code !== 0) err(`heed exited with code ${code}`);
-	});
+	if (useDesktop) {
+		log(`  ${C.dim}Starting services + floating panel...${C.reset}`);
+		log("");
 
-	// Handle Ctrl+C gracefully
-	process.on("SIGINT", () => {
-		child.kill("SIGINT");
-		process.exit(0);
-	});
+		// Start dev server in background
+		const devChild = spawn("bun", ["run", "dev"], {
+			cwd: targetDir,
+			stdio: "ignore",
+			shell: true,
+			detached: true,
+		});
+		devChild.unref();
+
+		// Wait a bit for services to start
+		info("Starting services...");
+		await new Promise(r => setTimeout(r, 8000));
+
+		// Launch desktop panel
+		const panelChild = spawn("python3", ["packages/desktop/main.py"], {
+			cwd: targetDir,
+			stdio: "inherit",
+			shell: true,
+		});
+
+		panelChild.on("exit", (code) => {
+			if (code !== 0) err(`Desktop panel exited with code ${code}`);
+			process.exit(0);
+		});
+
+		process.on("SIGINT", () => {
+			panelChild.kill("SIGINT");
+			process.exit(0);
+		});
+	} else {
+		log(`  ${C.dim}Starting heed...${C.reset}`);
+		log(`  ${C.dim}Open ${C.cyan}http://localhost:5000${C.dim} in your browser${C.reset}`);
+		log("");
+
+		const child = spawn("bun", ["run", "dev"], {
+			cwd: targetDir,
+			stdio: "inherit",
+			shell: true,
+		});
+
+		child.on("exit", (code) => {
+			if (code !== 0) err(`heed exited with code ${code}`);
+		});
+
+		process.on("SIGINT", () => {
+			child.kill("SIGINT");
+			process.exit(0);
+		});
+	}
 }
 
-main().catch((e) => {
-	err(e.message);
-	process.exit(1);
-});
+// --- Update subcommand ---
+async function update() {
+	log("");
+	log(`${C.bold}  heed update${C.reset}`);
+	log("");
+
+	// Find heed installation
+	const candidates = [
+		join(process.cwd(), "heed"),
+		process.cwd(), // maybe already inside heed dir
+		join(homedir(), "heed"),
+		join(homedir(), "Desktop", "heed"),
+		join(homedir(), "Projects", "heed"),
+	];
+
+	let heedDir = null;
+	for (const dir of candidates) {
+		if (existsSync(join(dir, "package.json")) && existsSync(join(dir, "packages", "server"))) {
+			heedDir = dir;
+			break;
+		}
+	}
+
+	if (!heedDir) {
+		err("heed installation not found.");
+		info("Run `npx create-heed` first to install.");
+		process.exit(1);
+	}
+
+	info(`Found heed at ${C.dim}${heedDir}${C.reset}`);
+
+	const currentHash = cmd(`cd "${heedDir}" && git rev-parse --short HEAD`);
+	info(`Current: ${C.dim}${currentHash}${C.reset}`);
+
+	info("Checking for updates...");
+	if (!cmd(`cd "${heedDir}" && git fetch origin main 2>&1`)) {
+		// Try without auth (public repo)
+		if (!cmd(`cd "${heedDir}" && git fetch origin 2>&1`)) {
+			err("Failed to fetch. Check your internet connection.");
+			process.exit(1);
+		}
+	}
+
+	const behind = cmd(`cd "${heedDir}" && git rev-list --count HEAD..origin/main`) || "0";
+	if (behind === "0") {
+		ok("Already up to date!");
+		process.exit(0);
+	}
+
+	info(`${C.bold}${behind}${C.reset} new commit(s) available`);
+
+	// Show changelog
+	const changelog = cmd(`cd "${heedDir}" && git log --oneline HEAD..origin/main`);
+	if (changelog) {
+		log("");
+		changelog.split("\n").forEach((line) => {
+			log(`  ${C.dim}${line}${C.reset}`);
+		});
+		log("");
+	}
+
+	// Pull
+	info("Downloading updates...");
+	if (!cmd(`cd "${heedDir}" && git pull origin main`)) {
+		err("Pull failed. You may have local changes.");
+		warn(`Run: cd "${heedDir}" && git stash && npx create-heed update && git stash pop`);
+		process.exit(1);
+	}
+
+	// Check what changed
+	const diffFiles = cmd(`cd "${heedDir}" && git diff --name-only HEAD~${behind} HEAD`) || "";
+
+	if (diffFiles.includes("package.json") || diffFiles.includes("bun.lock")) {
+		info("Dependencies changed, installing...");
+		run(`cd "${heedDir}" && bun install`, "Dependencies updated");
+	}
+
+	if (diffFiles.includes("packages/client/")) {
+		info("Frontend changed, rebuilding...");
+		run(`cd "${heedDir}" && bun run build`, "Frontend rebuilt");
+	}
+
+	if (diffFiles.includes("requirements.txt")) {
+		warn("Python dependencies may have changed. Run:");
+		log(`  ${C.dim}pip install -r ${heedDir}/packages/transcription/requirements.txt${C.reset}`);
+	}
+
+	const newHash = cmd(`cd "${heedDir}" && git rev-parse --short HEAD`);
+	log("");
+	ok(`Updated! ${C.dim}${currentHash}${C.reset} → ${C.bold}${newHash}${C.reset} (${behind} commits)`);
+	log(`  ${C.dim}Restart heed to apply: ${C.reset}${C.bold}cd "${heedDir}" && bun run dev${C.reset}`);
+	log("");
+}
+
+// --- Route subcommand ---
+const subcommand = process.argv[2];
+if (subcommand === "update") {
+	update().catch((e) => { err(e.message); process.exit(1); });
+} else {
+	main().catch((e) => {
+		err(e.message);
+		process.exit(1);
+	});
+}

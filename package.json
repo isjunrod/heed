@@ -7,7 +7,10 @@
 		"dev:server": "cd packages/server && bun run dev",
 		"dev:client": "cd packages/client && bun run dev",
 		"dev:python": "python3 -u packages/transcription/transcription_server.py",
-		"build": "cd packages/client && bun run build"
+		"build": "cd packages/client && bun run build",
+		"update": "node scripts/update.mjs",
+		"desktop": "python3 packages/desktop/main.py",
+		"desktop:prod": "python3 packages/desktop/main.py --prod"
 	},
 	"devDependencies": {
 		"concurrently": "^9.2.1"

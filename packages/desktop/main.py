@@ -1,74 +1,116 @@
 #!/usr/bin/env python3
 """
-heed — Floating Panel
-A small always-on-top draggable panel for meeting transcription.
-Wraps the heed web app and adds system audio capture via PipeWire.
+heed — Desktop Panel
 
-Usage: python3 panel.py
+Opens heed in a standalone Chrome/Chromium window (no tabs, no URL bar).
+Optionally sets the window to always-on-top so it floats over Zoom/Meet.
+
+Usage:
+  python3 packages/desktop/main.py          # connects to running dev server (:5000)
+  python3 packages/desktop/main.py --prod   # connects to built app (:5001)
+
+Requires: Google Chrome or Chromium installed.
 """
 import subprocess
 import sys
 import os
+import shutil
 import time
 import signal
-import threading
+import platform
 
-APP_URL = "http://localhost:5001"
-SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.ts")
+PROD_MODE = "--prod" in sys.argv
+DEV_URL = "http://localhost:5000"
+PROD_URL = "http://localhost:5001"
+APP_URL = PROD_URL if PROD_MODE else DEV_URL
 
-server_proc = None
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+IS_MAC = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
+
+procs = []
 
 
-def start_server():
-    """Start the Bun web server if not already running."""
-    global server_proc
+def find_chrome():
+    """Find Chrome/Chromium binary."""
+    candidates = [
+        "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    ]
+    if IS_MAC:
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ] + candidates
+
+    for c in candidates:
+        if shutil.which(c) or os.path.exists(c):
+            return c
+    return None
+
+
+def is_running(url, timeout=2):
     import urllib.request
     try:
-        urllib.request.urlopen(APP_URL, timeout=2)
-        print("[heed] Server already running")
-        return
+        urllib.request.urlopen(url, timeout=timeout)
+        return True
     except Exception:
-        pass
-
-    print("[heed] Starting server...")
-    server_proc = subprocess.Popen(
-        ["bun", "run", SERVER_SCRIPT],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        cwd=os.path.dirname(os.path.abspath(__file__)),
-    )
-    # Wait for server to be ready
-    for _ in range(20):
-        try:
-            urllib.request.urlopen(APP_URL, timeout=1)
-            print("[heed] Server ready")
-            return
-        except Exception:
-            time.sleep(0.5)
-    print("[heed] Warning: server may not be ready")
+        return False
 
 
-def start_ollama():
-    """Start Ollama if not running."""
-    try:
-        import urllib.request
-        urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
+def start_services():
+    """Start Ollama + backend services if needed."""
+    if not is_running("http://localhost:11434/api/tags"):
+        print("[heed] Starting Ollama...")
+        procs.append(subprocess.Popen(
+            ["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        time.sleep(2)
+
+    if PROD_MODE:
+        if not is_running(PROD_URL):
+            print("[heed] Starting server...")
+            procs.append(subprocess.Popen(
+                ["bun", "run", "packages/server/server.ts"],
+                cwd=ROOT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ))
+        if not is_running("http://localhost:5002/health"):
+            print("[heed] Starting transcription server...")
+            procs.append(subprocess.Popen(
+                ["python3", "-u", "packages/transcription/transcription_server.py"],
+                cwd=ROOT_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ))
+        print("[heed] Waiting for services...")
+        for _ in range(30):
+            if is_running(PROD_URL) and is_running("http://localhost:5002/health"):
+                print("[heed] All services ready")
+                break
+            time.sleep(1)
+
+
+def set_always_on_top(window_name="heed"):
+    """Set the window to always-on-top (Linux only, requires wmctrl)."""
+    if not IS_LINUX:
         return
-    except Exception:
-        pass
-    print("[heed] Starting Ollama...")
-    subprocess.Popen(
-        ["ollama", "serve"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    if not shutil.which("wmctrl"):
+        return
+    # Wait for the window to appear
     time.sleep(2)
+    try:
+        subprocess.run(
+            ["wmctrl", "-r", window_name, "-b", "add,above"],
+            capture_output=True,
+        )
+        print("[heed] Window set to always-on-top")
+    except Exception:
+        pass
 
 
 def cleanup(*args):
-    """Kill server on exit."""
-    if server_proc:
-        server_proc.terminate()
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
     sys.exit(0)
 
 
@@ -76,25 +118,43 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    start_ollama()
-    start_server()
+    chrome = find_chrome()
+    if not chrome:
+        print("[heed] Chrome or Chromium not found.")
+        print("[heed] Install it: https://www.google.com/chrome/")
+        print(f"[heed] Or open {APP_URL} manually in any browser.")
+        sys.exit(1)
 
-    import webview
+    start_services()
 
-    window = webview.create_window(
-        "heed",
-        APP_URL,
-        width=420,
-        height=680,
-        resizable=True,
-        on_top=True,
-        frameless=False,
-        easy_drag=True,
-        background_color="#F8FAFC",
-        text_select=True,
-    )
+    # Wait for the target URL to be ready
+    if not is_running(APP_URL):
+        print(f"[heed] Waiting for {APP_URL}...")
+        for _ in range(30):
+            if is_running(APP_URL):
+                break
+            time.sleep(1)
 
-    webview.start(debug=False)
+    print(f"[heed] Opening {APP_URL}")
+
+    # Launch Chrome in --app mode: standalone window, no tabs, no URL bar
+    chrome_proc = subprocess.Popen([
+        chrome,
+        f"--app={APP_URL}",
+        "--window-size=420,720",
+        "--new-window",
+        "--disable-extensions",
+        "--disable-default-apps",
+    ])
+    procs.append(chrome_proc)
+
+    # Try to set always-on-top on Linux
+    if IS_LINUX:
+        import threading
+        threading.Thread(target=set_always_on_top, daemon=True).start()
+
+    # Wait for Chrome to close
+    chrome_proc.wait()
     cleanup()
 
 

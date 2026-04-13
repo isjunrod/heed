@@ -521,20 +521,37 @@ async function handleSummarize(req: Request): Promise<Response> {
 	const ollamaOptions: Record<string, number> = {};
 	if (numGpu !== undefined) ollamaOptions.num_gpu = numGpu;
 	if (numGpu === 0) ollamaOptions.num_thread = cpuThreadLimit;
-	const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+	// Retry logic: if Ollama's runner crashed (OOM, VRAM contention, etc.),
+	// wait a beat and retry once. This recovers silently — the user never sees
+	// a raw 500 error for a transient Ollama failure.
+	const ollamaBody = JSON.stringify({
+		model: getCurrentModel(),
+		stream: true,
+		keep_alive: 0,
+		...(Object.keys(ollamaOptions).length > 0 ? { options: ollamaOptions } : {}),
+		messages: [
+			{ role: "system", content: systemPrompt },
+			{ role: "user", content: `Generate meeting notes from this transcript:\n\n${transcript}` },
+		],
+	});
+
+	let res = await fetch(`${OLLAMA_HOST}/api/chat`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			model: getCurrentModel(),
-			stream: true,
-			keep_alive: 0,
-			...(Object.keys(ollamaOptions).length > 0 ? { options: ollamaOptions } : {}),
-			messages: [
-				{ role: "system", content: systemPrompt },
-				{ role: "user", content: `Generate meeting notes from this transcript:\n\n${transcript}` },
-			],
-		}),
+		body: ollamaBody,
 	});
+
+	// Retry once on failure (runner crash, OOM, etc.)
+	if (!res.ok) {
+		const errBody = await res.text();
+		console.log(`[heed] Ollama failed (${res.status}), retrying in 3s... ${errBody.slice(0, 80)}`);
+		await new Promise(r => setTimeout(r, 3000));
+		res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: ollamaBody,
+		});
+	}
 
 	if (!res.ok) {
 		const errText = await res.text();
@@ -1010,23 +1027,33 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 			num_gpu: 0,
 			num_thread: Math.max(2, Math.floor(cores / 2)),
 		};
-		const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+		const summaryBody = JSON.stringify({
+			model: getCurrentModel(),
+			stream: false,
+			keep_alive: 0,
+			...(Object.keys(summaryOpts).length > 0 ? { options: summaryOpts } : {}),
+			messages: [
+				{
+					role: "system",
+					content: "You generate ONE single sentence (max 12 words) that captures the main topic of a meeting transcript. Output ONLY the sentence, no quotes, no prefixes, no explanation. Be concrete and specific. IMPORTANT: respond in the SAME language as the transcript — if it's in Spanish, your sentence must be in Spanish. If English, respond in English.",
+				},
+				{ role: "user", content: text },
+			],
+		});
+		let res = await fetch(`${OLLAMA_HOST}/api/chat`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				model: getCurrentModel(),
-				stream: false,
-				keep_alive: 0,
-				...(Object.keys(summaryOpts).length > 0 ? { options: summaryOpts } : {}),
-				messages: [
-					{
-						role: "system",
-						content: "You generate ONE single sentence (max 12 words) that captures the main topic of a meeting transcript. Output ONLY the sentence, no quotes, no prefixes, no explanation. Be concrete and specific. IMPORTANT: respond in the SAME language as the transcript — if it's in Spanish, your sentence must be in Spanish. If English, respond in English.",
-					},
-					{ role: "user", content: text },
-				],
-			}),
+			body: summaryBody,
 		});
+		// Retry once on failure
+		if (!res.ok) {
+			await new Promise(r => setTimeout(r, 3000));
+			res = await fetch(`${OLLAMA_HOST}/api/chat`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: summaryBody,
+			});
+		}
 		if (!res.ok) return Response.json({ summary: "" });
 		const data = await res.json() as { message?: { content?: string } };
 		const summary = (data.message?.content || "").trim().replace(/^["']|["']$/g, "").split("\n")[0];

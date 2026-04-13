@@ -45,9 +45,9 @@ if TRANSCRIPTION_PROFILE not in {"stable", "adaptive"}:
 
 # --- Model loading (once, kept in memory) ---
 whisper_model = None  # final transcription model
-whisper_model_live = None  # live chunk model
+whisper_model_live = None  # live chunk model (same as final — one model, one quality)
 whisper_model_name = "small"
-whisper_model_live_name = "base"
+whisper_model_live_name = "small"
 whisper_runtime_info = {
     "final_model": "small",
     "live_model": "base",
@@ -371,55 +371,53 @@ def get_system_ram_mb():
 
 
 def pick_whisper_models(device_cfg):
-    """Select Whisper models.
+    """Auto-select whisper model based on hardware power.
 
-    Stable profile (default):
-      - final="small", live="base" (known-good baseline)
+    Progressive scaling — starts at base, goes up with hardware:
+      base    → entry level (laptop, 4-8GB RAM, weak CPU)
+      small   → mid range (12+ cores, 12-16GB RAM, or any GPU)  ← your GTX 1650
+      medium  → high end (16+ cores, 24GB+ RAM, or 8GB+ VRAM)
+      large-v3→ ultra (24+ cores, 32GB+ RAM, or 16GB+ VRAM)
 
-    Adaptive profile (opt-in):
-      - scales models based on hardware tiers.
+    Live and final ALWAYS use the same model (same quality, shared instance).
     """
-    if TRANSCRIPTION_PROFILE != "adaptive":
-        return {
-            "final": "small",
-            "live": "base",
-            "reason": "stable profile (known-good): final=small, live=base",
-        }
-
-    final_model = "small"
-    live_model = "small"
-    reason = "default small (live + final)"
-
+    cpu_count = int(device_cfg.get("cpu_count", os.cpu_count() or 0) or 0)
+    ram_mb = int(device_cfg.get("ram_mb", get_system_ram_mb()) or 0)
     whisper_device = device_cfg.get("whisper", "cpu")
-    free_mb = int(device_cfg.get("free_vram_mb", 0) or 0)
+    free_vram = int(device_cfg.get("free_vram_mb", 0) or 0)
 
-    # GPU tiers are conservative because pyannote may run in parallel.
+    model = "base"
+    reason = "base (entry level)"
+
     if whisper_device == "cuda":
-        if free_mb >= 18000:
-            final_model = "large-v3"
-            live_model = "medium"
-            reason = f"GPU ultra tier ({free_mb}MB free VRAM, both scaled)"
-        elif free_mb >= 9000:
-            final_model = "medium"
-            live_model = "medium"
-            reason = f"GPU high tier ({free_mb}MB free VRAM, both scaled)"
+        # GPU path: scale by VRAM
+        if free_vram >= 16000:
+            model = "large-v3"
+            reason = f"large-v3 (GPU ultra, {free_vram}MB VRAM)"
+        elif free_vram >= 8000:
+            model = "medium"
+            reason = f"medium (GPU high, {free_vram}MB VRAM)"
         else:
-            reason = f"GPU baseline tier ({free_mb}MB free VRAM, both small)"
+            # Any GPU = at least small (GPU accelerates even with low VRAM since whisper runs on CPU)
+            model = "small"
+            reason = f"small (GPU present, {free_vram}MB VRAM, whisper on CPU)"
     else:
-        cpu_count = int(device_cfg.get("cpu_count", os.cpu_count() or 0) or 0)
-        ram_mb = int(device_cfg.get("ram_mb", get_system_ram_mb()) or 0)
-
-        # CPU-only upgrades require genuinely strong hardware to avoid painful latency.
-        if cpu_count >= 16 and ram_mb >= 24000:
-            final_model = "medium"
-            live_model = "medium"
-            reason = f"CPU high tier ({cpu_count} cores, {ram_mb}MB RAM, both scaled)"
+        # CPU-only path: scale by cores + RAM
+        if cpu_count >= 24 and ram_mb >= 32000:
+            model = "large-v3"
+            reason = f"large-v3 (CPU ultra, {cpu_count} cores, {ram_mb}MB RAM)"
+        elif cpu_count >= 16 and ram_mb >= 24000:
+            model = "medium"
+            reason = f"medium (CPU high, {cpu_count} cores, {ram_mb}MB RAM)"
+        elif cpu_count >= 8 and ram_mb >= 12000:
+            model = "small"
+            reason = f"small (CPU mid, {cpu_count} cores, {ram_mb}MB RAM)"
         else:
-            reason = f"CPU baseline tier ({cpu_count} cores, {ram_mb}MB RAM, both small)"
+            reason = f"base (CPU entry, {cpu_count} cores, {ram_mb}MB RAM)"
 
     return {
-        "final": final_model,
-        "live": live_model,
+        "final": model,
+        "live": model,  # same model, same quality, shared instance
         "reason": reason,
     }
 
@@ -549,28 +547,10 @@ def load_models():
     models_ready["whisper"] = True
     print(f"[heed] Whisper {whisper_model_name} ready in {time.time()-t:.1f}s ({whisper_device}, {compute_type})", flush=True)
 
-    # Live model for chunk transcription during recording
-    print(f"[heed] Loading faster-whisper {whisper_model_live_name} for live mode...", flush=True)
-    t2 = time.time()
-    whisper_model_live = WhisperModel(whisper_model_live_name, device=whisper_device, compute_type=compute_type)
-    try:
-        if not os.path.exists(_warmup_path):
-            import struct, wave
-            with wave.open(_warmup_path, "w") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(struct.pack("<" + "h" * 8000, *([0] * 8000)))
-        list(whisper_model_live.transcribe(_warmup_path, language="en")[0])
-    except Exception:
-        pass
-    finally:
-        try:
-            if os.path.exists(_warmup_path):
-                os.remove(_warmup_path)
-        except Exception:
-            pass
-    print(f"[heed] Whisper {whisper_model_live_name} (live) ready in {time.time()-t2:.1f}s", flush=True)
+    # Live uses the SAME model instance — no need to load twice.
+    # Saves ~300MB RAM. The whisper_live_lock ensures thread safety.
+    whisper_model_live = whisper_model
+    print(f"[heed] Whisper live = final (same {whisper_model_live_name} instance, saves RAM)", flush=True)
 
     # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"

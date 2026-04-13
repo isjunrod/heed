@@ -248,29 +248,17 @@ This is why heed detects overlapping voices that other tools miss — they mix e
 
 <br/>
 
-**Smart rename = merge** — Rename "Speaker 2" to "Sarah Chen". If Sarah already exists from a previous identification, heed merges them automatically. No duplicate chips, no manual cleanup. Right-click still works for explicit merges.
-
-**Inline `#tag` autocomplete** — Type `#` in the session title and get tag suggestions. Organize sessions by project, client, or topic without leaving the recording screen.
-
-**Meeting auto-detector** — heed listens to your system's audio stack (PipeWire on Linux) and detects when Zoom, Meet, Teams, or Discord are active. It can prompt you to start recording automatically when a meeting begins.
-
-**VRAM intelligence** — When Ollama generates notes, it holds your GPU's memory hostage. heed forces `keep_alive: 0` so the model unloads immediately after generation, freeing VRAM for pyannote's next diarization pass. On 4GB GPUs, this is the difference between working and crashing.
-
-**Auto-recovery** — heed crashed mid-recording? Your audio is safe on disk. On next launch, one click recovers the session and transcribes everything. Nothing is lost.
-
-**GPU/CPU split** — heed auto-detects your free VRAM and splits work intelligently. Less than 1.5GB free: everything on CPU. 1.5-6GB: pyannote on GPU, whisper on CPU. 6GB+: both on GPU. No manual configuration.
-
-**Offline capable** — No internet connection needed after initial setup. All models run locally. Record a meeting on a plane, transcribe it on a train.
-
-**Works with everything** — Zoom, Google Meet, Teams, Discord, a YouTube video, a podcast, a voice memo. If audio plays on your computer, heed captures it. Nobody in the call installs anything, nobody knows you're recording.
-
-**Bilingual setup wizard** — First-time users get a guided 3-step setup (Ollama, ffmpeg, AI model) in English or Spanish. The app detects your system language automatically.
-
-**In-app tour** — 5-step interactive walkthrough for new users. Spotlight-style highlights, contextual explanations. Skippable, never shown again.
-
-**GPU/CPU transparency** — If your selected model doesn't fit in VRAM, heed tells you exactly why and offers CPU mode. No silent crashes, no cryptic CUDA errors. You always know what's running and where.
-
-**Ollama auto-retry** — If the AI model crashes from RAM exhaustion (it happens), heed waits 3 seconds and retries automatically. You see notes, not error messages.
+- **Smart rename = merge** — Rename "Speaker 2" to "Sarah Chen". If she already exists, heed merges them automatically. No duplicates.
+- **Inline `#tag` autocomplete** — Type `#` in the session title to organize by project, client, or topic.
+- **Meeting auto-detector** — Detects Zoom, Meet, Teams, or Discord running and prompts you to record.
+- **VRAM intelligence** — Forces Ollama to release GPU memory immediately after generating notes, so pyannote doesn't crash. Critical on 4GB GPUs.
+- **Auto-recovery** — Crashed mid-recording? Audio is safe on disk. One click to recover on next launch.
+- **GPU/CPU split** — Auto-detects free VRAM and splits work: <1.5GB → all CPU, 1.5-6GB → mixed, 6GB+ → all GPU. Zero config.
+- **Offline capable** — No internet after setup. Record on a plane, transcribe on a train.
+- **Works with everything** — Zoom, Meet, Teams, Discord, YouTube, podcasts. If it plays audio, heed captures it. Nobody knows.
+- **Bilingual** — Setup wizard and in-app tour in English and Spanish. Auto-detected from your system.
+- **GPU/CPU transparency** — If a model doesn't fit in VRAM, heed tells you why and offers CPU mode. No cryptic CUDA errors.
+- **Ollama auto-retry** — Model crashed from RAM exhaustion? heed retries in 3 seconds automatically.
 
 </details>
 

@@ -4,7 +4,9 @@
   <img src="https://img.shields.io/badge/Linux_%2B_macOS-supported-F59E0B?style=for-the-badge" alt="Linux + macOS" />
 </p>
 
-<h1 align="center">heed</h1>
+<p align="center">
+  <img src="assets/logo.svg" alt="heed" width="64" height="64" />
+</p>
 
 <p align="center">
   <strong>Every voice, even when they speak at once.</strong><br/>

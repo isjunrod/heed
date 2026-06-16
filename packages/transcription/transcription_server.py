@@ -53,6 +53,11 @@ whisper_model_live_name = "small"
 live_governor = None
 _devices = None
 _warmup_path = None
+# Per-engine LIVE cadence hint the Node server reads from /health. Parakeet (Apple Neural
+# Engine, ~50ms per chunk) can poll fast with short windows → near-instant words on screen.
+# Whisper engines keep the safe 3s/2000ms cadence so slow CPUs never starve mid-recording.
+# Measured: Parakeet needs >=2s of audio to emit clean text (1s -> empty, 1.5s -> clipped).
+live_tuning = {"chunk_s": 3.0, "interval_ms": 2000}
 whisper_runtime_info = {
     "final_model": "small",
     "live_model": "base",
@@ -563,7 +568,7 @@ def _swap_live_model(new_model):
 
 def load_models():
     global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info, diarize_backend
-    global live_governor, _devices, _warmup_path
+    global live_governor, _devices, _warmup_path, live_tuning
 
     devices = get_device_config()
     _devices = devices
@@ -651,6 +656,14 @@ def load_models():
     except Exception as e:
         live_governor = None
         print(f"[heed] Live governor unavailable (non-critical): {e}", flush=True)
+
+    # Live cadence: Parakeet is fast enough (~50ms/chunk) to poll often with a short window,
+    # so words hit the screen ~2s after spoken instead of ~3s. Whisper keeps the safe cadence.
+    if engine_kind == "parakeet":
+        live_tuning = {"chunk_s": 2.0, "interval_ms": 800}
+    else:
+        live_tuning = {"chunk_s": 3.0, "interval_ms": 2000}
+    print(f"[heed] Live cadence: chunk={live_tuning['chunk_s']}s interval={live_tuning['interval_ms']}ms ({engine_kind})", flush=True)
 
     # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -1164,6 +1177,7 @@ class Handler(BaseHTTPRequestHandler):
                 **models_ready,
                 "whisper_info": whisper_runtime_info,
                 "pyannote_info": pyannote_runtime_info,
+                "live_tuning": live_tuning,
             })
         elif self.path == "/voices":
             self._json({"voices": list(load_voices().keys())})

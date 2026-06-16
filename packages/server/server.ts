@@ -1142,6 +1142,8 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 	// Reset live transcription state for the new recording
 	liveTranscribeOffset = 0;
 	liveChunkProcessing = false;
+	// Pick up the engine-adaptive live cadence (parakeet = fast) before the loop starts.
+	await refreshLiveTuning();
 
 	const ts = Date.now();
 	const mic = getMicSource() || "default";
@@ -1263,6 +1265,23 @@ let liveTranscribeInterval: ReturnType<typeof setInterval> | null = null;
 let liveTranscribeOffset = 0; // seconds already processed
 let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
 
+// Engine-adaptive live cadence, fetched from the Python /health on record-start.
+// Parakeet (Apple Neural Engine) polls fast with short windows for near-instant words;
+// Whisper keeps the safe 3s/2000ms cadence so slow CPUs never starve. Defaults are safe.
+let liveTuning = { chunk_s: 3.0, interval_ms: 2000 };
+async function refreshLiveTuning() {
+	try {
+		const r = await fetch(`${TRANSCRIPTION_SERVER}/health`, { signal: AbortSignal.timeout(2000) });
+		if (r.ok) {
+			const h = await r.json() as { live_tuning?: { chunk_s?: number; interval_ms?: number } };
+			if (h.live_tuning?.chunk_s && h.live_tuning?.interval_ms) {
+				liveTuning = { chunk_s: h.live_tuning.chunk_s, interval_ms: h.live_tuning.interval_ms };
+				console.log(`[heed] live cadence: chunk=${liveTuning.chunk_s}s interval=${liveTuning.interval_ms}ms`);
+			}
+		}
+	} catch { /* keep safe defaults */ }
+}
+
 function handleLiveTranscribe(reqUrl?: URL): Response {
 	if (!recorderProc || !recorderPath) {
 		// Return an SSE stream that immediately closes instead of a JSON error.
@@ -1285,8 +1304,8 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 	// silencedetect ffmpeg spawn per tick during active recording (on top of the recorder +
 	// level-meter ffmpeg) starved the pipeline and spiked live latency to 8-15s. Fixed length
 	// keeps it reliable (~0.3s/chunk). The accurate final pass re-transcribes with full context.
-	const LIVE_CHUNK = 3; // seconds per chunk
-	let interval = 2000; // ms between processing ticks (the file-length guard paces real work)
+	const LIVE_CHUNK = liveTuning.chunk_s; // engine-adaptive (parakeet 2s, whisper 3s)
+	let interval = liveTuning.interval_ms; // engine-adaptive (parakeet 800ms, whisper 2000ms)
 	const lang = reqUrl?.searchParams.get("lang") || "es";
 	// DON'T reset offset here — if EventSource reconnects, we continue from
 	// where we left off instead of re-processing the same first chunk forever.

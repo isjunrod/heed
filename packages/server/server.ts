@@ -1070,8 +1070,57 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 // Uses ffmpeg -f pulse which works reliably with PipeWire's PulseAudio layer
 let recorderProc: ReturnType<typeof Bun.spawn> | null = null;
 let recorderPath: string | null = null;
+// ScreenCaptureKit system-audio helper (mac). When present + permission granted, it
+// replaces BlackHole as the system source — no driver, no output re-routing.
+let syscapProc: ReturnType<typeof Bun.spawn> | null = null;
 
 const IS_MAC = process.platform === "darwin";
+
+// Path to the built heed-syscap binary (Apple Silicon, after `swift build`).
+function getSyscapBin(): string | null {
+	if (!IS_MAC) return null;
+	const bin = join(import.meta.dir, "..", "transcription", "native", "heed-parakeet", ".build", "release", "heed-syscap");
+	return existsSync(bin) ? bin : null;
+}
+
+// Spawn heed-syscap and wait for its one-line stderr handshake.
+// Returns the running process if it reported {"ready":true}; null on any failure
+// (permission declined, not built, timeout) so the caller falls back to BlackHole.
+async function spawnSyscap(): Promise<ReturnType<typeof Bun.spawn> | null> {
+	const bin = getSyscapBin();
+	if (!bin) return null;
+	try {
+		const proc = Bun.spawn([bin], { stdout: "pipe", stderr: "pipe" });
+		// Read the first stderr line (the JSON handshake) with a timeout.
+		const handshake = await Promise.race([
+			(async () => {
+				const reader = (proc.stderr as ReadableStream).getReader();
+				const dec = new TextDecoder();
+				let buf = "";
+				while (!buf.includes("\n")) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					buf += dec.decode(value, { stream: true });
+				}
+				reader.releaseLock();
+				return buf.split("\n")[0];
+			})(),
+			new Promise<string>((r) => setTimeout(() => r(""), 3000)),
+		]);
+		let ok = false;
+		try { ok = JSON.parse(handshake || "{}").ready === true; } catch {}
+		if (ok) {
+			console.log("[heed] system audio via ScreenCaptureKit (no BlackHole routing needed)");
+			return proc;
+		}
+		console.log(`[heed] ScreenCaptureKit unavailable (${(handshake || "no handshake").slice(0, 80)}) — falling back to BlackHole`);
+		try { proc.kill(); } catch {}
+		return null;
+	} catch (e) {
+		console.log(`[heed] ScreenCaptureKit spawn failed (${(e as Error).message}) — falling back to BlackHole`);
+		return null;
+	}
+}
 
 function getMonitorSource(): string | null {
 	if (IS_MAC) {
@@ -1139,6 +1188,10 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 		try { recorderProc.kill("SIGKILL"); } catch {}
 		recorderProc = null;
 	}
+	if (syscapProc) {
+		try { syscapProc.kill(); } catch {}
+		syscapProc = null;
+	}
 	// Reset live transcription state for the new recording
 	liveTranscribeOffset = 0;
 	liveChunkProcessing = false;
@@ -1147,47 +1200,62 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 
 	const ts = Date.now();
 	const mic = getMicSource() || "default";
-	const monitor = getMonitorSource();
+
+	// Prefer ScreenCaptureKit for system audio on mac (no BlackHole routing). It only
+	// activates if built AND the user granted Screen Recording; otherwise we transparently
+	// fall back to the BlackHole/avfoundation monitor below. So nothing breaks pre-permission.
+	if (mode === "system" || mode === "both") {
+		syscapProc = await spawnSyscap();
+	}
+	const usedSyscap = !!syscapProc;
+	const monitor = usedSyscap ? null : getMonitorSource();
+	// system source exists if SCK is active OR a BlackHole monitor was found.
+	const haveSystem = usedSyscap || !!monitor;
 
 	// Naming convention: dual-capture-* signals stereo (L=mic, R=system) → channel-based diarization later.
-	const isDual = mode === "both" && !!monitor;
+	const isDual = mode === "both" && haveSystem;
 	recorderPath = join(UPLOAD_DIR, `${isDual ? "dual-capture" : "capture"}-${ts}.wav`);
 
 	let args: string[];
+	// When SCK feeds the system channel, ffmpeg reads its raw PCM from stdin (pipe:0).
+	let stdinStream: ReadableStream | undefined;
+	const SCK_IN = ["-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0"];
 
 	if (mode === "system") {
-		if (!monitor) return Response.json({ error: "No system audio monitor found" }, { status: 500 });
-		args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", monitor, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
+		if (usedSyscap) {
+			args = ["ffmpeg", "-y", ...SCK_IN, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
+			stdinStream = syscapProc!.stdout as ReadableStream;
+		} else {
+			if (!monitor) return Response.json({ error: "No system audio monitor found" }, { status: 500 });
+			args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", monitor, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
+		}
 	} else if (mode === "mic") {
 		args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", mic, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
 	} else {
 		// both: keep mic and system in SEPARATE physical channels (L=mic, R=system).
 		// Downstream we split them and run diarization independently — this is what unlocks
 		// real overlap detection when two people speak at the same time.
-		if (!monitor) {
-			// Fallback to mic only
+		const MERGE = ["-filter_complex", "[0:a]aresample=16000,pan=mono|c0=c0[micL];[1:a]aresample=16000,pan=mono|c0=c0[sysR];[micL][sysR]amerge=inputs=2[out]", "-map", "[out]", "-ar", "16000", "-ac", "2", "-c:a", "pcm_s16le"];
+		if (usedSyscap) {
+			// mic from avfoundation (input 0) + SCK system PCM from stdin (input 1)
+			args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", mic, ...SCK_IN, ...MERGE, recorderPath];
+			stdinStream = syscapProc!.stdout as ReadableStream;
+		} else if (!monitor) {
+			// No system source at all → mic only (graceful)
 			args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", mic, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", recorderPath];
 		} else {
-			args = [
-				"ffmpeg", "-y",
-				"-f", AUDIO_FMT, "-i", mic,
-				"-f", AUDIO_FMT, "-i", monitor,
-				"-filter_complex", "[0:a]aresample=16000,pan=mono|c0=c0[micL];[1:a]aresample=16000,pan=mono|c0=c0[sysR];[micL][sysR]amerge=inputs=2[out]",
-				"-map", "[out]",
-				"-ar", "16000", "-ac", "2", "-c:a", "pcm_s16le",
-				recorderPath,
-			];
+			args = ["ffmpeg", "-y", "-f", AUDIO_FMT, "-i", mic, "-f", AUDIO_FMT, "-i", monitor, ...MERGE, recorderPath];
 		}
 	}
 
-	recorderProc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+	recorderProc = Bun.spawn(args, stdinStream ? { stdin: stdinStream, stdout: "pipe", stderr: "pipe" } : { stdout: "pipe", stderr: "pipe" });
 
-	// Start PipeWire loopback so browser can visualize system audio
-	if (mode === "system" || mode === "both") {
+	// Start PipeWire/BlackHole loopback so browser can visualize system audio (BlackHole path only).
+	if ((mode === "system" || mode === "both") && !usedSyscap) {
 		startLevelMeter();
 	}
 
-	return Response.json({ recording: true, mode, path: recorderPath, monitor: monitor || null, mic });
+	return Response.json({ recording: true, mode, path: recorderPath, source: usedSyscap ? "screencapturekit" : (monitor ? "blackhole" : "mic-only"), monitor: monitor || null, mic });
 }
 
 // --- System audio level meter via ffmpeg reading monitor source ---
@@ -1511,6 +1579,11 @@ async function handleSysRecordStop(): Promise<Response> {
 	stopLiveTranscribe();
 	if (!recorderProc || !recorderPath) return Response.json({ error: "Not recording" }, { status: 400 });
 
+	// Stop SCK first so ffmpeg gets EOF on its stdin pipe and flushes cleanly, then SIGINT ffmpeg.
+	if (syscapProc) {
+		try { syscapProc.kill(); } catch {}
+		syscapProc = null;
+	}
 	recorderProc.kill("SIGINT");
 	await recorderProc.exited.catch(() => {});
 	await new Promise(r => setTimeout(r, 500));

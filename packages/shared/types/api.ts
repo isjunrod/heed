@@ -20,6 +20,13 @@ export interface HealthResponse {
 		reason: string;
 		cpu_threads?: number;
 	} | null;
+	// Engine-aware language support: which codes the active engine can transcribe and whether
+	// it auto-detects. codes=null means "all Whisper languages" (the client's full list).
+	languages?: {
+		engine: string;
+		codes: string[] | null;
+		supports_auto: boolean;
+	} | null;
 }
 
 export interface TranscribeResult {

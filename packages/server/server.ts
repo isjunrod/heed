@@ -5,6 +5,20 @@ import { downloadFromUrl, normalizeAudio } from "./lib/media.ts";
 const TRANSCRIPTION_SERVER = process.env.HEED_TRANSCRIPTION_URL || "http://127.0.0.1:5002";
 
 const PORT = Number(process.env.PORT) || 5001;
+
+// Code → language name used to instruct Ollama to write the NOTES in the user's chosen
+// language. Covers the 28 Parakeet languages + common Whisper ones; an unmapped code just
+// falls back to the template's "match the transcript" (no hard-fail).
+const LANGUAGE_NAMES: Record<string, string> = {
+	en: "English", es: "Spanish", fr: "French", de: "German", it: "Italian",
+	pt: "Portuguese", ro: "Romanian", nl: "Dutch", da: "Danish", sv: "Swedish",
+	fi: "Finnish", hu: "Hungarian", et: "Estonian", lv: "Latvian", lt: "Lithuanian",
+	mt: "Maltese", pl: "Polish", cs: "Czech", sk: "Slovak", sl: "Slovenian",
+	hr: "Croatian", bs: "Bosnian", ru: "Russian", uk: "Ukrainian", be: "Belarusian",
+	bg: "Bulgarian", sr: "Serbian", el: "Greek", ja: "Japanese", ko: "Korean",
+	zh: "Chinese", ar: "Arabic", hi: "Hindi", tr: "Turkish", vi: "Vietnamese",
+	id: "Indonesian", th: "Thai", he: "Hebrew", ca: "Catalan", gl: "Galician",
+};
 const STATIC_ROOT = join(import.meta.dir, "..", "client", "dist");
 // Recordings stored in the project root
 const UPLOAD_DIR = join(import.meta.dir, "..", "..", "recordings");
@@ -499,9 +513,12 @@ async function handleSummarize(req: Request): Promise<Response> {
 
 	let systemPrompt = template?.prompt;
 
-	// Add language directive
-	if (language === "es") {
-		systemPrompt = `Responde SOLO en espanol.\n\n${systemPrompt}`;
+	// Add language directive: force the NOTES into the language the user picked for the
+	// transcript (not just Spanish). "auto" (Whisper auto-detect) is left to the template's
+	// "match the language of the transcript", since we don't know it until transcription runs.
+	const langName = language && language !== "auto" ? LANGUAGE_NAMES[language] : undefined;
+	if (langName) {
+		systemPrompt = `Respond ONLY in ${langName}. Write every section and heading in ${langName}.\n\n${systemPrompt}`;
 	}
 
 	if (!systemPrompt) {
@@ -1815,6 +1832,7 @@ async function handleHealth(): Promise<Response> {
 		pyannote: txServer.pyannote || false,
 		whisper_info: txServer.whisper_info || null,
 		pyannote_info: txServer.pyannote_info || null,
+		languages: txServer.languages || null,  // engine-aware language support (Parakeet=28, Whisper=all)
 	});
 }
 

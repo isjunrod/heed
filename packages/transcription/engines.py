@@ -38,6 +38,24 @@ class _Info:
         self.language = language
 
 
+# Parakeet TDT v3 (FluidAudio) transcribes these 28 European languages and NO others —
+# anything else silently falls back to English, so the UI must only offer these on Apple
+# Silicon. Mirrors FluidAudio's `enum Language` (Shared/TokenLanguageFilter.swift).
+# Parakeet has NO language auto-detection: without an explicit language it assumes English.
+PARAKEET_LANGUAGES = [
+    "en", "es", "fr", "de", "it", "pt", "ro", "nl", "da", "sv", "fi", "hu", "et", "lv",
+    "lt", "mt", "pl", "cs", "sk", "sl", "hr", "bs", "ru", "uk", "be", "bg", "sr", "el",
+]
+
+
+def supported_languages(engine_kind):
+    """Return (codes, supports_auto) for the active engine.
+    Parakeet → its 28 langs, no auto-detect. Whisper (mlx/ctranslate2) → None (all) + auto."""
+    if engine_kind == "parakeet":
+        return PARAKEET_LANGUAGES, False
+    return None, True  # None = the full Whisper list the client already has
+
+
 def is_apple_silicon():
     return sys.platform == "darwin" and platform.machine() == "arm64"
 

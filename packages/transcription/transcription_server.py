@@ -58,6 +58,9 @@ _warmup_path = None
 # Whisper engines keep the safe 3s/2000ms cadence so slow CPUs never starve mid-recording.
 # Measured: Parakeet needs >=2s of audio to emit clean text (1s -> empty, 1.5s -> clipped).
 live_tuning = {"chunk_s": 3.0, "interval_ms": 2000}
+# Active transcription engine ("parakeet" | "mlx" | "ctranslate2"), set in load_models().
+# Drives which languages the UI may offer (Parakeet = 28 European; Whisper = all).
+active_engine = "ctranslate2"
 whisper_runtime_info = {
     "final_model": "small",
     "live_model": "base",
@@ -568,7 +571,7 @@ def _swap_live_model(new_model):
 
 def load_models():
     global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info, diarize_backend
-    global live_governor, _devices, _warmup_path, live_tuning
+    global live_governor, _devices, _warmup_path, live_tuning, active_engine
 
     devices = get_device_config()
     _devices = devices
@@ -614,6 +617,7 @@ def load_models():
     # --- Whisper engine (hardware-aware: MLX on Apple Silicon, CTranslate2 on CUDA/CPU) ---
     import engines
     engine_kind = engines.select_engine_kind(devices)
+    active_engine = engine_kind
     print(f"[heed] Whisper engine: {engine_kind} (final={whisper_model_name}, live={whisper_model_live_name})", flush=True)
 
     # Build the silent warm-up clip once; it validates each model actually loads.
@@ -804,6 +808,14 @@ def transcribe(wav_path, language="auto", srt_output=None):
         "language": info.language if info else language,
         "model": whisper_model_name,
     }
+
+
+def _language_support():
+    """What the UI should offer for the ACTIVE engine: the supported codes (None = all
+    Whisper langs the client already lists) and whether language auto-detection works."""
+    import engines
+    codes, supports_auto = engines.supported_languages(active_engine)
+    return {"engine": active_engine, "codes": codes, "supports_auto": supports_auto}
 
 
 def format_ts(seconds):
@@ -1178,6 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
                 "whisper_info": whisper_runtime_info,
                 "pyannote_info": pyannote_runtime_info,
                 "live_tuning": live_tuning,
+                "languages": _language_support(),
             })
         elif self.path == "/voices":
             self._json({"voices": list(load_voices().keys())})

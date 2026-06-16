@@ -12,6 +12,7 @@ Endpoints:
 """
 import json
 import os
+import re
 import sys
 import time
 import warnings
@@ -45,9 +46,13 @@ if TRANSCRIPTION_PROFILE not in {"stable", "adaptive"}:
 
 # --- Model loading (once, kept in memory) ---
 whisper_model = None  # final transcription model
-whisper_model_live = None  # live chunk model (same as final — one model, one quality)
+whisper_model_live = None  # live chunk model (lighter, for low-latency preview)
 whisper_model_name = "small"
 whisper_model_live_name = "small"
+# RuntimeGovernor + the bits it needs to hot-swap the live model under contention.
+live_governor = None
+_devices = None
+_warmup_path = None
 whisper_runtime_info = {
     "final_model": "small",
     "live_model": "base",
@@ -386,38 +391,59 @@ def pick_whisper_models(device_cfg):
     whisper_device = device_cfg.get("whisper", "cpu")
     free_vram = int(device_cfg.get("free_vram_mb", 0) or 0)
 
-    model = "base"
-    reason = "base (entry level)"
+    # Whisper accuracy tiers (ascending). Footprint ≈ runtime memory in MB. `large-v3` is the
+    # 4-bit MLX build (measured: same accuracy as fp16, ~1.5x faster, ~1/3 the memory).
+    TIERS = ["base", "small", "medium", "large-v3"]
+    TIER_MEM_MB = {"base": 200, "small": 600, "medium": 1600, "large-v3": 1200}
 
-    if whisper_device == "cuda":
-        # GPU path: scale by VRAM
-        if free_vram >= 16000:
-            model = "large-v3"
-            reason = f"large-v3 (GPU ultra, {free_vram}MB VRAM)"
-        elif free_vram >= 8000:
-            model = "medium"
-            reason = f"medium (GPU high, {free_vram}MB VRAM)"
+    model = "base"
+    gpu_fast = whisper_device == "cuda" or "Apple Silicon" in str(device_cfg.get("gpu_name", ""))
+
+    if gpu_fast:
+        # On a fast accelerator (Apple GPU via MLX, or NVIDIA/CUDA) bigger models run in a
+        # fraction of real time, so we pick the LARGEST tier that fits the memory headroom —
+        # giving each machine its best accuracy. "Marvel on any hardware" = best that fits,
+        # never a fixed model.
+        total_mem = int(device_cfg.get("total_vram_mb", 0) or 0) or ram_mb  # VRAM (CUDA) or unified RAM (Apple)
+        # Headroom budget for the FINAL model: leave room for pyannote (~1.5GB), the live model,
+        # Ollama and the OS so we never push past ~80% and collapse the machine.
+        budget = max(0, int(free_vram) - 1800)
+        # Hard cap by total-memory class so low-RAM machines don't over-reach.
+        if total_mem >= 16000:
+            cap = "large-v3"
+        elif total_mem >= 11000:
+            cap = "medium"
+        elif total_mem >= 7000:
+            cap = "small"
         else:
-            # Any GPU = at least small (GPU accelerates even with low VRAM since whisper runs on CPU)
-            model = "small"
-            reason = f"small (GPU present, {free_vram}MB VRAM, whisper on CPU)"
+            cap = "base"
+        cap_i = TIERS.index(cap)
+        for i, tier in enumerate(TIERS):
+            if i <= cap_i and TIER_MEM_MB[tier] <= budget:
+                model = tier
+        reason = f"{model} (GPU-fast, {total_mem}MB mem, {budget}MB budget, cap={cap})"
     else:
-        # CPU-only path: scale by cores + RAM
+        # CPU-only: large models can't keep up in real time — scale conservatively by cores+RAM.
         if cpu_count >= 24 and ram_mb >= 32000:
-            model = "large-v3"
-            reason = f"large-v3 (CPU ultra, {cpu_count} cores, {ram_mb}MB RAM)"
+            model, reason = "large-v3", f"large-v3 (CPU ultra, {cpu_count} cores, {ram_mb}MB RAM)"
         elif cpu_count >= 16 and ram_mb >= 24000:
-            model = "medium"
-            reason = f"medium (CPU high, {cpu_count} cores, {ram_mb}MB RAM)"
+            model, reason = "medium", f"medium (CPU high, {cpu_count} cores, {ram_mb}MB RAM)"
         elif cpu_count >= 8 and ram_mb >= 12000:
-            model = "small"
-            reason = f"small (CPU mid, {cpu_count} cores, {ram_mb}MB RAM)"
+            model, reason = "small", f"small (CPU mid, {cpu_count} cores, {ram_mb}MB RAM)"
         else:
-            reason = f"base (CPU entry, {cpu_count} cores, {ram_mb}MB RAM)"
+            model, reason = "base", f"base (CPU entry, {cpu_count} cores, {ram_mb}MB RAM)"
+
+    # LIVE preview model: cap at `small` on GPU. `medium`/`large` for live regressed latency
+    # badly during active recording (GPU/CPU contention with the recorder), and `small` is
+    # already accurate + fast (~0.3s/chunk). The final pass uses the big `model` for accuracy.
+    if gpu_fast:
+        live_model = model if model in ("tiny", "base", "small") else "small"
+    else:
+        live_model = model if model in ("tiny", "base") else "base"
 
     return {
         "final": model,
-        "live": model,  # same model, same quality, shared instance
+        "live": live_model,
         "reason": reason,
     }
 
@@ -495,14 +521,67 @@ def pick_pyannote_tuning(device_cfg):
     }
 
 
+_WHISPER_FALLBACK_ORDER = ["large-v3", "medium", "small", "base", "tiny"]
+
+
+def _load_whisper_with_fallback(model_name, devices, warmup_path, label="whisper"):
+    """Load `model_name`; if it fails (OOM, missing download, etc.) step DOWN through smaller
+    tiers until one loads. The warm-up transcribe doubles as a load/compile validation. Returns
+    (engine, actual_model_name) and never hard-fails unless EVERY tier fails."""
+    import engines
+    start = _WHISPER_FALLBACK_ORDER.index(model_name) if model_name in _WHISPER_FALLBACK_ORDER else _WHISPER_FALLBACK_ORDER.index("small")
+    for name in _WHISPER_FALLBACK_ORDER[start:]:
+        try:
+            eng = engines.make_engine(name, devices)
+            list(eng.transcribe(warmup_path, language="en")[0])  # validates real load + compile
+            if name != model_name:
+                print(f"[heed] {label}: '{model_name}' unavailable — degraded to '{name}'", flush=True)
+            return eng, name
+        except Exception as e:
+            print(f"[heed] {label}: '{name}' failed to load ({str(e)[:80]}); stepping down...", flush=True)
+    raise RuntimeError(f"{label}: no whisper model could be loaded")
+
+
+def _swap_live_model(new_model):
+    """Hot-swap the live preview model when the governor decides to degrade/recover.
+    Loads + warms the new model OUTSIDE the transcribe lock, then swaps the reference under it."""
+    global whisper_model_live, whisper_model_live_name
+    try:
+        eng, name = _load_whisper_with_fallback(new_model, _devices, _warmup_path, "live-swap")
+        with whisper_live_lock:
+            whisper_model_live = eng
+            whisper_model_live_name = name
+        print(f"[heed] Governor: live model -> {name}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[heed] Governor: live swap failed ({str(e)[:80]})", flush=True)
+        return False
+
+
 def load_models():
     global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info
+    global live_governor, _devices, _warmup_path
 
     devices = get_device_config()
+    _devices = devices
     print(f"[heed] Transcription profile: {TRANSCRIPTION_PROFILE}", flush=True)
-    whisper_pick = pick_whisper_models(devices)
-    whisper_model_name = whisper_pick["final"]
-    whisper_model_live_name = whisper_pick["live"]
+
+    # --- Hardware-aware model selection: CapabilityProbe -> ModelPolicy -> verify-the-pick.
+    # If anything in the new path fails, fall back to the legacy conservative picker so heed
+    # NEVER hard-fails at startup (first robustness guarantee).
+    try:
+        import capability, policy
+        caps = capability.probe(log=lambda m: print(m, flush=True))
+        plan = policy.decide(caps, measure_final_rtf=capability.measure_model_rtf)
+        whisper_model_name = plan.final_model
+        whisper_model_live_name = plan.live_model
+        pick_reason = plan.reason
+    except Exception as e:
+        print(f"[heed] Capability probe failed ({e}) — using legacy picker", flush=True)
+        whisper_pick = pick_whisper_models(devices)
+        whisper_model_name = whisper_pick["final"]
+        whisper_model_live_name = whisper_pick["live"]
+        pick_reason = whisper_pick["reason"]
     whisper_quality = "very_good"
     whisper_speed = "fast"
     if whisper_model_name == "medium":
@@ -517,22 +596,19 @@ def load_models():
         "device": devices.get("whisper", "cpu"),
         "quality": whisper_quality,
         "speed": whisper_speed,
-        "reason": whisper_pick["reason"],
+        "reason": pick_reason,
     }
     print(
-        f"[heed] Whisper auto-pick: final={whisper_model_name}, live={whisper_model_live_name} ({whisper_pick['reason']})",
+        f"[heed] Whisper auto-pick: final={whisper_model_name}, live={whisper_model_live_name} ({pick_reason})",
         flush=True,
     )
 
-    # --- Whisper (hardware-aware auto-pick) ---
-    whisper_device = devices["whisper"]
-    compute_type = "float16" if whisper_device == "cuda" else "int8"
-    print(f"[heed] Loading faster-whisper {whisper_model_name} on {whisper_device} ({compute_type})...", flush=True)
-    t = time.time()
-    from faster_whisper import WhisperModel
-    whisper_model = WhisperModel(whisper_model_name, device=whisper_device, compute_type=compute_type)
-    # Warm-up JIT
-    print(f"[heed] Warming up whisper (JIT compile)...", flush=True)
+    # --- Whisper engine (hardware-aware: MLX on Apple Silicon, CTranslate2 on CUDA/CPU) ---
+    import engines
+    engine_kind = engines.select_engine_kind(devices)
+    print(f"[heed] Whisper engine: {engine_kind} (final={whisper_model_name}, live={whisper_model_live_name})", flush=True)
+
+    # Build the silent warm-up clip once; it validates each model actually loads.
     _warmup_path = os.path.join(os.path.dirname(__file__), "_warmup.wav")
     try:
         import struct, wave
@@ -541,71 +617,123 @@ def load_models():
             wf.setsampwidth(2)
             wf.setframerate(16000)
             wf.writeframes(struct.pack("<" + "h" * 8000, *([0] * 8000)))
-        list(whisper_model.transcribe(_warmup_path, language="en")[0])
-    except Exception as e:
-        print(f"[heed] Warmup failed (non-critical): {e}", flush=True)
-    models_ready["whisper"] = True
-    print(f"[heed] Whisper {whisper_model_name} ready in {time.time()-t:.1f}s ({whisper_device}, {compute_type})", flush=True)
+    except Exception:
+        pass
 
-    # Live uses the SAME model instance — no need to load twice.
-    # Saves ~300MB RAM. The whisper_live_lock ensures thread safety.
-    whisper_model_live = whisper_model
-    print(f"[heed] Whisper live = final (same {whisper_model_live_name} instance, saves RAM)", flush=True)
+    t = time.time()
+    whisper_model, whisper_model_name = _load_whisper_with_fallback(whisper_model_name, devices, _warmup_path, "final")
+    models_ready["whisper"] = True
+    print(f"[heed] Whisper final={whisper_model_name} ready in {time.time()-t:.1f}s ({engine_kind})", flush=True)
+
+    # Live preview: a SEPARATE, lighter model for low latency. Reuse the final instance if they
+    # ended up the same name (saves memory). Live also degrades gracefully on its own.
+    if whisper_model_live_name and whisper_model_live_name != whisper_model_name:
+        t_live = time.time()
+        print(f"[heed] Loading live whisper {whisper_model_live_name} ({engine_kind})...", flush=True)
+        whisper_model_live, whisper_model_live_name = _load_whisper_with_fallback(whisper_model_live_name, devices, _warmup_path, "live")
+        print(f"[heed] Whisper live={whisper_model_live_name} ready in {time.time()-t_live:.1f}s", flush=True)
+    else:
+        whisper_model_live = whisper_model
+        whisper_model_live_name = whisper_model_name
+        print(f"[heed] Whisper live = final (same {whisper_model_live_name} instance, saves RAM)", flush=True)
+
+    # Arm the RuntimeGovernor for the live preview: it self-corrects the live model under
+    # recording-time contention (the 8-15s regression). Ceiling = the policy's live pick so it
+    # never upgrades past what the hardware was judged able to run.
+    try:
+        from governor import RuntimeGovernor
+        live_governor = RuntimeGovernor(start_model=whisper_model_live_name,
+                                        ceiling=whisper_model_live_name, floor="tiny")
+        print(f"[heed] Live governor armed (start={whisper_model_live_name}, floor=tiny)", flush=True)
+    except Exception as e:
+        live_governor = None
+        print(f"[heed] Live governor unavailable (non-critical): {e}", flush=True)
 
     # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    # --- Pyannote ---
+    # --- Pyannote (OPTIONAL: diarization is a bonus, not a hard requirement) ---
+    # If it fails to load (missing weights, OOM, gated model on a fresh box), heed keeps working
+    # in transcription-only mode instead of hard-failing. "who said what" degrades to plain text.
     print(f"[heed] Loading pyannote on {devices['pyannote']}...", flush=True)
     t = time.time()
-    import torch
-    from pyannote.audio import Pipeline
-    diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-    pyannote_tuning = pick_pyannote_tuning(devices)
-    if devices["pyannote"] in ("cuda", "mps"):
-        diarize_pipeline.to(torch.device(devices["pyannote"]))
-    else:
-        cpu_threads = int(pyannote_tuning.get("cpu_threads", 0) or 0)
-        if cpu_threads > 0:
-            try:
-                torch.set_num_threads(cpu_threads)
-                torch.set_num_interop_threads(max(1, cpu_threads // 2))
-                print(f"[heed] Pyannote CPU threads tuned: {cpu_threads}", flush=True)
-            except Exception as e:
-                print(f"[heed] Could not tune pyannote CPU threads: {e}", flush=True)
-
-    bs = int(pyannote_tuning.get("batch_size", 8) or 8)
     try:
-        diarize_pipeline._segmentation.batch_size = bs
-        if hasattr(diarize_pipeline, '_embedding'):
-            diarize_pipeline._embedding.batch_size = bs
-    except Exception as e:
-        print(f"[heed] Could not apply pyannote batch_size={bs}: {e}", flush=True)
+        import torch
+        from pyannote.audio import Pipeline
+        diarize_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+        pyannote_tuning = pick_pyannote_tuning(devices)
+        if devices["pyannote"] in ("cuda", "mps"):
+            diarize_pipeline.to(torch.device(devices["pyannote"]))
+        else:
+            cpu_threads = int(pyannote_tuning.get("cpu_threads", 0) or 0)
+            if cpu_threads > 0:
+                try:
+                    torch.set_num_threads(cpu_threads)
+                    torch.set_num_interop_threads(max(1, cpu_threads // 2))
+                    print(f"[heed] Pyannote CPU threads tuned: {cpu_threads}", flush=True)
+                except Exception as e:
+                    print(f"[heed] Could not tune pyannote CPU threads: {e}", flush=True)
 
-    pyannote_runtime_info = {
-        "model": "pyannote/speaker-diarization-3.1",
-        "device": pyannote_tuning.get("device", devices["pyannote"]),
-        "profile": pyannote_tuning.get("profile", "balanced"),
-        "batch_size": bs,
-        "reason": pyannote_tuning.get("reason", "auto"),
-        **({"cpu_threads": pyannote_tuning.get("cpu_threads")} if pyannote_tuning.get("cpu_threads") else {}),
-    }
-    print(
-        f"[heed] Pyannote tuning: profile={pyannote_runtime_info['profile']}, batch={pyannote_runtime_info['batch_size']} ({pyannote_runtime_info['reason']})",
-        flush=True,
-    )
-    models_ready["pyannote"] = True
-    print(f"[heed] Pyannote ready in {time.time()-t:.1f}s ({devices['pyannote']})", flush=True)
-    print("[heed] All models ready!", flush=True)
+        bs = int(pyannote_tuning.get("batch_size", 8) or 8)
+        try:
+            diarize_pipeline._segmentation.batch_size = bs
+            if hasattr(diarize_pipeline, '_embedding'):
+                diarize_pipeline._embedding.batch_size = bs
+        except Exception as e:
+            print(f"[heed] Could not apply pyannote batch_size={bs}: {e}", flush=True)
+
+        pyannote_runtime_info = {
+            "model": "pyannote/speaker-diarization-3.1",
+            "device": pyannote_tuning.get("device", devices["pyannote"]),
+            "profile": pyannote_tuning.get("profile", "balanced"),
+            "batch_size": bs,
+            "reason": pyannote_tuning.get("reason", "auto"),
+            **({"cpu_threads": pyannote_tuning.get("cpu_threads")} if pyannote_tuning.get("cpu_threads") else {}),
+        }
+        models_ready["pyannote"] = True
+        print(f"[heed] Pyannote ready in {time.time()-t:.1f}s ({devices['pyannote']})", flush=True)
+    except Exception as e:
+        diarize_pipeline = None
+        models_ready["pyannote"] = False
+        pyannote_runtime_info = {"model": None, "disabled": True, "reason": f"load failed: {str(e)[:120]}"}
+        print(f"[heed] Pyannote unavailable ({str(e)[:100]}) — running TRANSCRIPTION-ONLY (no diarization)", flush=True)
+
+    print(f"[heed] All models ready! (whisper={'ok' if models_ready['whisper'] else 'FAIL'}, "
+          f"diarization={'on' if models_ready['pyannote'] else 'off'})", flush=True)
 
 
 # --- Transcription (faster-whisper) ---
+# Shared faster-whisper decode policy — defined in ONE place (high cohesion) so every
+# transcribe() call (final + live + dual mic/sys channels) behaves identically.
+# condition_on_previous_text=False stops repetition cascades (the "y y y..." loops) without
+# touching real speech. NOTE: vad_filter was tried and REMOVED — on quiet mic audio Silero VAD
+# chopped out real words ("uno dos tres probando..." → "dos, ando, hit"). The empty/garbage
+# sessions were NOT a Whisper-params problem; root cause is the process-stream crash (libavdevice).
+WHISPER_OPTS = {
+    "condition_on_previous_text": False,
+}
+
+
+def is_degenerate_repetition(text):
+    """Detect Whisper repetition-loop hallucinations.
+
+    Covers single-token loops ('ya ya ya ya...', 'y y y') AND short-cycle loops
+    ('o elementos o elementos o elementos...'). Heuristic: a real sentence has diverse
+    words, so if a chunk of >=6 words has a very LOW unique-token ratio (<0.35) it's a
+    degenerate loop, not speech. The accurate final pass re-transcribes regardless.
+    """
+    words = text.split()
+    if len(words) < 6:
+        return False
+    return len(set(words)) / len(words) < 0.35
+
+
 def transcribe(wav_path, language="auto", srt_output=None):
     lang = None if language == "auto" else language
     # Lock: whisper model is not thread-safe — serialize access.
     with whisper_lock:
-        segments_gen, info = whisper_model.transcribe(wav_path, language=lang)
+        segments_gen, info = whisper_model.transcribe(wav_path, language=lang, **WHISPER_OPTS)
         # MUST consume the generator inside the lock (it holds model state)
         segments_list = list(segments_gen)
 
@@ -902,22 +1030,26 @@ def split_stereo(wav_path):
         ],
         capture_output=True, text=True,
     )
-    # Parse volume from stderr to detect silent channels
+    # Parse per-channel volume from stderr to detect silent channels.
+    # CRITICAL: volumedetect prints its summary at filter-CLOSE time, and that order is
+    # NOT the filtergraph order (it routinely comes out reversed). So we must NOT assume
+    # the first "mean_volume" line is the mic — doing that swapped mic/sys and made heed
+    # skip the channel that actually had speech (empty transcripts). Each line is tagged
+    # [Parsed_volumedetect_N]; micout is declared before sysout, so it always gets the
+    # LOWER N. We map by N, not by print order. (Cross-platform bug — affects Linux too.)
+    SILENCE_DB = -50.0
     mic_has = True
     sys_has = True
-    volumes = []
+    measured = {}  # filter_index -> mean dB
     for line in proc.stderr.split("\n"):
-        if "mean_volume:" in line:
-            try:
-                db = float(line.split("mean_volume:")[1].strip().split()[0])
-                volumes.append(db)
-            except (ValueError, IndexError):
-                pass
-    if len(volumes) >= 2:
-        mic_has = volumes[0] > -50.0
-        sys_has = volumes[1] > -50.0
-    elif len(volumes) == 1:
-        mic_has = volumes[0] > -50.0
+        m = re.search(r"Parsed_volumedetect_(\d+).*mean_volume:\s*(-?[\d.]+)", line)
+        if m:
+            measured[int(m.group(1))] = float(m.group(2))
+    if measured:
+        order = sorted(measured)  # ascending filter index → [mic_idx, sys_idx]
+        mic_has = measured[order[0]] > SILENCE_DB
+        if len(order) > 1:
+            sys_has = measured[order[1]] > SILENCE_DB
 
     return mic_path, sys_path, mic_has, sys_has
 
@@ -1002,18 +1134,33 @@ class Handler(BaseHTTPRequestHandler):
             lang = body.get("language", "auto")
             lang = None if lang == "auto" else lang
             with whisper_live_lock:
-                segments_gen, info = whisper_model_live.transcribe(body["wav_path"], language=lang)
+                segments_gen, info = whisper_model_live.transcribe(body["wav_path"], language=lang, **WHISPER_OPTS)
                 segments_list = list(segments_gen)
             lines = []
             for seg in segments_list:
                 text = seg.text.strip()
-                if text:
+                if text and not is_degenerate_repetition(text):
                     lines.append(text)
+            process_s = time.time() - t
+
+            # RuntimeGovernor: observe how long THIS chunk took vs its audio length, and
+            # self-correct — hot-swap to a lighter live model if we're falling behind under
+            # contention, or recover toward the ceiling when there's headroom.
+            gov_info = {}
+            if live_governor is not None:
+                audio_s = float(body.get("audio_s", 3.0)) or 3.0
+                dec = live_governor.observe(audio_s, process_s)
+                if dec.changed and dec.live_model != whisper_model_live_name:
+                    _swap_live_model(dec.live_model)
+                gov_info = {"live_model": whisper_model_live_name, "interval_ms": dec.interval_ms,
+                            "changed": dec.changed, "reason": dec.reason}
+
             self._json({
                 "text": " ".join(lines),
                 "language": info.language if info else "auto",
                 "model": whisper_model_live_name,
-                "time_ms": int((time.time() - t) * 1000),
+                "time_ms": int(process_s * 1000),
+                "gov": gov_info,
             })
 
         elif self.path == "/diarize":
@@ -1118,10 +1265,10 @@ class Handler(BaseHTTPRequestHandler):
         mic_segments_raw = []
         mic_info = None
         if mic_has:
-            segments_gen, mic_info = whisper_model.transcribe(mic_path, language=lang)
+            segments_gen, mic_info = whisper_model.transcribe(mic_path, language=lang, **WHISPER_OPTS)
             for idx, seg in enumerate(segments_gen, 1):
                 text = seg.text.strip()
-                if not text:
+                if not text or is_degenerate_repetition(text):
                     continue
                 segment_data = {
                     "speaker": "Me",
@@ -1141,10 +1288,10 @@ class Handler(BaseHTTPRequestHandler):
         sys_raw_segs = []
         sys_info = None
         if sys_has:
-            segments_gen, sys_info = whisper_model.transcribe(sys_path, language=lang)
+            segments_gen, sys_info = whisper_model.transcribe(sys_path, language=lang, **WHISPER_OPTS)
             for idx, seg in enumerate(segments_gen, 1):
                 text = seg.text.strip()
-                if not text:
+                if not text or is_degenerate_repetition(text):
                     continue
                 segment_data = {
                     "speaker": "???",

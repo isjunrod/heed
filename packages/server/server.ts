@@ -14,7 +14,9 @@ const TEMPLATES_DIR = join(APP_DIR, "templates");
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
 // Hard fallback only — actual model is read from ~/.heed-app/config.json (set by hardware
 // auto-detection on first launch, or by the user via the model picker modal).
-const FALLBACK_MODEL = process.env.HEED_MODEL || "llama3.2:1b";
+// Opt-in override ONLY (for power users / tests). No silent hardcoded default — the user
+// must pick the notes model explicitly (see getCurrentModel + the model picker).
+const FALLBACK_MODEL = process.env.HEED_MODEL || null;
 const CONFIG_PATH = join(homedir(), ".heed-app", "config.json");
 
 for (const dir of [UPLOAD_DIR, APP_DIR, SESSIONS_DIR, TEMPLATES_DIR]) {
@@ -44,7 +46,10 @@ function saveConfig(patch: Partial<TrxConfig>) {
 	writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2));
 }
 
-function getCurrentModel(): string {
+function getCurrentModel(): string | null {
+	// The model the USER explicitly selected, or null if none chosen yet. We deliberately
+	// do NOT fall back to a tiny default — notes generation prompts the user to pick a model
+	// (setup wizard or in-app picker) instead of silently installing/using a conservative one.
 	return loadConfig().ollama_model || FALLBACK_MODEL;
 }
 
@@ -52,28 +57,11 @@ function getCurrentNumGpu(): number | undefined {
 	return loadConfig().ollama_num_gpu;
 }
 
-// Auto-seed model selection on first run by asking Python what default fits this hardware.
-// We seed if `ollama_model` is missing, even if other legacy keys exist in config.json.
-async function seedConfigFromHardware() {
-	if (loadConfig().ollama_model) return;
-	try {
-		const res = await fetch(`${TRANSCRIPTION_SERVER}/hardware`, { signal: AbortSignal.timeout(15000) });
-		if (!res.ok) return;
-		const hw = await res.json() as { default_model?: string; models?: Array<{ id: string; gpu_compatible: boolean }> };
-		if (!hw.default_model) return;
-		const def = hw.models?.find((m) => m.id === hw.default_model);
-		saveConfig({
-			ollama_model: hw.default_model,
-			ollama_num_gpu: def?.gpu_compatible ? undefined : 0,
-		});
-		console.log(`[heed] First-run model: ${hw.default_model} (gpu=${def?.gpu_compatible ? "auto" : "off"})`);
-	} catch (e) {
-		console.log(`[heed] Could not seed model from hardware (Python not ready?): ${(e as Error).message}`);
-	}
-}
-// Fire and forget — Python may still be loading models, retry once after a delay
-seedConfigFromHardware();
-setTimeout(() => { if (!loadConfig().ollama_model) seedConfigFromHardware(); }, 12000);
+// NOTE: there is intentionally NO silent auto-seed of the notes model. The user chooses it
+// explicitly — via the setup wizard or the in-app model picker. The hardware probe
+// (/hardware → handleListModels) only RECOMMENDS a best-fit model in the picker UI; it
+// never writes config on its own. This is a deliberate product rule: never install/use a
+// conservative model behind the user's back.
 
 // --- Seed default templates on first run ---
 const DEFAULT_TEMPLATES = [
@@ -495,6 +483,16 @@ function handleDeleteTemplate(url: URL): Response {
 async function handleSummarize(req: Request): Promise<Response> {
 	const { transcript, language, templateId, force_cpu } = await req.json();
 	if (!transcript) return Response.json({ error: "No transcript provided" }, { status: 400 });
+
+	// Gate: the user must have explicitly chosen a notes model. If none is selected we
+	// signal the client to open the model picker — we never silently pick/install one.
+	const model = getCurrentModel();
+	if (!model) {
+		return Response.json(
+			{ needsModelSelection: true, error: "No notes model selected yet. Pick one to generate notes." },
+			{ status: 409 },
+		);
+	}
 
 	// Load template (default to "general" if not specified)
 	const template = loadTemplate(templateId || "general") || loadTemplate("general");
@@ -1016,6 +1014,11 @@ async function handleSummaryLine(req: Request): Promise<Response> {
 		return Response.json({ summary: "" });
 	}
 
+	// Auto-title is a nice-to-have — if the user hasn't picked a notes model yet, just
+	// skip it silently (the heuristic title is used instead). Never auto-select a model.
+	const model = getCurrentModel();
+	if (!model) return Response.json({ summary: "" });
+
 	// Truncate transcript to first 1500 chars to keep it fast
 	const text = transcript.slice(0, 1500);
 
@@ -1278,8 +1281,12 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 
 	const wavPath = recorderPath;
 	const isDual = wavPath.includes("dual-capture-");
-	const CHUNK_DURATION = 5; // seconds per chunk
-	let interval = 6000; // ms between chunks
+	// Fixed 3s chunks. NOTE: VAD-variable boundaries were tried and REVERTED — adding a
+	// silencedetect ffmpeg spawn per tick during active recording (on top of the recorder +
+	// level-meter ffmpeg) starved the pipeline and spiked live latency to 8-15s. Fixed length
+	// keeps it reliable (~0.3s/chunk). The accurate final pass re-transcribes with full context.
+	const LIVE_CHUNK = 3; // seconds per chunk
+	let interval = 2000; // ms between processing ticks (the file-length guard paces real work)
 	const lang = reqUrl?.searchParams.get("lang") || "es";
 	// DON'T reset offset here — if EventSource reconnects, we continue from
 	// where we left off instead of re-processing the same first chunk forever.
@@ -1325,8 +1332,9 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 				}
 
 				const startTime = Math.max(0, liveTranscribeOffset);
+				const chunkDur = LIVE_CHUNK;
 				// Advance offset NOW so the next tick doesn't re-process the same chunk
-				liveTranscribeOffset = startTime + CHUNK_DURATION;
+				liveTranscribeOffset = startTime + chunkDur;
 				const chunkPath = join(UPLOAD_DIR, `live-chunk-${Date.now()}.wav`);
 
 				try {
@@ -1339,7 +1347,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 						"-i", wavPath,
 						"-af", `${channelFilter}dynaudnorm=p=0.9:m=10`,
 						"-ss", String(startTime),
-						"-t", String(CHUNK_DURATION),
+						"-t", String(chunkDur),
 						"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
 						chunkPath,
 					]);
@@ -1355,13 +1363,13 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 					const txRes = await fetch(`${TRANSCRIPTION_SERVER}/transcribe-live`, {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({ wav_path: chunkPath, language: lang }),
+						body: JSON.stringify({ wav_path: chunkPath, language: lang, audio_s: chunkDur }),
 					});
 					const whisperMs = Date.now() - whisperStart;
 
 					// Adaptive interval: if whisper is slow (RAM pressure), back off
 					// to avoid queueing up chunks that pile on even more pressure.
-					if (whisperMs > 8000 && liveTranscribeInterval) {
+					if (false /* RuntimeGovernor drives cadence now */ && liveTranscribeInterval) {
 						clearInterval(liveTranscribeInterval);
 						interval = Math.min(interval + 3000, 15000);
 						liveTranscribeInterval = setInterval(processChunk, interval);
@@ -1370,14 +1378,21 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 
 					console.log(`[heed] live: whisper responded in ${whisperMs}ms, status=${txRes.status}`);
 					if (txRes.ok) {
-						const tx = await txRes.json() as { text?: string; srt_path?: string };
-						const text = (tx.text || "").trim();
+						const tx = await txRes.json() as { text?: string; srt_path?: string; gov?: { interval_ms?: number; live_model?: string; changed?: boolean; reason?: string } };
+						const gov = tx.gov;
+							if (gov?.interval_ms && gov.interval_ms !== interval && liveTranscribeInterval) {
+								clearInterval(liveTranscribeInterval);
+								interval = gov.interval_ms;
+								liveTranscribeInterval = setInterval(processChunk, interval);
+							}
+							if (gov?.changed) console.log(`[heed] live governor: ${gov.reason} (interval=${interval}ms)`);
+							const text = (tx.text || "").trim();
 						console.log(`[heed] live: whisper text="${text.slice(0, 50)}" (${text.length} chars)`);
 						if (text && text.length > 3) {
 							send("segment", {
 								speaker: "Me",
 								start: Math.round(startTime * 100) / 100,
-								end: Math.round(Math.min(startTime + CHUNK_DURATION, fileDurationS) * 100) / 100,
+								end: Math.round(Math.min(startTime + chunkDur, fileDurationS) * 100) / 100,
 								text,
 								channel: "mic",
 								live: true,
@@ -1394,7 +1409,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 							"-i", wavPath,
 							"-af", "pan=mono|c0=c1,dynaudnorm=p=0.9:m=10",
 							"-ss", String(startTime),
-							"-t", String(CHUNK_DURATION),
+							"-t", String(chunkDur),
 							"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
 							sysChunkPath,
 						]);
@@ -1411,7 +1426,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 									send("segment", {
 										speaker: "???",
 										start: Math.round(startTime * 100) / 100,
-										end: Math.round(Math.min(startTime + CHUNK_DURATION, fileDurationS) * 100) / 100,
+										end: Math.round(Math.min(startTime + chunkDur, fileDurationS) * 100) / 100,
 										text: sysText,
 										channel: "sys",
 										live: true,
@@ -1437,11 +1452,11 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 				}
 			};
 
-			// First chunk after 3 seconds, then every interval
+			// First chunk after 1 second (was 3s) so words start appearing fast, then every interval
 			const firstTimeout = setTimeout(() => {
 				processChunk();
 				liveTranscribeInterval = setInterval(processChunk, interval);
-			}, 3000);
+			}, 1000);
 
 			// Cleanup when connection drops
 			const checkClosed = setInterval(() => {

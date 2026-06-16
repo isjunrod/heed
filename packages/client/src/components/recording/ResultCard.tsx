@@ -22,6 +22,7 @@ export function ResultCard() {
 	const { templates, load: loadTemplates } = useTemplatesStore();
 	const modelsData = useModelsStore((s) => s.data);
 	const loadModels = useModelsStore((s) => s.load);
+	const openPicker = useModelsStore((s) => s.openPicker);
 
 	const [activeTab, setActiveTab] = useState<Tab>("speakers");
 	const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({});
@@ -90,7 +91,12 @@ export function ResultCard() {
 				forceCpu,
 			);
 		} catch (e) {
-			showToast(`Error: ${(e as Error).message}`);
+			if ((e as { needsModelSelection?: boolean }).needsModelSelection) {
+				showToast("Elige un modelo de notas para generar");
+				openPicker();
+			} else {
+				showToast(`Error: ${(e as Error).message}`);
+			}
 		} finally {
 			setGenerating(false);
 		}

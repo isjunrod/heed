@@ -6,7 +6,7 @@
 		"dev": "concurrently -n server,client,python -c blue,green,yellow \"bun run dev:server\" \"bun run dev:client\" \"bun run dev:python\"",
 		"dev:server": "cd packages/server && bun run dev",
 		"dev:client": "cd packages/client && bun run dev",
-		"dev:python": "python3 -u packages/transcription/transcription_server.py",
+		"dev:python": ".venv/bin/python3 -u packages/transcription/transcription_server.py",
 		"build": "cd packages/client && bun run build",
 		"update": "node scripts/update.mjs",
 		"desktop": "python3 packages/desktop/main.py",

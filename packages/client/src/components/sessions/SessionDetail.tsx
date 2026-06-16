@@ -25,6 +25,7 @@ export function SessionDetail({ session, onBack }: Props) {
 	const { templates, load: loadTemplates } = useTemplatesStore();
 	const modelsData = useModelsStore((s) => s.data);
 	const loadModels = useModelsStore((s) => s.load);
+	const openPicker = useModelsStore((s) => s.openPicker);
 
 	const [activeTab, setActiveTab] = useState<TabId>("speakers");
 	const [templateId, setTemplateId] = useState<string>("general");
@@ -89,7 +90,12 @@ export function SessionDetail({ session, onBack }: Props) {
 				},
 			);
 		} catch (e) {
-			showToast(`Error: ${(e as Error).message}`);
+			if ((e as { needsModelSelection?: boolean }).needsModelSelection) {
+				showToast("Elige un modelo de notas para generar");
+				openPicker();
+			} else {
+				showToast(`Error: ${(e as Error).message}`);
+			}
 		} finally {
 			setGenerating(false);
 		}

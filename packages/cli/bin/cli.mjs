@@ -145,22 +145,7 @@ async function main() {
 		}
 	}
 
-	// --- Step 3: Python AI packages ---
-	step(++stepN, TOTAL, "AI models (faster-whisper + pyannote)");
-	const hasFW = cmd(`${pyCmd || "python3"} -c "import faster_whisper" 2>&1`) !== null
-		? cmd(`${pyCmd || "python3"} -c "import faster_whisper; print('ok')"`) === "ok"
-		: false;
-	if (hasFW) {
-		ok("faster-whisper already installed");
-	} else {
-		warn("Installing AI packages (~3GB download first time). This powers the transcription.");
-		if (await ask("Install faster-whisper + pyannote-audio + torch?")) {
-			const pipCmd = IS_MAC ? "pip3 install" : "pip install --break-system-packages";
-			run(`${pipCmd} faster-whisper pyannote-audio`, "AI packages installed");
-		}
-	}
-
-	// --- Step 4: ffmpeg ---
+	// --- Step 3: ffmpeg ---
 	step(++stepN, TOTAL, "ffmpeg (audio capture)");
 	if (hasCommand("ffmpeg")) {
 		ok("ffmpeg already installed");
@@ -177,7 +162,7 @@ async function main() {
 		}
 	}
 
-	// --- Step 5: Ollama ---
+	// --- Step 4: Ollama (local notes engine) ---
 	step(++stepN, TOTAL, "Ollama (local AI engine)");
 	if (hasCommand("ollama")) {
 		const ollamaVer = cmd("ollama --version");
@@ -185,11 +170,21 @@ async function main() {
 	} else {
 		warn("Ollama runs AI models locally for generating meeting notes.");
 		if (await ask("Install Ollama?")) {
-			run("curl -fsSL https://ollama.com/install.sh | sh", "Ollama installed");
+			if (IS_MAC) {
+				// macOS: the official app bundles the llama-server runner. The Homebrew
+				// *formula* (`brew install ollama`) ships WITHOUT that runner and cannot
+				// generate — so we install the cask (Ollama.app) instead.
+				if (!hasCommand("brew")) run('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', "Homebrew installed");
+				run("brew install --cask ollama-app", "Ollama installed");
+			} else {
+				// Linux: official install script (ships the runner correctly).
+				run("curl -fsSL https://ollama.com/install.sh | sh", "Ollama installed");
+			}
 		}
 	}
 
-	// --- Step 6: Clone heed ---
+	// --- Step 5: Download heed --- (must happen BEFORE the Python venv so we have
+	// requirements.txt and a folder for .venv)
 	step(++stepN, TOTAL, "Download heed");
 	const targetDir = join(process.cwd(), "heed");
 	if (existsSync(targetDir)) {
@@ -200,10 +195,45 @@ async function main() {
 		info("Cloning from GitHub...");
 		run(`git clone https://github.com/isjunrod/heed.git "${targetDir}"`, "Downloaded");
 	}
-
-	// Install dependencies
 	info("Installing JavaScript dependencies...");
 	run(`cd "${targetDir}" && bun install`, "Dependencies installed");
+
+	// --- Step 6: Python AI packages (isolated in a project-local .venv) ---
+	step(++stepN, TOTAL, "AI models (faster-whisper + pyannote + torch)");
+	// torch needs Python 3.10–3.12; a system python3 can be too new (e.g. 3.14 has no
+	// torch wheels yet). Prefer an explicit 3.12/3.11/3.10, and on macOS install
+	// python@3.12 if none is present. We ALWAYS install into `<heed>/.venv` so the
+	// system Python stays untouched and `bun run dev` (dev:python → .venv/bin/python3)
+	// works identically on macOS and Linux.
+	let venvPy = hasCommand("python3.12") ? "python3.12"
+		: hasCommand("python3.11") ? "python3.11"
+		: hasCommand("python3.10") ? "python3.10"
+		: null;
+	if (!venvPy) {
+		if (IS_MAC) {
+			if (!hasCommand("brew")) run('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', "Homebrew installed");
+			run("brew install python@3.12", "Python 3.12 installed");
+			venvPy = hasCommand("python3.12") ? "python3.12" : (pyCmd || "python3");
+		} else {
+			venvPy = pyCmd || "python3";
+		}
+	}
+	const venvDir = join(targetDir, ".venv");
+	const venvPython = join(venvDir, "bin", "python3");
+	if (!existsSync(venvDir)) {
+		run(`${venvPy} -m venv "${venvDir}"`, "Virtualenv created (.venv)");
+	}
+	const reqPath = join(targetDir, "packages", "transcription", "requirements.txt");
+	const hasFW = cmd(`"${venvPython}" -c "import faster_whisper; print('ok')" 2>/dev/null`) === "ok";
+	if (hasFW) {
+		ok("AI packages already installed in .venv");
+	} else {
+		warn("Installing AI packages (~3GB download first time). This powers the transcription.");
+		if (await ask("Install faster-whisper + pyannote + torch into .venv?")) {
+			run(`"${venvPython}" -m pip install --upgrade pip`, "pip upgraded");
+			run(`"${venvPython}" -m pip install -r "${reqPath}"`, "AI packages installed");
+		}
+	}
 
 	// --- Step 7: Launch ---
 	step(++stepN, TOTAL, "Launch heed");
@@ -351,8 +381,14 @@ async function update() {
 	}
 
 	if (diffFiles.includes("requirements.txt")) {
-		warn("Python dependencies may have changed. Run:");
-		log(`  ${C.dim}pip install -r ${heedDir}/packages/transcription/requirements.txt${C.reset}`);
+		const venvPy = join(heedDir, ".venv", "bin", "python3");
+		if (existsSync(venvPy)) {
+			info("Python dependencies changed, updating .venv...");
+			run(`"${venvPy}" -m pip install -r "${heedDir}/packages/transcription/requirements.txt"`, "Python deps updated");
+		} else {
+			warn("Python dependencies may have changed. Run:");
+			log(`  ${C.dim}${heedDir}/.venv/bin/python3 -m pip install -r ${heedDir}/packages/transcription/requirements.txt${C.reset}`);
+		}
 	}
 
 	const newHash = cmd(`cd "${heedDir}" && git rev-parse --short HEAD`);

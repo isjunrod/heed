@@ -6,6 +6,9 @@ interface ModelsState {
 	data: ModelsResponse | null;
 	loading: boolean;
 	error: string | null;
+	pickerOpen: boolean;
+	openPicker: () => void;
+	closePicker: () => void;
 	load: () => Promise<void>;
 	currentModel: () => CatalogModel | null;
 	select: (id: string) => Promise<void>;
@@ -15,6 +18,10 @@ export const useModelsStore = create<ModelsState>((set, get) => ({
 	data: null,
 	loading: false,
 	error: null,
+	// Global picker visibility so notes generation can open it when no model is selected.
+	pickerOpen: false,
+	openPicker: () => set({ pickerOpen: true }),
+	closePicker: () => set({ pickerOpen: false }),
 	load: async () => {
 		set({ loading: true, error: null });
 		try {

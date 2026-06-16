@@ -218,6 +218,14 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 							case "result": {
 								useRecordingStore.getState().setResult(data);
 								const words = (data.text || "").split(/\s+/).filter(Boolean);
+								// Guard: don't persist a phantom session when nothing was captured
+								// (no transcript and no segments) — tell the user instead of saving
+								// an empty "Meeting ..." card.
+								const hasSegs = Array.isArray(data.segments) && data.segments.length > 0;
+								if (words.length === 0 && !hasSegs) {
+									showToast("No se detectó voz en la grabación — nada que guardar");
+									break;
+								}
 								const heuristicTitle = words.length > 0
 									? words.slice(0, 8).join(" ") + (words.length > 8 ? "..." : "")
 									: `Meeting ${fmtDate(new Date().toISOString())}`;

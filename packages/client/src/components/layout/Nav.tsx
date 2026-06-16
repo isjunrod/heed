@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useUIStore, type Page } from "@/stores/ui.ts";
 import { useHealthStore } from "@/stores/health.ts";
 import { useModelsStore } from "@/stores/models.ts";
@@ -29,7 +29,9 @@ export function Nav() {
 	const checkHealth = useHealthStore((s) => s.check);
 	const modelsData = useModelsStore((s) => s.data);
 	const loadModels = useModelsStore((s) => s.load);
-	const [pickerOpen, setPickerOpen] = useState(false);
+	const pickerOpen = useModelsStore((s) => s.pickerOpen);
+	const openPicker = useModelsStore((s) => s.openPicker);
+	const closePicker = useModelsStore((s) => s.closePicker);
 
 	useEffect(() => {
 		checkHealth();
@@ -71,7 +73,7 @@ export function Nav() {
 					<div className={styles.status}>
 						<button
 							className={styles.modelChip}
-							onClick={() => setPickerOpen(true)}
+							onClick={() => openPicker()}
 							title="Click to switch AI model"
 							data-tour="model-chip"
 						>
@@ -133,7 +135,7 @@ export function Nav() {
 					</div>
 				</div>
 			</div>
-			<ModelPicker open={pickerOpen} onClose={() => setPickerOpen(false)} />
+			<ModelPicker open={pickerOpen} onClose={() => closePicker()} />
 		</nav>
 	);
 }

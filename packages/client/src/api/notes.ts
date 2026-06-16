@@ -22,6 +22,13 @@ export async function generateNotes(
 		body: JSON.stringify({ transcript, language, templateId, force_cpu }),
 	});
 	if (!res.ok || !res.body) {
+		// 409 = no notes model selected yet. Signal callers to open the model picker
+		// instead of surfacing a raw error — the user picks a model, then retries.
+		if (res.status === 409) {
+			const e = new Error("needs-model-selection") as Error & { needsModelSelection?: boolean };
+			e.needsModelSelection = true;
+			throw e;
+		}
 		const msg = `Summarize failed: ${res.status}`;
 		handlers.onError?.(msg);
 		throw new Error(msg);

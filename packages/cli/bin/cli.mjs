@@ -103,7 +103,8 @@ async function main() {
 	info(`Detected: ${C.bold}${IS_MAC ? "macOS" : "Linux"}${C.reset} (${cpus()[0]?.model || "unknown CPU"})`);
 	log("");
 
-	const TOTAL = 7;
+	const IS_APPLE_SILICON = IS_MAC && process.arch === "arm64";
+	const TOTAL = IS_APPLE_SILICON ? 8 : 7;
 	let stepN = 0;
 
 	// --- Step 1: Bun ---
@@ -235,7 +236,29 @@ async function main() {
 		}
 	}
 
-	// --- Step 7: Launch ---
+	// --- Step 7 (Apple Silicon only): Parakeet speed engine ---
+	// Builds the Swift sidecar that runs Parakeet ASR + FluidAudio diarization on the Apple
+	// Neural Engine — the fastest path on Mac AND the one that needs NO gated pyannote token.
+	// GRACEFUL: if the Swift toolchain isn't present we skip and heed falls back to MLX-Whisper
+	// (still GPU-accelerated) + pyannote. heed must never hard-fail at install.
+	if (IS_APPLE_SILICON) {
+		step(++stepN, TOTAL, "Parakeet speed engine (Apple Neural Engine)");
+		const sidecarDir = join(targetDir, "packages", "transcription", "native", "heed-parakeet");
+		const sidecarBin = join(sidecarDir, ".build", "release", "heed-parakeet");
+		if (existsSync(sidecarBin)) {
+			ok("Parakeet sidecar already built");
+		} else if (!hasCommand("swift")) {
+			info("Swift toolchain not found — skipping Parakeet (heed will use MLX-Whisper).");
+			info(`Install Xcode Command Line Tools (${C.cyan}xcode-select --install${C.reset}) then re-run to enable the fastest engine.`);
+		} else if (existsSync(sidecarDir)) {
+			info("Building Parakeet sidecar (first build downloads CoreML deps, ~1-2 min)...");
+			if (!run(`cd "${sidecarDir}" && swift build -c release`, "Parakeet sidecar built (Apple Neural Engine)")) {
+				info("Parakeet build failed — heed will use MLX-Whisper instead (still fast). Continuing.");
+			}
+		}
+	}
+
+	// --- Step 8: Launch ---
 	step(++stepN, TOTAL, "Launch heed");
 	log("");
 	log(`${C.bold}${C.green}  All set!${C.reset}`);

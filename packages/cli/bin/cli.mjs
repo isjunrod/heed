@@ -58,6 +58,34 @@ async function ask(question) {
 	});
 }
 
+// Trigger the macOS Screen-Recording permission dialog by briefly running heed-syscap
+// (the binary the grant must bind to). Resolves true if it reported {"ready":true} —
+// i.e. capture started, so permission is already granted. Resolves false if it errored
+// out quickly (dialog shown / declined) or never reported ready within the window.
+function warmSystemAudioPermission(bin) {
+	return new Promise((resolve) => {
+		let stderr = "";
+		let settled = false;
+		const finish = (granted) => {
+			if (settled) return;
+			settled = true;
+			try { child.kill(); } catch {}
+			resolve(granted);
+		};
+		const isReady = () => stderr.split("\n").some((l) => {
+			try { return JSON.parse(l).ready === true; } catch { return false; }
+		});
+		const child = spawn(bin, [], { stdio: ["ignore", "ignore", "pipe"] });
+		child.stderr.on("data", (d) => {
+			stderr += d.toString();
+			if (isReady()) finish(true);
+		});
+		child.on("error", () => finish(false));
+		child.on("exit", () => finish(isReady())); // exited fast → likely permission error
+		setTimeout(() => finish(isReady()), 3000); // still running w/o "ready" → treat as not granted
+	});
+}
+
 function run(command, label) {
 	info(`Running: ${C.dim}${command}${C.reset}`);
 	try {
@@ -104,7 +132,7 @@ async function main() {
 	log("");
 
 	const IS_APPLE_SILICON = IS_MAC && process.arch === "arm64";
-	const TOTAL = IS_APPLE_SILICON ? 8 : 7;
+	const TOTAL = IS_APPLE_SILICON ? 9 : 7;
 	let stepN = 0;
 
 	// --- Step 1: Bun ---
@@ -256,9 +284,35 @@ async function main() {
 				info("Parakeet build failed — heed will use MLX-Whisper instead (still fast). Continuing.");
 			}
 		}
+
+		// --- Step 8 (Apple Silicon): System-audio permission (pre-armed, one time) ---
+		// macOS protects system audio: capturing it ALWAYS needs the user's Screen Recording
+		// permission (true of every method — SCK, Core Audio taps, etc.; only BlackHole avoids
+		// it, at the cost of a sudo driver + manual output re-routing). We ask for it HERE, once,
+		// at peak setup-intent, so pressing "record" later is friction-free. The dialog must be
+		// triggered by heed-syscap itself (TCC binds the grant to the calling binary), so we run
+		// the real binary briefly. If the toolchain was missing, this step is a no-op (mic still
+		// works; system falls back to BlackHole if present).
+		step(++stepN, TOTAL, "System audio permission (one-time)");
+		const syscapBin = join(sidecarDir, ".build", "release", "heed-syscap");
+		if (!existsSync(syscapBin)) {
+			info("System-audio helper not built — heed will record mic (and BlackHole system audio if present).");
+		} else {
+			info("heed needs permission to capture your meetings' system audio.");
+			info("A macOS dialog will appear — approve it. (Mic-only recording works without this.)");
+			const granted = await warmSystemAudioPermission(syscapBin);
+			if (granted) {
+				ok("System audio permission granted — press record and you're done");
+			} else {
+				// Open the exact Settings pane so the user can flip the toggle in one move.
+				try { execSync(`open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"`, { stdio: "ignore" }); } catch {}
+				info("Enable heed (heed-syscap) under Screen Recording, then heed uses it automatically.");
+				info("Until then heed records your mic; system audio falls back to BlackHole if installed.");
+			}
+		}
 	}
 
-	// --- Step 8: Launch ---
+	// --- Step 9: Launch ---
 	step(++stepN, TOTAL, "Launch heed");
 	log("");
 	log(`${C.bold}${C.green}  All set!${C.reset}`);

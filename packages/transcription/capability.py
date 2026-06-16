@@ -23,7 +23,7 @@ from dataclasses import dataclass, asdict, field
 import engines
 
 CACHE_PATH = os.path.join(os.path.expanduser("~"), ".heed-app", "capabilities.json")
-CACHE_VERSION = 1
+CACHE_VERSION = 2  # bumped for v3: Parakeet engine detection (invalidates stale mlx caches)
 
 # The benchmark transcribes with this reference model; other tiers are extrapolated from it.
 BENCH_MODEL = "small"
@@ -72,6 +72,10 @@ class Capabilities:
         """
         if not self.rtf:
             return 0.0
+        # Parakeet runs ONE model (TDT v3) regardless of the requested whisper tier, so its
+        # speed doesn't scale with tier — the measured RTF applies to every tier as-is.
+        if self.engine == "parakeet":
+            return self.rtf
         ref = LARGE_COST.get(self.engine, 6.0) if self.bench_model == "large-v3" else TIER_COST.get(self.bench_model, 1.0)
         tgt = LARGE_COST.get(self.engine, 6.0) if model_name == "large-v3" else TIER_COST.get(model_name, 1.0)
         return self.rtf * (ref / tgt)
@@ -97,7 +101,14 @@ def _detect_accelerator():
         if platform.system() == "Darwin" and platform.machine() == "arm64" \
                 and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             ram = _system_ram_mb()
-            engine = "mlx" if engines.mlx_available() else "ctranslate2"
+            # Prefer Parakeet (Apple Neural Engine, far faster than Whisper) when its sidecar
+            # is built; fall back to MLX (Apple GPU), then CTranslate2 (CPU).
+            if engines.parakeet_available():
+                engine = "parakeet"
+            elif engines.mlx_available():
+                engine = "mlx"
+            else:
+                engine = "ctranslate2"
             return "apple_gpu", "Apple Silicon (MPS)", ram, engine
         if torch.cuda.is_available():
             _, total = torch.cuda.mem_get_info(0)

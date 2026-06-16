@@ -69,6 +69,9 @@ pyannote_runtime_info = {
     "reason": "initializing",
 }
 diarize_pipeline = None
+# Which backend answers diarization: "pyannote" (Linux/CUDA/CPU) or "parakeet" (Apple
+# Silicon, via the FluidAudio sidecar — no gated HF token). None = diarization off.
+diarize_backend = None
 models_ready = {"whisper": False, "pyannote": False}
 
 
@@ -559,7 +562,7 @@ def _swap_live_model(new_model):
 
 
 def load_models():
-    global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info
+    global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info, diarize_backend
     global live_governor, _devices, _warmup_path
 
     devices = get_device_config()
@@ -653,6 +656,29 @@ def load_models():
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+    # --- Diarization backend selection ---
+    # On Apple Silicon, the Parakeet sidecar ALSO loads FluidAudio speaker diarization (CoreML,
+    # downloaded from a PUBLIC HF repo — NO gated token). Prefer it: zero-friction install, no
+    # pyannote/torch token wall. Everywhere else (Linux/CUDA/CPU) keep pyannote unchanged.
+    if engine_kind == "parakeet" and engines.parakeet_available():
+        try:
+            t = time.time()
+            engines.get_parakeet()  # warms the sidecar (ASR + diarization models) if not already
+            diarize_backend = "parakeet"
+            models_ready["pyannote"] = True
+            pyannote_runtime_info = {
+                "model": "fluidaudio (CoreML, no token)",
+                "device": "ane",
+                "profile": "parakeet-sidecar",
+                "reason": "Apple Silicon: zero-token diarization via FluidAudio",
+            }
+            print(f"[heed] Diarization: FluidAudio sidecar (no token) ready in {time.time()-t:.1f}s", flush=True)
+            print(f"[heed] All models ready! (whisper=ok, diarization=on via parakeet-sidecar)", flush=True)
+            return
+        except Exception as e:
+            diarize_backend = None
+            print(f"[heed] FluidAudio sidecar diarization unavailable ({str(e)[:100]}) — trying pyannote", flush=True)
+
     # --- Pyannote (OPTIONAL: diarization is a bonus, not a hard requirement) ---
     # If it fails to load (missing weights, OOM, gated model on a fresh box), heed keeps working
     # in transcription-only mode instead of hard-failing. "who said what" degrades to plain text.
@@ -692,6 +718,7 @@ def load_models():
             **({"cpu_threads": pyannote_tuning.get("cpu_threads")} if pyannote_tuning.get("cpu_threads") else {}),
         }
         models_ready["pyannote"] = True
+        diarize_backend = "pyannote"
         print(f"[heed] Pyannote ready in {time.time()-t:.1f}s ({devices['pyannote']})", flush=True)
     except Exception as e:
         diarize_pipeline = None
@@ -818,7 +845,57 @@ def match_voice(embedding, threshold=0.7):
 
 
 # --- Diarization ---
+def _diarize_parakeet(wav_path, srt_path=None):
+    """Diarization via the FluidAudio sidecar (Apple Silicon, no gated token).
+    Returns the SAME contract as the pyannote path so callers don't branch.
+    Note: cross-session voice naming (embeddings/match_voice) is pyannote-only for now;
+    here speakers are stable per-session labels ("Speaker N") mapped from FluidAudio IDs."""
+    import engines
+    raw_segments = engines.get_parakeet().diarize(wav_path)  # [{speaker, start, end}, ...]
+
+    # Map FluidAudio speaker ids -> "Speaker 1/2/..." in first-appearance order.
+    speakers_map = {}
+    counter = 0
+    diar_segments = []
+    for seg in raw_segments:
+        sid = str(seg.get("speaker", "?"))
+        if sid not in speakers_map:
+            counter += 1
+            speakers_map[sid] = f"Speaker {counter}"
+        diar_segments.append({
+            "start": round(float(seg.get("start", 0.0)), 2),
+            "end": round(float(seg.get("end", 0.0)), 2),
+            "speaker": speakers_map[sid],
+        })
+    diar_segments.sort(key=lambda s: s["start"])
+
+    if srt_path and os.path.exists(srt_path):
+        srt_segments = parse_srt(srt_path)
+        merged = assign_speakers(diar_segments, srt_segments)
+        lines = []
+        last = None
+        for seg in merged:
+            if seg["speaker"] != last:
+                lines.append(f"\n{seg['speaker']}:")
+                last = seg["speaker"]
+            lines.append(f"  {seg['text']}")
+        text = "\n".join(lines).strip()
+    else:
+        merged = diar_segments
+        text = ""
+
+    return {
+        "speakers": list(set(speakers_map.values())),
+        "speaker_count": len(set(speakers_map.values())),
+        "segments": merged,
+        "text": text,
+        "embeddings": {},  # FluidAudio embeddings not exposed yet → no cross-session match
+    }
+
+
 def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
+    if diarize_backend == "parakeet":
+        return _diarize_parakeet(wav_path, srt_path)
     # Tune clustering for accuracy (slightly conservative to avoid splitting same voice)
     params = diarize_pipeline.parameters(instantiated=True)
     params["clustering"]["threshold"] = 0.8

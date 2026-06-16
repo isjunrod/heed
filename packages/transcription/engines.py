@@ -14,6 +14,11 @@ never selected elsewhere — the CUDA/CPU path (current behavior) is untouched.
 """
 import sys
 import platform
+import os
+import json
+import wave
+import subprocess
+import threading
 
 
 class _Seg:
@@ -101,8 +106,79 @@ class MLXEngine:
         return iter(segs), _Info(r.get("language", language))
 
 
+# --- Parakeet / FluidAudio sidecar (Apple Silicon only) ---------------------------------
+# A resident Swift process (packages/transcription/native/heed-parakeet) runs Parakeet ASR on
+# the Apple Neural Engine — far faster than Whisper. heed talks to it over newline-delimited
+# JSON on stdin/stdout. Only used when its binary has been built (Apple Silicon).
+_SIDECAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "heed-parakeet")
+_SIDECAR_BIN = os.path.join(_SIDECAR_DIR, ".build", "release", "heed-parakeet")
+_parakeet_singleton = None
+_parakeet_lock = threading.Lock()
+
+
+def parakeet_available():
+    """True on Apple Silicon when the sidecar binary has been built."""
+    return is_apple_silicon() and os.path.exists(_SIDECAR_BIN)
+
+
+def _wav_duration(path):
+    try:
+        with wave.open(path) as w:
+            return w.getnframes() / float(w.getframerate() or 16000)
+    except Exception:
+        return 0.0
+
+
+class ParakeetEngine:
+    """Talks to the resident Swift sidecar. One model for all languages/tiers, so `model_name`
+    is ignored. Same interface as the Whisper engines: transcribe() -> (segments_iter, info)."""
+
+    kind = "parakeet"
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            [_SIDECAR_BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+        self.lock = threading.Lock()
+        self.proc.stdout.readline()  # consume the {"ready":...} line
+
+    def _request(self, obj):
+        with self.lock:
+            self.proc.stdin.write(json.dumps(obj) + "\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+        try:
+            return json.loads(line)
+        except Exception:
+            return {"ok": False, "error": "bad sidecar response"}
+
+    def transcribe(self, wav_path, language=None, **opts):
+        lang = language if language else "auto"
+        r = self._request({"cmd": "transcribe", "wav": wav_path, "language": lang})
+        text = (r.get("text", "") if r.get("ok") else "").strip()
+        segs = [_Seg(0.0, _wav_duration(wav_path), text)] if text else []
+        return iter(segs), _Info(language or "auto")
+
+    def diarize(self, wav_path):
+        """Speaker segments via FluidAudio CoreML (no gated token). Apple Silicon only."""
+        r = self._request({"cmd": "diarize", "wav": wav_path})
+        return r.get("segments", []) if r.get("ok") else []
+
+
+def get_parakeet():
+    """Lazy shared sidecar (one process for live + final)."""
+    global _parakeet_singleton
+    with _parakeet_lock:
+        if _parakeet_singleton is None:
+            _parakeet_singleton = ParakeetEngine()
+        return _parakeet_singleton
+
+
 def select_engine_kind(device_cfg=None):
-    """Apple Silicon (with mlx) → 'mlx'; otherwise → 'ctranslate2' (CUDA or CPU)."""
+    """Apple Silicon with the Parakeet sidecar built → 'parakeet'; else mlx; else ctranslate2."""
+    if parakeet_available():
+        return "parakeet"
     if mlx_available():
         return "mlx"
     return "ctranslate2"
@@ -110,7 +186,10 @@ def select_engine_kind(device_cfg=None):
 
 def make_engine(model_name, device_cfg):
     """Build the fastest engine for this machine running `model_name`."""
-    if select_engine_kind(device_cfg) == "mlx":
+    kind = select_engine_kind(device_cfg)
+    if kind == "parakeet":
+        return get_parakeet()  # shared singleton; model_name ignored (Parakeet is one model)
+    if kind == "mlx":
         return MLXEngine(model_name)
     device = device_cfg.get("whisper", "cpu")
     compute_type = "float16" if device == "cuda" else "int8"

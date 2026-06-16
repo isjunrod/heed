@@ -1,5 +1,6 @@
 node_modules/
 .venv/
+.venv
 .env
 *.log
 .vercel
@@ -24,3 +25,7 @@ pendints.txt
 _warmup.wav
 CLAUDE.md
 docs/competitive-analysis.md
+
+# Swift sidecar build artifacts (heed-parakeet) — rebuilt by the installer
+packages/transcription/native/**/.build/
+packages/transcription/native/**/.swiftpm/

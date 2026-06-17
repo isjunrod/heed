@@ -1127,35 +1127,23 @@ async function spawnSyscap(): Promise<ReturnType<typeof Bun.spawn> | null> {
 		let ok = false;
 		try { ok = JSON.parse(handshake || "{}").ready === true; } catch {}
 		if (ok) {
-			console.log("[heed] system audio via ScreenCaptureKit (no BlackHole routing needed)");
+			console.log("[heed] system audio via ScreenCaptureKit");
 			return proc;
 		}
-		console.log(`[heed] ScreenCaptureKit unavailable (${(handshake || "no handshake").slice(0, 80)}) — falling back to BlackHole`);
+		console.log(`[heed] ScreenCaptureKit unavailable (${(handshake || "no handshake").slice(0, 80)}) — system audio off (grant Screen Recording)`);
 		try { proc.kill(); } catch {}
 		return null;
 	} catch (e) {
-		console.log(`[heed] ScreenCaptureKit spawn failed (${(e as Error).message}) — falling back to BlackHole`);
+		console.log(`[heed] ScreenCaptureKit spawn failed (${(e as Error).message}) — system audio off`);
 		return null;
 	}
 }
 
 function getMonitorSource(): string | null {
 	if (IS_MAC) {
-		// macOS: use BlackHole or built-in audio loopback if available.
-		// BlackHole creates a virtual device "BlackHole 2ch" that captures system audio.
-		// If not installed, we can't capture system audio (return null → mic-only mode).
-		try {
-			const result = Bun.spawnSync(["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""]);
-			const output = new TextDecoder().decode(result.stderr);
-			// Look for BlackHole in the device list
-			const lines = output.split("\n");
-			for (let i = 0; i < lines.length; i++) {
-				if (/blackhole/i.test(lines[i])) {
-					const match = lines[i].match(/\[(\d+)\]/);
-					if (match) return `:${match[1]}`; // avfoundation audio device index
-				}
-			}
-		} catch {}
+		// macOS captures system audio via ScreenCaptureKit (heed-syscap) — no virtual driver.
+		// BlackHole support was removed (confusing: needs manual output re-routing and the user
+		// hears nothing). If SCK isn't available, system audio is simply unavailable (mic-only).
 		return null;
 	}
 	// Linux: PipeWire/PulseAudio monitor
@@ -1272,7 +1260,7 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 		startLevelMeter();
 	}
 
-	return Response.json({ recording: true, mode, path: recorderPath, source: usedSyscap ? "screencapturekit" : (monitor ? "blackhole" : "mic-only"), monitor: monitor || null, mic });
+	return Response.json({ recording: true, mode, path: recorderPath, source: usedSyscap ? "screencapturekit" : (monitor ? "system-monitor" : "mic-only"), monitor: monitor || null, mic });
 }
 
 // --- System audio level meter via ffmpeg reading monitor source ---
@@ -1371,7 +1359,7 @@ async function refreshLiveTuning() {
 // REPLACE event per channel, so the on-screen text always has full context (accurate) and refines
 // as you speak. Bounded to the last LIVE_FULL_WINDOW seconds so very long meetings stay responsive;
 // the accurate final pass covers the whole recording regardless.
-const LIVE_FULL_WINDOW = 180;
+const LIVE_FULL_WINDOW = 90;
 async function processFullLive(
 	wavPath: string, isDual: boolean, lang: string,
 	send: (event: string, data: unknown) => void,
@@ -1443,7 +1431,6 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 	const LIVE_CHUNK = liveTuning.chunk_s; // engine-adaptive (parakeet 2s, whisper 3s)
 	let interval = liveTuning.interval_ms; // engine-adaptive (parakeet 800ms, whisper 2000ms)
 	const lang = reqUrl?.searchParams.get("lang") || "es";
-	console.log(`[heed] LIVE lang received from client: "${reqUrl?.searchParams.get("lang")}" -> using "${lang}"`);
 	// DON'T reset offset here — if EventSource reconnects, we continue from
 	// where we left off instead of re-processing the same first chunk forever.
 	// Offset is only reset in stopLiveTranscribe() when recording actually stops.

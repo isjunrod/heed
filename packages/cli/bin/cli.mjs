@@ -287,16 +287,14 @@ async function main() {
 
 		// --- Step 8 (Apple Silicon): System-audio permission (pre-armed, one time) ---
 		// macOS protects system audio: capturing it ALWAYS needs the user's Screen Recording
-		// permission (true of every method — SCK, Core Audio taps, etc.; only BlackHole avoids
-		// it, at the cost of a sudo driver + manual output re-routing). We ask for it HERE, once,
+		// permission (true of every method — SCK, Core Audio taps, etc.). We ask for it HERE, once,
 		// at peak setup-intent, so pressing "record" later is friction-free. The dialog must be
 		// triggered by heed-syscap itself (TCC binds the grant to the calling binary), so we run
-		// the real binary briefly. If the toolchain was missing, this step is a no-op (mic still
-		// works; system falls back to BlackHole if present).
+		// the real binary briefly. If the toolchain was missing, this step is a no-op (mic still works).
 		step(++stepN, TOTAL, "System audio permission (one-time)");
 		const syscapBin = join(sidecarDir, ".build", "release", "heed-syscap");
 		if (!existsSync(syscapBin)) {
-			info("System-audio helper not built — heed will record mic (and BlackHole system audio if present).");
+			info("System-audio helper not built — heed will record your microphone only.");
 		} else {
 			info("heed needs permission to capture your meetings' system audio.");
 			info("A macOS dialog will appear — approve it. (Mic-only recording works without this.)");
@@ -307,7 +305,7 @@ async function main() {
 				// Open the exact Settings pane so the user can flip the toggle in one move.
 				try { execSync(`open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"`, { stdio: "ignore" }); } catch {}
 				info("Enable heed (heed-syscap) under Screen Recording, then heed uses it automatically.");
-				info("Until then heed records your mic; system audio falls back to BlackHole if installed.");
+				info("Until then heed records your microphone only.");
 			}
 		}
 	}

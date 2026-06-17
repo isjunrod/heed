@@ -44,8 +44,15 @@ export function Nav() {
 	const isCpuOnly = modelsData?.current?.num_gpu === 0;
 	const whisperInfo = health.whisper_info || null;
 	const pyannoteInfo = health.pyannote_info || null;
-	const whisperModelLabel = whisperInfo?.final_model || "...";
 	const whisperPower = whisperInfo ? `${WHISPER_QUALITY_LABEL[whisperInfo.quality] || whisperInfo.quality} / ${WHISPER_SPEED_LABEL[whisperInfo.speed] || whisperInfo.speed}` : "detecting";
+	// Show the REAL engine, not the nominal whisper tier. Apple Silicon runs Parakeet (Neural
+	// Engine); CUDA/CPU run Whisper. Diarization is FluidAudio on Mac, pyannote elsewhere.
+	const engine = health.languages?.engine;
+	const engineLabel = !whisperInfo ? "..."
+		: engine === "parakeet" ? "Parakeet v3"
+		: engine === "mlx" ? `MLX ${whisperInfo.final_model}`
+		: `whisper ${whisperInfo.final_model}`;
+	const diarLabel = pyannoteInfo?.model?.toLowerCase().includes("fluidaudio") ? "FluidAudio" : "pyannote";
 
 	return (
 		<nav className={styles.nav}>
@@ -95,7 +102,7 @@ export function Nav() {
 							aria-label="Whisper diagnostics, hover to see tuning details"
 						>
 							<div className={`${styles.dot} ${health.whisper ? styles.dotOk : styles.dotErr}`} />
-							<span className={styles.label}>whisper {whisperModelLabel}</span>
+							<span className={styles.label}>{engineLabel}</span>
 							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
 							<div className={styles.infoTooltip} role="tooltip">
 								<div className={styles.infoTooltipHead}>
@@ -115,7 +122,7 @@ export function Nav() {
 							aria-label="Pyannote diagnostics, hover to see tuning details"
 						>
 							<div className={`${styles.dot} ${health.pyannote ? styles.dotOk : styles.dotErr}`} />
-							<span className={styles.label}>pyannote</span>
+							<span className={styles.label}>{diarLabel}</span>
 							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
 							<div className={styles.infoTooltip} role="tooltip">
 								<div className={styles.infoTooltipHead}>

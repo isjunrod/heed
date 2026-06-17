@@ -668,7 +668,7 @@ def load_models():
     #  - "chunk" (CTranslate2/CPU, slow): keep stitching short 3s chunks — re-transcribing the whole
     #    file each tick would be far too slow on CPU. Safe, proven path.
     if engine_kind in ("parakeet", "mlx"):
-        live_tuning = {"chunk_s": 2.0, "interval_ms": 1200, "mode": "full"}
+        live_tuning = {"chunk_s": 2.0, "interval_ms": 700, "mode": "full"}
     else:
         live_tuning = {"chunk_s": 3.0, "interval_ms": 2000, "mode": "chunk"}
     print(f"[heed] Live: mode={live_tuning['mode']} interval={live_tuning['interval_ms']}ms ({engine_kind})", flush=True)

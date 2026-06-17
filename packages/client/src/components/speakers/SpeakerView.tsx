@@ -6,30 +6,31 @@ import { voicesApi } from "@/api/voices.ts";
 import { SpeakerMergeMenu } from "./SpeakerMergeMenu.tsx";
 import styles from "./SpeakerView.module.css";
 
-/** Reveals text character by character with a typing effect. */
-function TypewriterText({ text, speed = 20 }: { text: string; speed?: number }) {
-	const [charCount, setCharCount] = useState(0);
-	const textRef = useRef(text);
+/** Reveals text with a typing effect. In live "full" mode the whole transcript is replaced
+ * each tick, so we must NOT re-type from zero (that made the box flicker/resize). Instead:
+ *   - growth/refinement (new text extends what's shown) → type forward from where we are;
+ *   - a different replacement → jump straight to full text.
+ * Result: the live box is as stable in size as the final result. */
+function TypewriterText({ text, speed = 25 }: { text: string; speed?: number }) {
+	const [charCount, setCharCount] = useState(text.length);
+	const prevText = useRef(text);
 
 	useEffect(() => {
-		// If the text changed (new segment replaced this one), show full immediately
-		if (textRef.current !== text) {
-			textRef.current = text;
+		const prev = prevText.current;
+		prevText.current = text;
+		// If the new text doesn't continue the old one, don't untype — show it fully.
+		if (!text.startsWith(prev.slice(0, charCount))) {
 			setCharCount(text.length);
-			return;
 		}
+	}, [text]); // eslint-disable-line react-hooks/exhaustive-deps
+
+	useEffect(() => {
 		if (charCount >= text.length) return;
-		const timer = setTimeout(() => setCharCount((c) => c + 1), speed);
+		const timer = setTimeout(() => setCharCount((c) => Math.min(c + 1, text.length)), speed);
 		return () => clearTimeout(timer);
 	}, [charCount, text, speed]);
 
-	// Reset when component mounts with new text
-	useEffect(() => {
-		setCharCount(0);
-		textRef.current = text;
-	}, [text]);
-
-	return <>{text.slice(0, charCount)}</>;
+	return <>{text.slice(0, Math.min(charCount, text.length))}</>;
 }
 
 interface Props {

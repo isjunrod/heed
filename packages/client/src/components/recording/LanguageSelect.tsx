@@ -1,23 +1,12 @@
 import { useEffect, useMemo } from "react";
 import { useLocalStorage } from "@/hooks/useLocalStorage.ts";
-import { WHISPER_LANGUAGES } from "@/lib/languages.ts";
+import { WHISPER_LANGUAGES, pickLanguageDefault } from "@/lib/languages.ts";
 import { useHealthStore } from "@/stores/health.ts";
 import styles from "./LanguageSelect.module.css";
 
 interface Props {
 	value?: string;
 	onChange?: (value: string) => void;
-}
-
-// Pick a sensible default when the stored language isn't offered by the active engine
-// (e.g. "auto" or a non-European code on Apple Silicon/Parakeet): prefer the browser's
-// language if supported, else Spanish, else the first available option.
-function pickDefault(available: Array<[string, string]>): string {
-	const codes = available.map(([c]) => c);
-	const browser = navigator.language?.slice(0, 2).toLowerCase();
-	if (browser && codes.includes(browser)) return browser;
-	if (codes.includes("es")) return "es";
-	return codes.find((c) => c !== "auto") ?? codes[0] ?? "es";
 }
 
 export function LanguageSelect({ value, onChange }: Props) {
@@ -43,7 +32,7 @@ export function LanguageSelect({ value, onChange }: Props) {
 		if (!langs) return;
 		const codes = available.map(([c]) => c);
 		if (!codes.includes(current)) {
-			const def = pickDefault(available);
+			const def = pickLanguageDefault(codes);
 			setStored(def);
 			onChange?.(def);
 		}

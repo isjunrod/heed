@@ -57,7 +57,7 @@ _warmup_path = None
 # Engine, ~50ms per chunk) can poll fast with short windows → near-instant words on screen.
 # Whisper engines keep the safe 3s/2000ms cadence so slow CPUs never starve mid-recording.
 # Measured: Parakeet needs >=2s of audio to emit clean text (1s -> empty, 1.5s -> clipped).
-live_tuning = {"chunk_s": 3.0, "interval_ms": 2000}
+live_tuning = {"chunk_s": 3.0, "interval_ms": 2000, "mode": "chunk"}
 # Active transcription engine ("parakeet" | "mlx" | "ctranslate2"), set in load_models().
 # Drives which languages the UI may offer (Parakeet = 28 European; Whisper = all).
 active_engine = "ctranslate2"
@@ -661,13 +661,17 @@ def load_models():
         live_governor = None
         print(f"[heed] Live governor unavailable (non-critical): {e}", flush=True)
 
-    # Live cadence: Parakeet is fast enough (~50ms/chunk) to poll often with a short window,
-    # so words hit the screen ~2s after spoken instead of ~3s. Whisper keeps the safe cadence.
-    if engine_kind == "parakeet":
-        live_tuning = {"chunk_s": 2.0, "interval_ms": 800}
+    # Live strategy, per engine:
+    #  - "full" (Parakeet/MLX, fast): RE-TRANSCRIBE the whole growing audio each tick and REPLACE
+    #    the on-screen text. Full context = accurate (no word-cutting), and it's affordable because
+    #    Parakeet does 30s in ~0.3s. This is the killer live UX Whisper-on-CPU could never do.
+    #  - "chunk" (CTranslate2/CPU, slow): keep stitching short 3s chunks — re-transcribing the whole
+    #    file each tick would be far too slow on CPU. Safe, proven path.
+    if engine_kind in ("parakeet", "mlx"):
+        live_tuning = {"chunk_s": 2.0, "interval_ms": 1200, "mode": "full"}
     else:
-        live_tuning = {"chunk_s": 3.0, "interval_ms": 2000}
-    print(f"[heed] Live cadence: chunk={live_tuning['chunk_s']}s interval={live_tuning['interval_ms']}ms ({engine_kind})", flush=True)
+        live_tuning = {"chunk_s": 3.0, "interval_ms": 2000, "mode": "chunk"}
+    print(f"[heed] Live: mode={live_tuning['mode']} interval={live_tuning['interval_ms']}ms ({engine_kind})", flush=True)
 
     # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"

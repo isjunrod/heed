@@ -24,6 +24,8 @@ interface RecordingState {
 	setProcessing: (step: string, percent: number) => void;
 	/** Progressive: append a single segment as whisper produces it */
 	appendSegment: (seg: Segment) => void;
+	/** Live "full" mode: REPLACE the single live segment for this channel each tick (full re-transcribe). */
+	setLiveSegment: (seg: Segment) => void;
 	/** Speaker reveal: replace all segments + speakers with final pyannote result */
 	revealSpeakers: (speakers: string[], segments: Segment[], embeddings: Record<string, number[]>) => void;
 	setResult: (result: TranscribeResult) => void;
@@ -73,6 +75,19 @@ export const useRecordingStore = create<RecordingState>((set) => ({
 			const newSpeakers = s.speakers.includes(seg.speaker) ? s.speakers : [...s.speakers, seg.speaker];
 			const newTranscript = s.transcript ? `${s.transcript}\n${seg.text}` : seg.text;
 			return { segments: newSegments, speakers: newSpeakers, transcript: newTranscript };
+		}),
+
+	setLiveSegment: (seg) =>
+		set((s) => {
+			const channel = seg.channel ?? "mic";
+			// Keep at most ONE live segment per channel; replace it each tick. Empty text clears it.
+			const others = s.segments.filter((x) => (x.channel ?? "mic") !== channel);
+			const next = seg.text && seg.text.trim().length > 1 ? [...others, seg] : others;
+			// Stable order: mic before sys.
+			next.sort((a, b) => (a.channel === "sys" ? 1 : 0) - (b.channel === "sys" ? 1 : 0));
+			const newSpeakers = next.reduce<string[]>((acc, x) => acc.includes(x.speaker) ? acc : [...acc, x.speaker], []);
+			const newTranscript = next.map((x) => x.text).join("\n");
+			return { segments: next, speakers: newSpeakers, transcript: newTranscript };
 		}),
 
 	revealSpeakers: (speakers, segments, embeddings) =>

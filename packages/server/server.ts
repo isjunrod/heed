@@ -1353,18 +1353,69 @@ let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
 // Engine-adaptive live cadence, fetched from the Python /health on record-start.
 // Parakeet (Apple Neural Engine) polls fast with short windows for near-instant words;
 // Whisper keeps the safe 3s/2000ms cadence so slow CPUs never starve. Defaults are safe.
-let liveTuning = { chunk_s: 3.0, interval_ms: 2000 };
+let liveTuning = { chunk_s: 3.0, interval_ms: 2000, mode: "chunk" as "chunk" | "full" };
 async function refreshLiveTuning() {
 	try {
 		const r = await fetch(`${TRANSCRIPTION_SERVER}/health`, { signal: AbortSignal.timeout(2000) });
 		if (r.ok) {
-			const h = await r.json() as { live_tuning?: { chunk_s?: number; interval_ms?: number } };
+			const h = await r.json() as { live_tuning?: { chunk_s?: number; interval_ms?: number; mode?: "chunk" | "full" } };
 			if (h.live_tuning?.chunk_s && h.live_tuning?.interval_ms) {
-				liveTuning = { chunk_s: h.live_tuning.chunk_s, interval_ms: h.live_tuning.interval_ms };
-				console.log(`[heed] live cadence: chunk=${liveTuning.chunk_s}s interval=${liveTuning.interval_ms}ms`);
+				liveTuning = { chunk_s: h.live_tuning.chunk_s, interval_ms: h.live_tuning.interval_ms, mode: h.live_tuning.mode || "chunk" };
+				console.log(`[heed] live: mode=${liveTuning.mode} interval=${liveTuning.interval_ms}ms`);
 			}
 		}
 	} catch { /* keep safe defaults */ }
+}
+
+// Live "full" mode (Parakeet/MLX): re-transcribe the whole growing audio each tick and emit a
+// REPLACE event per channel, so the on-screen text always has full context (accurate) and refines
+// as you speak. Bounded to the last LIVE_FULL_WINDOW seconds so very long meetings stay responsive;
+// the accurate final pass covers the whole recording regardless.
+const LIVE_FULL_WINDOW = 180;
+async function processFullLive(
+	wavPath: string, isDual: boolean, lang: string,
+	send: (event: string, data: unknown) => void,
+): Promise<void> {
+	if (!existsSync(wavPath)) return;
+	const fileSize = Bun.file(wavPath).size;
+	const bytesPerSec = isDual ? 64000 : 32000;
+	const fileDurationS = (fileSize - 44) / bytesPerSec;
+	if (fileDurationS < 1.2) return; // need a little audio before the first pass
+
+	const startTime = Math.max(0, fileDurationS - LIVE_FULL_WINDOW);
+	const dur = fileDurationS - startTime;
+
+	// channel filter: mic = c0; (dual also has sys = c1)
+	const channels: Array<{ ch: string; filter: string; speaker: string; label: "mic" | "sys" }> = [
+		{ ch: "mic", filter: isDual ? "pan=mono|c0=c0," : "", speaker: "Me", label: "mic" },
+	];
+	if (isDual) channels.push({ ch: "sys", filter: "pan=mono|c0=c1,", speaker: "???", label: "sys" });
+
+	for (const c of channels) {
+		const outPath = join(UPLOAD_DIR, `live-full-${c.label}-${Date.now()}.wav`);
+		Bun.spawnSync([
+			"ffmpeg", "-y", "-loglevel", "error", "-i", wavPath,
+			"-af", `${c.filter}dynaudnorm=p=0.9:m=10`,
+			"-ss", String(startTime), "-t", String(dur),
+			"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", outPath,
+		]);
+		try {
+			if (existsSync(outPath) && Bun.file(outPath).size > 1000) {
+				const res = await fetch(`${TRANSCRIPTION_SERVER}/transcribe-live`, {
+					method: "POST", headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ wav_path: outPath, language: lang, audio_s: dur }),
+				});
+				if (res.ok) {
+					const tx = await res.json() as { text?: string };
+					const text = (tx.text || "").trim();
+					// Emit even when empty so the client can clear a stale line; client ignores tiny noise.
+					send("live", { speaker: c.speaker, channel: c.label, text, start: 0, end: fileDurationS, live: true });
+				}
+			}
+		} finally {
+			try { unlinkSync(outPath); } catch {}
+		}
+	}
 }
 
 function handleLiveTranscribe(reqUrl?: URL): Response {
@@ -1392,6 +1443,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 	const LIVE_CHUNK = liveTuning.chunk_s; // engine-adaptive (parakeet 2s, whisper 3s)
 	let interval = liveTuning.interval_ms; // engine-adaptive (parakeet 800ms, whisper 2000ms)
 	const lang = reqUrl?.searchParams.get("lang") || "es";
+	console.log(`[heed] LIVE lang received from client: "${reqUrl?.searchParams.get("lang")}" -> using "${lang}"`);
 	// DON'T reset offset here — if EventSource reconnects, we continue from
 	// where we left off instead of re-processing the same first chunk forever.
 	// Offset is only reset in stopLiveTranscribe() when recording actually stops.
@@ -1420,6 +1472,18 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 				// Lock: skip if previous chunk is still processing
 				if (liveChunkProcessing) return;
 				liveChunkProcessing = true;
+
+				// FULL mode (Parakeet/MLX): re-transcribe the whole growing audio, REPLACE on screen.
+				if (liveTuning.mode === "full") {
+					try {
+						await processFullLive(wavPath, isDual, lang, send);
+					} catch (e) {
+						console.log(`[heed] live full error: ${(e as Error).message}`);
+					} finally {
+						liveChunkProcessing = false;
+					}
+					return;
+				}
 
 				// Check if the file has enough new data
 				if (!existsSync(wavPath)) {

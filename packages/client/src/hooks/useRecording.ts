@@ -5,7 +5,15 @@ import { notesApi } from "@/api/notes.ts";
 import { useRecordingStore } from "@/stores/recording.ts";
 import { useSessionsStore } from "@/stores/sessions.ts";
 import { useUIStore } from "@/stores/ui.ts";
+import { useHealthStore } from "@/stores/health.ts";
 import { fmtDate } from "@/lib/format.ts";
+import { resolveLanguage } from "@/lib/languages.ts";
+
+// Always send a language the ACTIVE engine can transcribe (Parakeet has no auto-detect),
+// resolved at send-time from the live health info — independent of UI render timing.
+function effectiveLanguage(requested: string): string {
+	return resolveLanguage(requested, useHealthStore.getState().health.languages);
+}
 
 interface UseRecordingOptions {
 	micBars: React.RefObject<HTMLDivElement[] | null>;
@@ -62,12 +70,17 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 			// Live transcription via SSE — segments appear while recording
 			setTimeout(() => {
 				if (!useRecordingStore.getState().recording) return;
-				const liveLang = encodeURIComponent(getLanguage());
+				const liveLang = encodeURIComponent(effectiveLanguage(getLanguage()));
 				liveEventRef.current = new EventSource(`/api/sysrecord/live?lang=${liveLang}`);
+				// "segment" = chunk mode (append, Whisper/CPU); "live" = full mode (replace, Parakeet/MLX).
 				liveEventRef.current.addEventListener("segment", (e) => {
 					try {
-						const seg = JSON.parse(e.data);
-						useRecordingStore.getState().appendSegment(seg);
+						useRecordingStore.getState().appendSegment(JSON.parse(e.data));
+					} catch {}
+				});
+				liveEventRef.current.addEventListener("live", (e) => {
+					try {
+						useRecordingStore.getState().setLiveSegment(JSON.parse(e.data));
 					} catch {}
 				});
 				liveEventRef.current.onerror = () => {
@@ -162,7 +175,7 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 	};
 
 	const finalizeRecording = async (audioPath: string) => {
-		const lang = getLanguage();
+		const lang = effectiveLanguage(getLanguage());
 		const seconds = useRecordingStore.getState().seconds;
 		// DON'T clear live segments — they stay visible in Speakers.
 		// We only need to: 1) transcribe remaining chunks, 2) run pyannote.

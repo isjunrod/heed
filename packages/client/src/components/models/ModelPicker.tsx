@@ -178,7 +178,7 @@ export function ModelPicker({ open, onClose }: Props) {
 						<div className={styles.section}>
 							CPU only on your hardware
 							<span className={styles.sectionHint}>
-								(slower, but won't crash diarization — keeps {fmtMb(data.pyannote_reserve_mb)} VRAM free for pyannote)
+								(slower, but won't crash diarization — keeps {fmtMb(data.pyannote_reserve_mb)} VRAM free for speaker diarization)
 							</span>
 						</div>
 						<div className={styles.grid}>{grouped.cpu.map(renderModel)}</div>

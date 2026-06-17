@@ -13,7 +13,7 @@ import styles from "./RecordPage.module.css";
 const FAST_PROCESS_MESSAGES_EN = [
 	"Transcribing mic...",
 	"Transcribing sys...",
-	"Transcribing pyannote...",
+	"Identifying speakers...",
 	"Aligning speaker timeline...",
 	"Merging segments...",
 	"It's almost ready!",

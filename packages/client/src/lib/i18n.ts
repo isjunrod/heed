@@ -115,8 +115,8 @@ const STRINGS: StringMap = {
 		en: "ffmpeg: for recording and processing audio",
 	},
 	"setup.ffmpeg.body": {
-		es: "ffmpeg captura el audio de tu microfono y de tu sistema, y lo convierte al formato que necesita whisper para transcribirlo.",
-		en: "ffmpeg captures audio from your microphone and system, and converts it to the format whisper needs for transcription.",
+		es: "ffmpeg captura el audio de tu microfono y de tu sistema, y lo convierte al formato que necesita el motor de transcripcion.",
+		en: "ffmpeg captures audio from your microphone and system, and converts it to the format the transcription engine needs.",
 	},
 	"setup.ffmpeg.installBtn": {
 		es: "Instalar ffmpeg",

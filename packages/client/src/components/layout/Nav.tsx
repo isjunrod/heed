@@ -92,51 +92,87 @@ export function Nav() {
 							{currentModel?.new && <span className={styles.modelChipNew}>NEW</span>}
 							<span className={styles.modelChipChevron} aria-hidden="true">⌄</span>
 						</button>
-						<div className={styles.statusItem}>
+						<div
+							className={`${styles.statusItem} ${styles.statusItemInfo}`}
+							tabIndex={0}
+							aria-label="Local notes engine (Ollama)"
+						>
 							<div className={`${styles.dot} ${health.ollama ? styles.dotOk : styles.dotErr}`} />
 							<span className={styles.label}>ollama</span>
+							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
+							<div className={styles.infoTooltip} role="tooltip">
+								<div className={styles.infoTooltipHead}>
+									<div className={styles.infoTooltipTitle}>Ollama</div>
+									<span className={styles.infoTooltipBadge}>AI notes</span>
+								</div>
+								<div className={styles.infoTooltipLine}>Local LLM that writes the meeting <strong>notes</strong> from the transcript.</div>
+								<div className={styles.infoTooltipLine}><strong>Model:</strong> {currentModel?.name || modelsData?.current?.id || "none selected"}</div>
+								<div className={styles.infoTooltipReason}>Separate from transcription — heed transcribes locally, then Ollama summarizes.</div>
+							</div>
 						</div>
 						<div
 							className={`${styles.statusItem} ${styles.statusItemInfo}`}
 							tabIndex={0}
-							aria-label="Whisper diagnostics, hover to see tuning details"
+							aria-label="Transcription engine details"
 						>
 							<div className={`${styles.dot} ${health.whisper ? styles.dotOk : styles.dotErr}`} />
 							<span className={styles.label}>{engineLabel}</span>
 							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
 							<div className={styles.infoTooltip} role="tooltip">
 								<div className={styles.infoTooltipHead}>
-									<div className={styles.infoTooltipTitle}>Whisper auto profile</div>
-									<span className={styles.infoTooltipBadge}>live + final</span>
+									<div className={styles.infoTooltipTitle}>
+										{engine === "parakeet" ? "Parakeet (Apple Neural Engine)" : engine === "mlx" ? "MLX-Whisper (Apple GPU)" : "Whisper auto profile"}
+									</div>
+									<span className={styles.infoTooltipBadge}>transcription</span>
 								</div>
-								<div className={styles.infoTooltipLine}><strong>Final:</strong> {whisperInfo?.final_model || "small"}</div>
-								<div className={styles.infoTooltipLine}><strong>Live:</strong> {whisperInfo?.live_model || "small"}</div>
-								<div className={styles.infoTooltipLine}><strong>Power:</strong> {whisperPower}</div>
-								<div className={styles.infoTooltipLine}><strong>Device:</strong> {whisperInfo?.device || "cpu"}</div>
-								<div className={styles.infoTooltipReason}>{whisperInfo?.reason || "Detecting hardware and choosing the best profile."}</div>
+								{engine === "parakeet" ? (
+									<>
+										<div className={styles.infoTooltipLine}><strong>Model:</strong> parakeet-tdt-v3</div>
+										<div className={styles.infoTooltipLine}><strong>Runs on:</strong> Apple Neural Engine</div>
+										<div className={styles.infoTooltipLine}><strong>Languages:</strong> 28 European</div>
+									</>
+								) : (
+									<>
+										<div className={styles.infoTooltipLine}><strong>Final:</strong> {whisperInfo?.final_model || "small"}</div>
+										<div className={styles.infoTooltipLine}><strong>Live:</strong> {whisperInfo?.live_model || "small"}</div>
+										<div className={styles.infoTooltipLine}><strong>Power:</strong> {whisperPower}</div>
+										<div className={styles.infoTooltipLine}><strong>Device:</strong> {whisperInfo?.device || "cpu"}</div>
+									</>
+								)}
+								<div className={styles.infoTooltipReason}>{whisperInfo?.reason || "Detecting hardware and choosing the best engine."}</div>
 							</div>
 						</div>
 						<div
 							className={`${styles.statusItem} ${styles.statusItemInfo}`}
 							tabIndex={0}
-							aria-label="Pyannote diagnostics, hover to see tuning details"
+							aria-label="Speaker diarization details"
 						>
 							<div className={`${styles.dot} ${health.pyannote ? styles.dotOk : styles.dotErr}`} />
 							<span className={styles.label}>{diarLabel}</span>
 							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
 							<div className={styles.infoTooltip} role="tooltip">
 								<div className={styles.infoTooltipHead}>
-									<div className={styles.infoTooltipTitle}>Pyannote auto tuning</div>
-									<span className={styles.infoTooltipBadge}>speaker diarization</span>
+									<div className={styles.infoTooltipTitle}>{diarLabel === "FluidAudio" ? "FluidAudio diarization" : "Pyannote auto tuning"}</div>
+									<span className={styles.infoTooltipBadge}>who said what</span>
 								</div>
-								<div className={styles.infoTooltipLine}><strong>Model:</strong> {pyannoteInfo?.model || "pyannote/speaker-diarization-3.1"}</div>
-								<div className={styles.infoTooltipLine}><strong>Device:</strong> {pyannoteInfo?.device || "cpu"}</div>
-								<div className={styles.infoTooltipLine}><strong>Profile:</strong> {pyannoteInfo?.profile || "balanced"}</div>
-								<div className={styles.infoTooltipLine}><strong>Batch:</strong> {pyannoteInfo?.batch_size || 8}</div>
-								{pyannoteInfo?.cpu_threads ? (
-									<div className={styles.infoTooltipLine}><strong>CPU threads:</strong> {pyannoteInfo.cpu_threads}</div>
-								) : null}
-								<div className={styles.infoTooltipReason}>{pyannoteInfo?.reason || "Tuning based on available VRAM/CPU."}</div>
+								{diarLabel === "FluidAudio" ? (
+									<>
+										<div className={styles.infoTooltipLine}><strong>Model:</strong> FluidAudio CoreML</div>
+										<div className={styles.infoTooltipLine}><strong>Runs on:</strong> Apple Neural Engine</div>
+										<div className={styles.infoTooltipLine}><strong>Token:</strong> none needed</div>
+									</>
+								) : (
+									<>
+										<div className={styles.infoTooltipLine}><strong>Model:</strong> {pyannoteInfo?.model || "pyannote/speaker-diarization-3.1"}</div>
+										<div className={styles.infoTooltipLine}><strong>Device:</strong> {pyannoteInfo?.device || "cpu"}</div>
+										<div className={styles.infoTooltipLine}><strong>Profile:</strong> {pyannoteInfo?.profile || "balanced"}</div>
+										<div className={styles.infoTooltipLine}><strong>Batch:</strong> {pyannoteInfo?.batch_size || 8}</div>
+										{pyannoteInfo?.cpu_threads ? (
+											<div className={styles.infoTooltipLine}><strong>CPU threads:</strong> {pyannoteInfo.cpu_threads}</div>
+										) : null}
+									</>
+								)}
+								<div className={styles.infoTooltipReason}>{pyannoteInfo?.reason || "Tuning based on available hardware."}</div>
 							</div>
 						</div>
 					</div>

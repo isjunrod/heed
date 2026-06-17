@@ -1225,19 +1225,23 @@ class Handler(BaseHTTPRequestHandler):
             if not whisper_model_live:
                 self._json({"error": "live whisper not loaded"}, 503)
                 return
-            # Quick RMS energy check: skip whisper entirely for silent chunks.
-            # Saves 3-9 seconds per silent chunk (whisper wastes time on silence).
+            # Energy gate: skip the engine only when the audio is silent EVERYWHERE. We scan the
+            # WHOLE clip (strided for speed), not just the first 3s — in live "full" mode the window
+            # can be long and start with silence (you press record, then speak), and checking only
+            # the head wrongly dropped the entire window. Peak-based so a silent intro never hides
+            # later speech.
             try:
-                import wave as _wave, struct as _struct, math as _math
+                import wave as _wave, struct as _struct
                 with _wave.open(body["wav_path"]) as _wf:
-                    _frames = _wf.readframes(min(_wf.getnframes(), 48000))  # first 3s max
-                    _samples = _struct.unpack('<' + 'h' * (len(_frames) // 2), _frames)
-                    _rms = _math.sqrt(sum(s*s for s in _samples) / max(len(_samples), 1))
-                if _rms < 300:
+                    _frames = _wf.readframes(_wf.getnframes())
+                _samples = _struct.unpack('<' + 'h' * (len(_frames) // 2), _frames)
+                _step = max(1, len(_samples) // 50000)  # cap work ~50k samples regardless of length
+                _peak = max((abs(s) for s in _samples[::_step]), default=0)
+                if _peak < 500:  # truly silent everywhere
                     self._json({"text": "", "language": "auto", "time_ms": 0, "skipped": "silence"})
                     return
             except Exception:
-                pass  # if check fails, proceed with whisper
+                pass  # if check fails, proceed with the engine
             t = time.time()
             lang = body.get("language", "auto")
             lang = None if lang == "auto" else lang

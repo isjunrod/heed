@@ -1406,10 +1406,15 @@ async function processFullLive(
 					body: JSON.stringify({ wav_path: outPath, language: lang, audio_s: dur }),
 				});
 				if (res.ok) {
-					const tx = await res.json() as { text?: string };
+					const tx = await res.json() as { text?: string; quality?: { ok: boolean; reason: string; hint: string } };
 					const text = (tx.text || "").trim();
 					// Emit even when empty so the client can clear a stale line; client ignores tiny noise.
 					send("live", { speaker: c.speaker, channel: c.label, text, start: 0, end: fileDurationS, live: true });
+					// Audio-quality hint (heed's differentiator) — only for the MIC channel (the user's
+					// own mic is what they can fix). Lets the UI warn instead of silently showing garbage.
+					if (c.label === "mic" && tx.quality) {
+						send("quality", tx.quality.ok === false ? { ok: false, reason: tx.quality.reason, hint: tx.quality.hint } : { ok: true });
+					}
 				}
 			}
 		} finally {

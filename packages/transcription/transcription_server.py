@@ -777,6 +777,31 @@ def is_degenerate_repetition(text):
     return len(set(words)) / len(words) < 0.35
 
 
+# Reasons → short, actionable user message (the UI localizes/styles it). This is heed's
+# robustness differentiator: instead of silently showing garbage on bad audio, we tell the
+# user WHY (mic too quiet, echo, unclear) so they can fix it. Engine-agnostic, mac + Linux.
+QUALITY_HINTS = {
+    "low_volume": "Tu microfono se escucha muy bajo — acercate o subi el volumen de entrada.",
+    "unclear": "Audio poco claro (eco o ruido). Usa auriculares para la salida y un buen microfono.",
+}
+
+
+def assess_audio_quality(text, audio_s, peak):
+    """Flag likely-bad transcription from cheap signals (peak amplitude + word yield +
+    repetition loops). Conservative: only fires on clear failure so we never nag good audio.
+    `peak` is the int16 peak (0..32767) already computed by the energy gate."""
+    t = (text or "").strip()
+    if peak and peak < 1000:
+        return {"ok": False, "reason": "low_volume", "hint": QUALITY_HINTS["low_volume"]}
+    # Loud-ish audio (clear energy) that yields almost no words = echo / muddy / unintelligible.
+    if t and audio_s and audio_s >= 6 and peak and peak > 3000:
+        if len(t) / audio_s < 2.0:
+            return {"ok": False, "reason": "unclear", "hint": QUALITY_HINTS["unclear"]}
+    if t and is_degenerate_repetition(t):
+        return {"ok": False, "reason": "unclear", "hint": QUALITY_HINTS["unclear"]}
+    return {"ok": True, "reason": "", "hint": ""}
+
+
 def transcribe(wav_path, language="auto", srt_output=None):
     lang = None if language == "auto" else language
     # Lock: whisper model is not thread-safe — serialize access.
@@ -1230,6 +1255,7 @@ class Handler(BaseHTTPRequestHandler):
             # can be long and start with silence (you press record, then speak), and checking only
             # the head wrongly dropped the entire window. Peak-based so a silent intro never hides
             # later speech.
+            _peak = None
             try:
                 import wave as _wave, struct as _struct
                 with _wave.open(body["wav_path"]) as _wf:
@@ -1267,12 +1293,14 @@ class Handler(BaseHTTPRequestHandler):
                 gov_info = {"live_model": whisper_model_live_name, "interval_ms": dec.interval_ms,
                             "changed": dec.changed, "reason": dec.reason}
 
+            _live_text = " ".join(lines)
             self._json({
-                "text": " ".join(lines),
+                "text": _live_text,
                 "language": info.language if info else "auto",
                 "model": whisper_model_live_name,
                 "time_ms": int(process_s * 1000),
                 "gov": gov_info,
+                "quality": assess_audio_quality(_live_text, float(body.get("audio_s", 0) or 0), _peak),
             })
 
         elif self.path == "/diarize":

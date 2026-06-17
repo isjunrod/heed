@@ -31,6 +31,7 @@ export function RecordPage() {
 	});
 
 	const { recording, processing, processStep, segments, transcript } = useRecordingStore();
+	const liveQuality = useRecordingStore((s) => s.liveQuality);
 	// Show result card when recording (live preview) or after stop (final result)
 	const showResult = recording || processing || segments.length > 0 || !!transcript;
 	// Block recording button while processing (transcribing + diarizing after stop)
@@ -95,6 +96,12 @@ export function RecordPage() {
 				<div className={styles.label}>
 					{recording ? "Recording... click to stop" : processing ? "" : !showResult ? "Click to start recording" : ""}
 				</div>
+				{recording && liveQuality && !liveQuality.ok && (
+					<div className={styles.qualityWarn} role="status">
+						<span className={styles.qualityWarnIcon} aria-hidden="true">!</span>
+						<span>{liveQuality.hint}</span>
+					</div>
+				)}
 				{!processing && (
 					<div className={styles.options}>
 						<LanguageSelect value={language} onChange={setLanguage} />

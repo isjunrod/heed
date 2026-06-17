@@ -90,6 +90,12 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 						useRecordingStore.getState().setLiveSegment(JSON.parse(e.data));
 					} catch {}
 				});
+				// Audio-quality hint (heed differentiator): warn when the mic is too quiet/echoey.
+				liveEventRef.current.addEventListener("quality", (e) => {
+					try {
+						useRecordingStore.getState().setLiveQuality(JSON.parse(e.data));
+					} catch {}
+				});
 				liveEventRef.current.onerror = () => {
 					liveEventRef.current?.close();
 					liveEventRef.current = null;

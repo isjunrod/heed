@@ -26,6 +26,9 @@ interface RecordingState {
 	appendSegment: (seg: Segment) => void;
 	/** Live "full" mode: REPLACE the single live segment for this channel each tick (full re-transcribe). */
 	setLiveSegment: (seg: Segment) => void;
+	/** Live audio-quality hint (heed differentiator): warns when the mic is too quiet / echoey / unclear. */
+	liveQuality: { ok: boolean; hint?: string } | null;
+	setLiveQuality: (q: { ok: boolean; hint?: string }) => void;
 	/** Speaker reveal: replace all segments + speakers with final pyannote result */
 	revealSpeakers: (speakers: string[], segments: Segment[], embeddings: Record<string, number[]>) => void;
 	setResult: (result: TranscribeResult) => void;
@@ -60,6 +63,7 @@ export const useRecordingStore = create<RecordingState>((set) => ({
 			embeddings: {},
 			files: null,
 			notesText: "",
+			liveQuality: null,
 			currentSessionId: null,
 		}),
 
@@ -76,6 +80,9 @@ export const useRecordingStore = create<RecordingState>((set) => ({
 			const newTranscript = s.transcript ? `${s.transcript}\n${seg.text}` : seg.text;
 			return { segments: newSegments, speakers: newSpeakers, transcript: newTranscript };
 		}),
+
+	liveQuality: null,
+	setLiveQuality: (q) => set({ liveQuality: q.ok ? null : q }),
 
 	setLiveSegment: (seg) =>
 		set((s) => {

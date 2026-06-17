@@ -42,6 +42,13 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 	const start = async () => {
 		try {
 			const data = await recordingApi.start("both");
+			// System audio (ScreenCaptureKit) needs Screen Recording permission. If it's not
+			// granted yet, the server does NOT start recording — we ask the user to grant it and
+			// press record again. The timer never starts until the permission is resolved.
+			if ((data as { permissionNeeded?: boolean }).permissionNeeded) {
+				showToast("Otorgá permiso de Grabación de Pantalla (se abrió Ajustes) y volvé a grabar");
+				return;
+			}
 			if ((data as { error?: string }).error) {
 				showToast((data as { error?: string }).error || "Failed to start");
 				return;

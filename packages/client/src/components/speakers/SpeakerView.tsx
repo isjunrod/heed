@@ -6,27 +6,30 @@ import { voicesApi } from "@/api/voices.ts";
 import { SpeakerMergeMenu } from "./SpeakerMergeMenu.tsx";
 import styles from "./SpeakerView.module.css";
 
-/** Reveals text with a typing effect. In live "full" mode the whole transcript is replaced
- * each tick, so we must NOT re-type from zero (that made the box flicker/resize). Instead:
- *   - growth/refinement (new text extends what's shown) → type forward from where we are;
- *   - a different replacement → jump straight to full text.
- * Result: the live box is as stable in size as the final result. */
-function TypewriterText({ text, speed = 25 }: { text: string; speed?: number }) {
-	const [charCount, setCharCount] = useState(text.length);
-	const prevText = useRef(text);
+/** Reveals text with a smooth typing effect that survives live "full" mode (the whole
+ * transcript is replaced each tick). On every text change we keep the longest common PREFIX
+ * already on screen and only (re)type the part that actually changed — so it never re-types
+ * from zero and never snaps abruptly. If the live text grows faster than 1 char/tick, it
+ * catches up in proportional steps so the display never falls far behind speech. */
+function TypewriterText({ text, speed = 22 }: { text: string; speed?: number }) {
+	const [charCount, setCharCount] = useState(0);
+	const prevText = useRef("");
 
 	useEffect(() => {
 		const prev = prevText.current;
 		prevText.current = text;
-		// If the new text doesn't continue the old one, don't untype — show it fully.
-		if (!text.startsWith(prev.slice(0, charCount))) {
-			setCharCount(text.length);
-		}
-	}, [text]); // eslint-disable-line react-hooks/exhaustive-deps
+		// Longest common prefix between what was there and the new text.
+		let cp = 0;
+		while (cp < prev.length && cp < text.length && prev[cp] === text[cp]) cp++;
+		// Keep everything up to the divergence; re-type only from there.
+		setCharCount((c) => Math.min(c, cp));
+	}, [text]);
 
 	useEffect(() => {
 		if (charCount >= text.length) return;
-		const timer = setTimeout(() => setCharCount((c) => Math.min(c + 1, text.length)), speed);
+		const gap = text.length - charCount;
+		const step = Math.max(1, Math.floor(gap / 8)); // catch up smoothly when far behind
+		const timer = setTimeout(() => setCharCount((c) => Math.min(c + step, text.length)), speed);
 		return () => clearTimeout(timer);
 	}, [charCount, text, speed]);
 

@@ -1101,14 +1101,16 @@ function getSyscapBin(): string | null {
 }
 
 // Spawn heed-syscap and wait for its one-line stderr handshake.
-// Returns the running process if it reported {"ready":true}; null on any failure
-// (permission declined, not built, timeout) so the caller falls back to BlackHole.
-async function spawnSyscap(): Promise<ReturnType<typeof Bun.spawn> | null> {
+// Returns { proc, denied }:
+//   - proc set     → SCK is capturing (permission granted).
+//   - denied=true  → built but the user hasn't granted Screen Recording (TCC -3801). The caller
+//                    should NOT start recording; it should ask the user to grant + retry.
+//   - both falsy   → not built / not mac → just record mic only.
+async function spawnSyscap(): Promise<{ proc: ReturnType<typeof Bun.spawn> | null; denied: boolean }> {
 	const bin = getSyscapBin();
-	if (!bin) return null;
+	if (!bin) return { proc: null, denied: false };
 	try {
 		const proc = Bun.spawn([bin], { stdout: "pipe", stderr: "pipe" });
-		// Read the first stderr line (the JSON handshake) with a timeout.
 		const handshake = await Promise.race([
 			(async () => {
 				const reader = (proc.stderr as ReadableStream).getReader();
@@ -1128,14 +1130,16 @@ async function spawnSyscap(): Promise<ReturnType<typeof Bun.spawn> | null> {
 		try { ok = JSON.parse(handshake || "{}").ready === true; } catch {}
 		if (ok) {
 			console.log("[heed] system audio via ScreenCaptureKit");
-			return proc;
+			return { proc, denied: false };
 		}
-		console.log(`[heed] ScreenCaptureKit unavailable (${(handshake || "no handshake").slice(0, 80)}) — system audio off (grant Screen Recording)`);
+		// -3801 / "declined" / "TCC" = the permission hasn't been granted yet.
+		const denied = /-3801|declined|TCC/i.test(handshake || "");
+		console.log(`[heed] ScreenCaptureKit ${denied ? "permission needed" : "unavailable"} (${(handshake || "no handshake").slice(0, 80)})`);
 		try { proc.kill(); } catch {}
-		return null;
+		return { proc: null, denied };
 	} catch (e) {
-		console.log(`[heed] ScreenCaptureKit spawn failed (${(e as Error).message}) — system audio off`);
-		return null;
+		console.log(`[heed] ScreenCaptureKit spawn failed (${(e as Error).message})`);
+		return { proc: null, denied: false };
 	}
 }
 
@@ -1206,15 +1210,23 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 	const ts = Date.now();
 	const mic = getMicSource() || "default";
 
-	// Prefer ScreenCaptureKit for system audio on mac (no BlackHole routing). It only
-	// activates if built AND the user granted Screen Recording; otherwise we transparently
-	// fall back to the BlackHole/avfoundation monitor below. So nothing breaks pre-permission.
+	// Prefer ScreenCaptureKit for system audio on mac. If the binary is built but Screen
+	// Recording hasn't been granted yet, DON'T start a half-recording (mic-only) and let the
+	// timer run — return a clear "permission needed" so the UI can ask first and the user
+	// retries. This is what makes the record button feel correct: nothing starts until the
+	// permission is resolved.
 	if (mode === "system" || mode === "both") {
-		syscapProc = await spawnSyscap();
+		const r = await spawnSyscap();
+		syscapProc = r.proc;
+		if (!r.proc && r.denied) {
+			// Open the exact Settings pane so granting is one move; recording does NOT start.
+			try { Bun.spawn(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]); } catch {}
+			return Response.json({ permissionNeeded: true, mode }, { status: 200 });
+		}
 	}
 	const usedSyscap = !!syscapProc;
 	const monitor = usedSyscap ? null : getMonitorSource();
-	// system source exists if SCK is active OR a BlackHole monitor was found.
+	// system source exists if SCK is active OR a (Linux) monitor was found.
 	const haveSystem = usedSyscap || !!monitor;
 
 	// Naming convention: dual-capture-* signals stereo (L=mic, R=system) → channel-based diarization later.

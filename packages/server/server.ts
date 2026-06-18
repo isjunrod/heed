@@ -1349,6 +1349,10 @@ function handleSysLevelsSSE(): Response {
 let liveTranscribeInterval: ReturnType<typeof setInterval> | null = null;
 let liveTranscribeOffset = 0; // seconds already processed
 let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
+// Streaming-mode state (Parakeet): a persistent ASR session in the sidecar; we feed only the
+// NEW audio since lastStreamOffset each tick and show the model's append-only partial.
+let lastStreamOffset = 0;
+let streamStarted = false;
 
 // Engine-adaptive live cadence, fetched from the Python /health on record-start.
 // Parakeet (Apple Neural Engine) polls fast with short windows for near-instant words;
@@ -1423,6 +1427,61 @@ async function processFullLive(
 	}
 }
 
+// Live STREAM mode (Parakeet): persistent ASR session in the sidecar. Each tick we feed ONLY
+// the NEW audio since lastStreamOffset (contiguous, mic channel) and emit the model's append-only
+// partial. The confirmed prefix never changes, so the existing client typing renders it stably.
+async function processStreamLive(
+	wavPath: string, isDual: boolean, lang: string,
+	send: (event: string, data: unknown) => void,
+): Promise<void> {
+	if (!existsSync(wavPath)) return;
+	if (!streamStarted) {
+		try {
+			await fetch(`${TRANSCRIPTION_SERVER}/stream/start`, {
+				method: "POST", headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ language: lang }),
+			});
+		} catch { return; }
+		streamStarted = true;
+		lastStreamOffset = 0;
+	}
+	const fileSize = Bun.file(wavPath).size;
+	const bytesPerSec = isDual ? 64000 : 32000;
+	const fileDurationS = (fileSize - 44) / bytesPerSec;
+	const newAudio = fileDurationS - lastStreamOffset;
+	if (newAudio < 0.4) return; // wait until ~0.4s of new audio accumulated
+
+	// Extract the NEW contiguous segment (mic channel). No dynaudnorm — per-segment normalization
+	// would break level continuity across feeds and confuse the streaming model.
+	const segPath = join(UPLOAD_DIR, `live-seg-${Date.now()}.wav`);
+	const channelFilter = isDual ? "pan=mono|c0=c0," : "";
+	Bun.spawnSync([
+		"ffmpeg", "-y", "-loglevel", "error", "-i", wavPath,
+		...(channelFilter ? ["-af", channelFilter.replace(/,$/, "")] : []),
+		"-ss", String(lastStreamOffset), "-t", String(newAudio),
+		"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", segPath,
+	]);
+	lastStreamOffset = fileDurationS;
+	try {
+		if (existsSync(segPath) && Bun.file(segPath).size > 1000) {
+			const res = await fetch(`${TRANSCRIPTION_SERVER}/stream/feed`, {
+				method: "POST", headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ wav_path: segPath, audio_s: newAudio }),
+			});
+			if (res.ok) {
+				const tx = await res.json() as { partial?: string; quality?: { ok: boolean; reason: string; hint: string } };
+				const partial = (tx.partial || "").trim();
+				send("live", { speaker: "Me", channel: "mic", text: partial, start: 0, end: fileDurationS, live: true });
+				if (tx.quality) {
+					send("quality", tx.quality.ok === false ? { ok: false, reason: tx.quality.reason, hint: tx.quality.hint } : { ok: true });
+				}
+			}
+		}
+	} finally {
+		try { unlinkSync(segPath); } catch {}
+	}
+}
+
 function handleLiveTranscribe(reqUrl?: URL): Response {
 	if (!recorderProc || !recorderPath) {
 		// Return an SSE stream that immediately closes instead of a JSON error.
@@ -1476,6 +1535,19 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 				// Lock: skip if previous chunk is still processing
 				if (liveChunkProcessing) return;
 				liveChunkProcessing = true;
+
+				// STREAM mode (Parakeet): feed ONLY the new audio to the sidecar's streaming
+				// session; show the model's append-only partial (confirmed prefix never changes).
+				if (liveTuning.mode === "stream") {
+					try {
+						await processStreamLive(wavPath, isDual, lang, send);
+					} catch (e) {
+						console.log(`[heed] live stream error: ${(e as Error).message}`);
+					} finally {
+						liveChunkProcessing = false;
+					}
+					return;
+				}
 
 				// FULL mode (Parakeet/MLX): re-transcribe the whole growing audio, REPLACE on screen.
 				if (liveTuning.mode === "full") {
@@ -1655,6 +1727,8 @@ function stopLiveTranscribe() {
 	}
 	liveTranscribeOffset = 0;
 	liveChunkProcessing = false;
+	lastStreamOffset = 0;
+	streamStarted = false;
 	// Any in-flight whisper call will still complete but its result will be
 	// dropped because processChunk checks `!recorderProc` at the top.
 }

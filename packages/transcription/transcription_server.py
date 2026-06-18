@@ -667,7 +667,12 @@ def load_models():
     #    Parakeet does 30s in ~0.3s. This is the killer live UX Whisper-on-CPU could never do.
     #  - "chunk" (CTranslate2/CPU, slow): keep stitching short 3s chunks — re-transcribing the whole
     #    file each tick would be far too slow on CPU. Safe, proven path.
-    if engine_kind in ("parakeet", "mlx"):
+    if engine_kind == "parakeet":
+        # "stream": true real-time. The sidecar runs a streaming ASR session (Nemotron
+        # multilingual); heed feeds only the NEW audio each tick and shows the model's
+        # append-only partial (confirmed prefix never re-renders). ~25-50ms/chunk.
+        live_tuning = {"chunk_s": 1.0, "interval_ms": 700, "mode": "stream"}
+    elif engine_kind == "mlx":
         live_tuning = {"chunk_s": 2.0, "interval_ms": 700, "mode": "full"}
     else:
         live_tuning = {"chunk_s": 3.0, "interval_ms": 2000, "mode": "chunk"}
@@ -1244,6 +1249,43 @@ class Handler(BaseHTTPRequestHandler):
             )
             result["time_ms"] = int((time.time() - t) * 1000)
             self._json(result)
+
+        elif self.path == "/stream/start":
+            # Open/reset the live streaming session (Apple Silicon / Parakeet sidecar only).
+            try:
+                import engines
+                ok = engines.get_parakeet().stream_start(body.get("language") or "en") if active_engine == "parakeet" else False
+                self._json({"ok": bool(ok)})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)[:120]}, 200)
+
+        elif self.path == "/stream/feed":
+            # Append NEW audio → growing partial (stable prefix). Also assess audio quality.
+            try:
+                import engines
+                partial = engines.get_parakeet().stream_feed(body["wav_path"]) if active_engine == "parakeet" else ""
+                _peak = None
+                try:
+                    import wave as _wave, struct as _struct
+                    with _wave.open(body["wav_path"]) as _wf:
+                        _frames = _wf.readframes(_wf.getnframes())
+                    _samples = _struct.unpack('<' + 'h' * (len(_frames) // 2), _frames)
+                    _step = max(1, len(_samples) // 50000)
+                    _peak = max((abs(s) for s in _samples[::_step]), default=0)
+                except Exception:
+                    pass
+                self._json({"ok": True, "partial": partial,
+                            "quality": assess_audio_quality(partial, float(body.get("audio_s", 0) or 0), _peak)})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)[:120]}, 200)
+
+        elif self.path == "/stream/finish":
+            try:
+                import engines
+                text = engines.get_parakeet().stream_finish() if active_engine == "parakeet" else ""
+                self._json({"ok": True, "text": text})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)[:120]}, 200)
 
         elif self.path == "/transcribe-live":
             # Live transcription using the auto-picked live model.

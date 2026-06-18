@@ -36,6 +36,30 @@ let diarModels = try await DiarizerModels.downloadIfNeeded()
 diarizer.initialize(models: diarModels)
 
 let converter = AudioConverter()
+
+// --- Live STREAMING (Nemotron multilingual): real-time commit/partial ---
+// Lazy-loaded on the first stream-start so the resident memory cost is only paid when the
+// user actually records. 560ms chunk = lowest latency (~0.5s) with clean Spanish (eval'd).
+// Gives a monotonically-growing partial (confirmed prefix never changes) — heed shows it
+// directly, no re-render. finish() yields the final text == what was on screen (seamless stop).
+var streamMgr: StreamingNemotronMultilingualAsrManager? = nil
+var streamVariant: String? = nil
+
+func ensureStream(_ language: String) async throws -> StreamingNemotronMultilingualAsrManager {
+    let variant = StreamingNemotronMultilingualAsrManager.languageDirectory(for: language)
+    if streamMgr == nil || streamVariant != variant {
+        let dir = try await StreamingNemotronMultilingualAsrManager.downloadVariant(languageCode: language, chunkMs: 560)
+        let m = StreamingNemotronMultilingualAsrManager()
+        try await m.loadModels(from: dir)
+        streamMgr = m
+        streamVariant = variant
+    }
+    let m = streamMgr!
+    await m.reset()
+    await m.setLanguage(language)
+    return m
+}
+
 emit(["ready": true, "engine": "parakeet-fluidaudio"])
 
 // --- Serve requests ---
@@ -75,6 +99,26 @@ while let line = readLine() {
             }
             let speakers = Array(Set(result.segments.map { $0.speakerId })).sorted()
             emit(["ok": true, "speakers": speakers, "segments": segs])
+        case "stream-start":
+            // Open/reset a live streaming session for this recording.
+            let lang = (req["language"] as? String) ?? "en"
+            _ = try await ensureStream(lang)
+            emit(["ok": true])
+        case "stream-feed":
+            // Append the NEW audio segment; return the growing partial (confirmed prefix is stable).
+            guard let wav = req["wav"] as? String, let m = streamMgr else {
+                emit(["ok": false, "error": "no stream session"]); continue
+            }
+            let samples = try converter.resampleAudioFile(path: wav)
+            _ = try await m.process(samples: samples)
+            let partial = await m.getPartialTranscript()
+            emit(["ok": true, "partial": partial])
+        case "stream-finish":
+            // End the stream → final text (== what was on screen). Caller then diarizes.
+            guard let m = streamMgr else { emit(["ok": false, "error": "no stream session"]); continue }
+            let text = try await m.finish()
+            await m.reset()
+            emit(["ok": true, "text": text])
         case "ping":
             emit(["ok": true, "pong": true])
         default:

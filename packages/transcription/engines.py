@@ -161,14 +161,24 @@ class ParakeetEngine:
         self.lock = threading.Lock()
         self.proc.stdout.readline()  # consume the {"ready":...} line
 
-    def _request(self, obj):
+    def _request(self, obj, timeout_lines=200):
         with self.lock:
             self.proc.stdin.write(json.dumps(obj) + "\n")
             self.proc.stdin.flush()
-            line = self.proc.stdout.readline()
-        try:
-            return json.loads(line)
-        except Exception:
+            # CoreML/ANE can print noisy "E5RT ..." lines to STDOUT during model load/inference,
+            # polluting the JSON protocol. Be robust: skip non-JSON lines and parse from the first
+            # "{" on a line (the E5RT text has no brace and gets prepended to the response line).
+            for _ in range(timeout_lines):
+                line = self.proc.stdout.readline()
+                if not line:
+                    return {"ok": False, "error": "sidecar closed"}
+                i = line.find("{")
+                if i < 0:
+                    continue
+                try:
+                    return json.loads(line[i:])
+                except Exception:
+                    continue
             return {"ok": False, "error": "bad sidecar response"}
 
     def transcribe(self, wav_path, language=None, **opts):
@@ -182,6 +192,21 @@ class ParakeetEngine:
         """Speaker segments via FluidAudio CoreML (no gated token). Apple Silicon only."""
         r = self._request({"cmd": "diarize", "wav": wav_path})
         return r.get("segments", []) if r.get("ok") else []
+
+    # --- Live streaming (Nemotron multilingual): real-time commit/partial ---
+    def stream_start(self, language=None):
+        """Open/reset a streaming session. First call downloads+loads the model (slow)."""
+        return self._request({"cmd": "stream-start", "language": language or "en"}).get("ok", False)
+
+    def stream_feed(self, wav_path):
+        """Append the NEW audio segment; returns the growing partial transcript (stable prefix)."""
+        r = self._request({"cmd": "stream-feed", "wav": wav_path})
+        return r.get("partial", "") if r.get("ok") else ""
+
+    def stream_finish(self):
+        """End the stream → final text (== what was on screen)."""
+        r = self._request({"cmd": "stream-finish"})
+        return r.get("text", "") if r.get("ok") else ""
 
 
 def get_parakeet():

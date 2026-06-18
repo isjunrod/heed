@@ -180,16 +180,50 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 		store.stopRecording();
 
 		try {
-			const { path } = await recordingApi.stop();
-			await finalizeRecording(path);
+			const { path, streaming, streamText } = await recordingApi.stop();
+			await finalizeRecording(path, streaming, streamText);
 		} catch (e) {
 			showToast(`Stop failed: ${(e as Error).message}`);
 		}
 	};
 
-	const finalizeRecording = async (audioPath: string) => {
+	const finalizeRecording = async (audioPath: string, streaming?: boolean, streamText?: string) => {
 		const lang = effectiveLanguage(getLanguage());
 		const seconds = useRecordingStore.getState().seconds;
+
+		// SEAMLESS stop (streaming mic-only): the streamed text IS the final — same model, same
+		// text that's already on screen. Just finalize it (no re-transcribe, no re-type) instead
+		// of running the full process-stream. (Dual/system recordings still use the full pass below
+		// so the other party's channel gets transcribed + diarized.)
+		const isDual = audioPath.includes("dual-capture-");
+		if (streaming && !isDual) {
+			const text = (streamText || useRecordingStore.getState().transcript || "").trim();
+			const words = text.split(/\s+/).filter(Boolean);
+			if (words.length === 0) {
+				useRecordingStore.getState().reset();
+				showToast("No se detectó voz en la grabación — nada que guardar");
+				return;
+			}
+			const seg = { speaker: "Me", start: 0, end: seconds, text, channel: "mic" as const };
+			useRecordingStore.getState().setResult({
+				success: true, text,
+				files: { wav: audioPath, srt: "", txt: "" },
+				metadata: { language: lang, model: "parakeet-stream" },
+				speakers: ["Me"], segments: [seg], embeddings: {},
+				wordCount: words.length,
+			});
+			try {
+				const created = await sessionsApi.create({
+					title: words.slice(0, 8).join(" ") + (words.length > 8 ? "..." : ""),
+					createdAt: new Date().toISOString(), duration: seconds, language: lang,
+					transcript: text, speakers: ["Me"], segments: [seg], embeddings: {},
+					files: { wav: audioPath, srt: "", txt: "" }, aiNotes: "", summary: "", tags: [], pinned: false,
+				});
+				useRecordingStore.getState().setSessionId(created.id);
+				reloadSessions();
+			} catch { /* keep the on-screen result even if persistence fails */ }
+			return;
+		}
 		// DON'T clear live segments — they stay visible in Speakers.
 		// We only need to: 1) transcribe remaining chunks, 2) run pyannote.
 		useRecordingStore.getState().setProcessing("Finishing transcription...", 30);

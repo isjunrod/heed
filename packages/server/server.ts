@@ -1735,6 +1735,8 @@ function stopLiveTranscribe() {
 
 async function handleSysRecordStop(): Promise<Response> {
 	const offset = liveTranscribeOffset; // save before reset
+	const wasStreaming = streamStarted;
+	const streamOffset = lastStreamOffset;
 	stopLiveTranscribe();
 	if (!recorderProc || !recorderPath) return Response.json({ error: "Not recording" }, { status: 400 });
 
@@ -1755,7 +1757,33 @@ async function handleSysRecordStop(): Promise<Response> {
 
 	if (!existsSync(path)) return Response.json({ error: "Recording file not created" }, { status: 500 });
 
-	return Response.json({ path, liveOffset: offset });
+	// Seamless stop for streaming: feed the final tail of audio, then stream-finish to get the
+	// authoritative final text (== what's on screen) — NO full re-transcribe / re-type.
+	let streamText = "";
+	if (wasStreaming) {
+		try {
+			const isDual = path.includes("dual-capture-");
+			const dur = (Bun.file(path).size - 44) / (isDual ? 64000 : 32000);
+			if (dur - streamOffset > 0.1) {
+				const segPath = join(UPLOAD_DIR, `live-seg-final-${Date.now()}.wav`);
+				const cf = isDual ? ["-af", "pan=mono|c0=c0"] : [];
+				Bun.spawnSync(["ffmpeg", "-y", "-loglevel", "error", "-i", path, ...cf,
+					"-ss", String(streamOffset), "-t", String(dur - streamOffset),
+					"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", segPath]);
+				if (existsSync(segPath) && Bun.file(segPath).size > 1000) {
+					await fetch(`${TRANSCRIPTION_SERVER}/stream/feed`, {
+						method: "POST", headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ wav_path: segPath }),
+					}).catch(() => {});
+				}
+				try { unlinkSync(segPath); } catch {}
+			}
+			const r = await fetch(`${TRANSCRIPTION_SERVER}/stream/finish`, { method: "POST" });
+			if (r.ok) streamText = ((await r.json() as { text?: string }).text || "").trim();
+		} catch {}
+	}
+
+	return Response.json({ path, liveOffset: offset, streaming: wasStreaming, streamText });
 }
 
 // --- Meeting auto-detector ---

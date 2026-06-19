@@ -63,6 +63,25 @@ func ensureStream(_ language: String) async throws -> StreamingNemotronMultiling
     return m
 }
 
+// --- Live STREAMING diarization (Sortformer): speakers in real time ---
+// Lazy-loaded on first diar-start. Streaming addAudio + process gives a growing speaker timeline
+// (finalized segments are stable; max 4 speakers). Used live on the SYSTEM channel (the remote
+// party); the mic is always "Me". The Python side drops phantom speakers (post-filter).
+var diarStream: SortformerDiarizer? = nil
+
+func ensureDiarStream() async throws -> SortformerDiarizer {
+    if diarStream == nil {
+        let cfg = SortformerConfig.default
+        let d = SortformerDiarizer(config: cfg)
+        let models = try await SortformerModels.loadFromHuggingFace(config: cfg, computeUnits: .all)
+        d.initialize(models: models)
+        diarStream = d
+    }
+    let d = diarStream!
+    d.reset()
+    return d
+}
+
 emit(["ready": true, "engine": "parakeet-fluidaudio"])
 
 // --- Serve requests ---
@@ -122,6 +141,30 @@ while let line = readLine() {
             let text = try await m.finish()
             await m.reset()
             emit(["ok": true, "text": text])
+        case "diar-start":
+            // Open/reset a live streaming diarization session (system channel).
+            _ = try await ensureDiarStream()
+            emit(["ok": true])
+        case "diar-feed":
+            // Append the NEW audio; return the current finalized speaker timeline (stable).
+            guard let wav = req["wav"] as? String, let d = diarStream else {
+                emit(["ok": false, "error": "no diar session"]); continue
+            }
+            let samples = try converter.resampleAudioFile(path: wav)
+            d.addAudio(samples)
+            _ = try d.process()
+            let segs = d.timeline.speakers.values.flatMap { $0.finalizedSegments }
+                .sorted { $0.startTime < $1.startTime }
+                .map { ["speaker": $0.speakerIndex, "start": Double($0.startTime), "end": Double($0.endTime)] as [String: Any] }
+            emit(["ok": true, "segments": segs])
+        case "diar-finish":
+            guard let d = diarStream else { emit(["ok": false, "error": "no diar session"]); continue }
+            _ = try d.finalizeSession()
+            let segs = d.timeline.speakers.values.flatMap { $0.finalizedSegments }
+                .sorted { $0.startTime < $1.startTime }
+                .map { ["speaker": $0.speakerIndex, "start": Double($0.startTime), "end": Double($0.endTime)] as [String: Any] }
+            d.reset()
+            emit(["ok": true, "segments": segs])
         case "ping":
             emit(["ok": true, "pong": true])
         default:

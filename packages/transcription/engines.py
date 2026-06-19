@@ -208,6 +208,19 @@ class ParakeetEngine:
         r = self._request({"cmd": "stream-finish"})
         return r.get("text", "") if r.get("ok") else ""
 
+    # --- Live streaming diarization (Sortformer): speakers in real time ---
+    def diar_start(self):
+        return self._request({"cmd": "diar-start"}).get("ok", False)
+
+    def diar_feed(self, wav_path):
+        """Append NEW audio → current finalized speaker timeline [{speaker,start,end}, ...]."""
+        r = self._request({"cmd": "diar-feed", "wav": wav_path})
+        return r.get("segments", []) if r.get("ok") else []
+
+    def diar_finish(self):
+        r = self._request({"cmd": "diar-finish"})
+        return r.get("segments", []) if r.get("ok") else []
+
 
 def get_parakeet():
     """Lazy shared sidecar (one process for live + final)."""

@@ -31,7 +31,10 @@ try await asrEN.loadModels()
 let asrML = AsrManager(config: ASRConfig(melChunkContext: false, dualDecodeArbitration: true))
 try await asrML.loadModels(asrModels)
 
-let diarizer = DiarizerManager(config: DiarizerConfig())
+// clusteringThreshold 0.74 (default 0.7 over-split similar voices, e.g. a 2-host podcast → 3).
+// Measured: 0.74 yields the correct count on hard audio AND clean clips; >=0.76 over-merges.
+// The Python side also drops residual phantom speakers as a safety net (_filter_spurious_speakers).
+let diarizer = DiarizerManager(config: DiarizerConfig(clusteringThreshold: 0.74))
 let diarModels = try await DiarizerModels.downloadIfNeeded()
 diarizer.initialize(models: diarModels)
 

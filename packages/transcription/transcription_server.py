@@ -904,6 +904,36 @@ def match_voice(embedding, threshold=0.7):
 
 
 # --- Diarization ---
+# Diarization over-counts speakers on hard audio (similar voices, podcasts): one real voice
+# can split into an extra "phantom" cluster with little total speech. This drops speakers whose
+# total speech is tiny both absolutely and relative to the rest, reassigning their segments to
+# the temporally-nearest surviving speaker (keeps all transcript text, just fixes the label).
+# Model-agnostic: applied to both FluidAudio and pyannote output.
+def _filter_spurious_speakers(segments, min_fraction=0.12, min_abs_s=3.0):
+    if not segments:
+        return segments
+    totals = {}
+    for s in segments:
+        totals[s["speaker"]] = totals.get(s["speaker"], 0.0) + (s["end"] - s["start"])
+    if len(totals) <= 1:
+        return segments
+    grand = sum(totals.values()) or 1.0
+    keep = {spk for spk, t in totals.items() if t >= min_abs_s and (t / grand) >= min_fraction}
+    if not keep:                       # everyone tiny (very short clip) → keep the largest
+        keep = {max(totals, key=totals.get)}
+    if len(keep) == len(totals):
+        return segments                # nothing spurious
+    segs = sorted(segments, key=lambda s: s["start"])
+    for i, s in enumerate(segs):
+        if s["speaker"] in keep:
+            continue
+        new_spk = next((segs[j]["speaker"] for j in range(i - 1, -1, -1) if segs[j]["speaker"] in keep), None)
+        if new_spk is None:
+            new_spk = next((segs[j]["speaker"] for j in range(i + 1, len(segs)) if segs[j]["speaker"] in keep), None)
+        s["speaker"] = new_spk or next(iter(keep))
+    return segs
+
+
 def _diarize_parakeet(wav_path, srt_path=None):
     """Diarization via the FluidAudio sidecar (Apple Silicon, no gated token).
     Returns the SAME contract as the pyannote path so callers don't branch.
@@ -911,12 +941,17 @@ def _diarize_parakeet(wav_path, srt_path=None):
     here speakers are stable per-session labels ("Speaker N") mapped from FluidAudio IDs."""
     import engines
     raw_segments = engines.get_parakeet().diarize(wav_path)  # [{speaker, start, end}, ...]
+    # Drop phantom speakers, then map remaining ids -> contiguous "Speaker 1/2/...".
+    raw_segments = _filter_spurious_speakers([
+        {"start": float(s.get("start", 0.0)), "end": float(s.get("end", 0.0)), "speaker": str(s.get("speaker", "?"))}
+        for s in raw_segments
+    ])
 
     # Map FluidAudio speaker ids -> "Speaker 1/2/..." in first-appearance order.
     speakers_map = {}
     counter = 0
     diar_segments = []
-    for seg in raw_segments:
+    for seg in sorted(raw_segments, key=lambda s: s["start"]):
         sid = str(seg.get("speaker", "?"))
         if sid not in speakers_map:
             counter += 1
@@ -1018,6 +1053,10 @@ def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
             "end": round(turn.end, 2),
             "speaker": speakers_map[speaker],
         })
+    # Drop phantom over-counted speakers (reassign their segments to the nearest real speaker).
+    diar_segments = _filter_spurious_speakers(diar_segments)
+    kept_speakers = {s["speaker"] for s in diar_segments}
+    speaker_embeddings = {k: v for k, v in speaker_embeddings.items() if k in kept_speakers}
 
     # Merge with SRT if provided
     if srt_path and os.path.exists(srt_path):
@@ -1036,11 +1075,11 @@ def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
         text = ""
 
     return {
-        "speakers": list(set(speakers_map.values())),
-        "speaker_count": len(set(speakers_map.values())),
+        "speakers": sorted(kept_speakers),
+        "speaker_count": len(kept_speakers),
         "segments": merged,
         "text": text,
-        "embeddings": speaker_embeddings,  # { "Speaker 1": [...], "Junior": [...] }
+        "embeddings": speaker_embeddings,
     }
 
 

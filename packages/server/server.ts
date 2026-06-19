@@ -1700,7 +1700,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 			const firstTimeout = setTimeout(() => {
 				processChunk();
 				liveTranscribeInterval = setInterval(processChunk, interval);
-			}, 1000);
+			}, 300);
 
 			// Cleanup when connection drops
 			const checkClosed = setInterval(() => {

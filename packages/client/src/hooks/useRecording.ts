@@ -74,7 +74,8 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 				try { sysLevelsRef.current = JSON.parse(e.data); } catch {}
 			};
 
-			// Live transcription via SSE — segments appear while recording
+			// Live transcription via SSE — segments appear while recording. Short delay just to
+			// let the recorder create the WAV; the heavy model warm-up is pre-loaded server-side.
 			setTimeout(() => {
 				if (!useRecordingStore.getState().recording) return;
 				const liveLang = encodeURIComponent(effectiveLanguage(getLanguage()));
@@ -100,7 +101,7 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 					liveEventRef.current?.close();
 					liveEventRef.current = null;
 				};
-			}, 2000);
+			}, 300);
 
 			startVisualizerLoop();
 		} catch (e) {

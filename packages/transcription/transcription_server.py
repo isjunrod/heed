@@ -678,6 +678,19 @@ def load_models():
         live_tuning = {"chunk_s": 3.0, "interval_ms": 2000, "mode": "chunk"}
     print(f"[heed] Live: mode={live_tuning['mode']} interval={live_tuning['interval_ms']}ms ({engine_kind})", flush=True)
 
+    # Pre-warm the streaming model in the BACKGROUND so the FIRST recording doesn't stall on a
+    # ~30s download / model load. "en" loads the shared 'latin' variant that also covers
+    # es/fr/it/pt/de (most users), so the first real record is instant. Non-blocking: the server
+    # is ready immediately; the warm finishes in the background within seconds of boot.
+    if engine_kind == "parakeet":
+        def _prewarm_stream():
+            try:
+                engines.get_parakeet().stream_start("en")
+                print("[heed] Live streaming model pre-warmed (ready for instant first record)", flush=True)
+            except Exception as e:
+                print(f"[heed] Stream pre-warm skipped: {str(e)[:80]}", flush=True)
+        threading.Thread(target=_prewarm_stream, daemon=True).start()
+
     # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"

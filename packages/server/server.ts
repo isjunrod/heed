@@ -1427,58 +1427,84 @@ async function processFullLive(
 	}
 }
 
-// Live STREAM mode (Parakeet): persistent ASR session in the sidecar. Each tick we feed ONLY
-// the NEW audio since lastStreamOffset (contiguous, mic channel) and emit the model's append-only
-// partial. The confirmed prefix never changes, so the existing client typing renders it stably.
+// Extract a contiguous channel segment [start, start+dur] to a small WAV. channel 0=mic, 1=sys.
+function extractChannelSeg(wavPath: string, channelIdx: number, start: number, dur: number): string | null {
+	const segPath = join(UPLOAD_DIR, `live-seg-${channelIdx}-${Date.now()}.wav`);
+	const filter = channelIdx === 1 ? ["-af", "pan=mono|c0=c1"] : channelIdx === 0 && wavPath.includes("dual-capture-") ? ["-af", "pan=mono|c0=c0"] : [];
+	Bun.spawnSync([
+		"ffmpeg", "-y", "-loglevel", "error", "-i", wavPath, ...filter,
+		"-ss", String(start), "-t", String(dur), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", segPath,
+	]);
+	return existsSync(segPath) && Bun.file(segPath).size > 1000 ? segPath : null;
+}
+
+async function postJSON(path: string, body: unknown): Promise<any | null> {
+	try {
+		const r = await fetch(`${TRANSCRIPTION_SERVER}${path}`, {
+			method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+		});
+		return r.ok ? await r.json() : null;
+	} catch { return null; }
+}
+
+// Live STREAM mode (Parakeet): persistent ASR session(s) in the sidecar. Each tick feeds ONLY the
+// NEW contiguous audio. MIC → "Me". On DUAL recordings the SYSTEM channel is ALSO streamed (its own
+// ASR session) and diarized live (Sortformer) → the remote party's words appear labeled "Speaker N"
+// IN REAL TIME. Speaker labels come from the streaming diarization timeline (dominant speaker).
 async function processStreamLive(
 	wavPath: string, isDual: boolean, lang: string,
 	send: (event: string, data: unknown) => void,
 ): Promise<void> {
 	if (!existsSync(wavPath)) return;
 	if (!streamStarted) {
-		try {
-			await fetch(`${TRANSCRIPTION_SERVER}/stream/start`, {
-				method: "POST", headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ language: lang }),
-			});
-		} catch { return; }
+		const ok = await postJSON("/stream/start", { language: lang, channel: "mic" });
+		if (!ok) return;
+		if (isDual) {
+			await postJSON("/stream/start", { language: lang, channel: "sys" });
+			await postJSON("/diar/start", {});
+		}
 		streamStarted = true;
 		lastStreamOffset = 0;
 	}
 	const fileSize = Bun.file(wavPath).size;
-	const bytesPerSec = isDual ? 64000 : 32000;
-	const fileDurationS = (fileSize - 44) / bytesPerSec;
+	const fileDurationS = (fileSize - 44) / (isDual ? 64000 : 32000);
 	const newAudio = fileDurationS - lastStreamOffset;
 	if (newAudio < 0.4) return; // wait until ~0.4s of new audio accumulated
-
-	// Extract the NEW contiguous segment (mic channel). No dynaudnorm — per-segment normalization
-	// would break level continuity across feeds and confuse the streaming model.
-	const segPath = join(UPLOAD_DIR, `live-seg-${Date.now()}.wav`);
-	const channelFilter = isDual ? "pan=mono|c0=c0," : "";
-	Bun.spawnSync([
-		"ffmpeg", "-y", "-loglevel", "error", "-i", wavPath,
-		...(channelFilter ? ["-af", channelFilter.replace(/,$/, "")] : []),
-		"-ss", String(lastStreamOffset), "-t", String(newAudio),
-		"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", segPath,
-	]);
+	const start = lastStreamOffset;
 	lastStreamOffset = fileDurationS;
-	try {
-		if (existsSync(segPath) && Bun.file(segPath).size > 1000) {
-			const res = await fetch(`${TRANSCRIPTION_SERVER}/stream/feed`, {
-				method: "POST", headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ wav_path: segPath, audio_s: newAudio }),
-			});
-			if (res.ok) {
-				const tx = await res.json() as { partial?: string; quality?: { ok: boolean; reason: string; hint: string } };
-				const partial = (tx.partial || "").trim();
-				send("live", { speaker: "Me", channel: "mic", text: partial, start: 0, end: fileDurationS, live: true });
-				if (tx.quality) {
-					send("quality", tx.quality.ok === false ? { ok: false, reason: tx.quality.reason, hint: tx.quality.hint } : { ok: true });
-				}
+
+	// --- MIC channel ("Me") ---
+	const micSeg = extractChannelSeg(wavPath, 0, start, newAudio);
+	if (micSeg) {
+		try {
+			const tx = await postJSON("/stream/feed", { wav_path: micSeg, channel: "mic", audio_s: newAudio });
+			if (tx) {
+				send("live", { speaker: "Me", channel: "mic", text: (tx.partial || "").trim(), start: 0, end: fileDurationS, live: true });
+				if (tx.quality) send("quality", tx.quality.ok === false ? { ok: false, reason: tx.quality.reason, hint: tx.quality.hint } : { ok: true });
 			}
+		} finally { try { unlinkSync(micSeg); } catch {} }
+	}
+
+	// --- SYSTEM channel (remote party): live transcript + live diarization ---
+	if (isDual) {
+		const sysSeg = extractChannelSeg(wavPath, 1, start, newAudio);
+		if (sysSeg) {
+			try {
+				const [sx, dx] = await Promise.all([
+					postJSON("/stream/feed", { wav_path: sysSeg, channel: "sys", audio_s: newAudio }),
+					postJSON("/diar/feed", { wav_path: sysSeg }),
+				]);
+				const sysText = (sx?.partial || "").trim();
+				if (sysText) {
+					// Live speaker = the dominant one in the streaming diarization timeline so far.
+					const segs: Array<{ speaker: string; start: number; end: number }> = dx?.segments || [];
+					const totals: Record<string, number> = {};
+					for (const s of segs) totals[s.speaker] = (totals[s.speaker] || 0) + (s.end - s.start);
+					const speaker = Object.keys(totals).sort((a, b) => totals[b] - totals[a])[0] || "Speaker 1";
+					send("live", { speaker, channel: "sys", text: sysText, start: 0, end: fileDurationS, live: true });
+				}
+			} finally { try { unlinkSync(sysSeg); } catch {} }
 		}
-	} finally {
-		try { unlinkSync(segPath); } catch {}
 	}
 }
 
@@ -1778,8 +1804,19 @@ async function handleSysRecordStop(): Promise<Response> {
 				}
 				try { unlinkSync(segPath); } catch {}
 			}
-			const r = await fetch(`${TRANSCRIPTION_SERVER}/stream/finish`, { method: "POST" });
+			const r = await fetch(`${TRANSCRIPTION_SERVER}/stream/finish`, {
+				method: "POST", headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ channel: "mic" }),
+			});
 			if (r.ok) streamText = ((await r.json() as { text?: string }).text || "").trim();
+			// Close the system streaming + diarization sessions too (dual). The accurate final
+			// transcript + speakers for the system channel still come from the process-stream pass.
+			if (path.includes("dual-capture-")) {
+				await fetch(`${TRANSCRIPTION_SERVER}/stream/finish`, {
+					method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channel: "sys" }),
+				}).catch(() => {});
+				await fetch(`${TRANSCRIPTION_SERVER}/diar/finish`, { method: "POST" }).catch(() => {});
+			}
 		} catch {}
 	}
 

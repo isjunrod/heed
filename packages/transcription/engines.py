@@ -193,19 +193,19 @@ class ParakeetEngine:
         r = self._request({"cmd": "diarize", "wav": wav_path})
         return r.get("segments", []) if r.get("ok") else []
 
-    # --- Live streaming (Nemotron multilingual): real-time commit/partial ---
-    def stream_start(self, language=None):
-        """Open/reset a streaming session. First call downloads+loads the model (slow)."""
-        return self._request({"cmd": "stream-start", "language": language or "en"}).get("ok", False)
+    # --- Live streaming (Nemotron multilingual): real-time commit/partial, per channel ---
+    def stream_start(self, language=None, channel="mic"):
+        """Open/reset a streaming session for a channel ("mic" | "sys")."""
+        return self._request({"cmd": "stream-start", "language": language or "en", "channel": channel}).get("ok", False)
 
-    def stream_feed(self, wav_path):
+    def stream_feed(self, wav_path, channel="mic"):
         """Append the NEW audio segment; returns the growing partial transcript (stable prefix)."""
-        r = self._request({"cmd": "stream-feed", "wav": wav_path})
+        r = self._request({"cmd": "stream-feed", "wav": wav_path, "channel": channel})
         return r.get("partial", "") if r.get("ok") else ""
 
-    def stream_finish(self):
+    def stream_finish(self, channel="mic"):
         """End the stream → final text (== what was on screen)."""
-        r = self._request({"cmd": "stream-finish"})
+        r = self._request({"cmd": "stream-finish", "channel": channel})
         return r.get("text", "") if r.get("ok") else ""
 
     # --- Live streaming diarization (Sortformer): speakers in real time ---

@@ -45,19 +45,27 @@ let converter = AudioConverter()
 // user actually records. 560ms chunk = lowest latency (~0.5s) with clean Spanish (eval'd).
 // Gives a monotonically-growing partial (confirmed prefix never changes) — heed shows it
 // directly, no re-render. finish() yields the final text == what was on screen (seamless stop).
-var streamMgr: StreamingNemotronMultilingualAsrManager? = nil
+// Per-channel ASR streaming sessions (mic + system) that SHARE the ~1.5 GB model weights
+// (preloadShared) and only cost ~50 MB of state each — so we can transcribe BOTH the user's mic
+// AND the remote/system channel live without doubling memory.
+var streamShared: SharedNemotronMultilingualModels? = nil
 var streamVariant: String? = nil
+var streamMgrs: [String: StreamingNemotronMultilingualAsrManager] = [:]
 
-func ensureStream(_ language: String) async throws -> StreamingNemotronMultilingualAsrManager {
+func ensureStream(_ channel: String, _ language: String) async throws -> StreamingNemotronMultilingualAsrManager {
     let variant = StreamingNemotronMultilingualAsrManager.languageDirectory(for: language)
-    if streamMgr == nil || streamVariant != variant {
+    if streamShared == nil || streamVariant != variant {
         let dir = try await StreamingNemotronMultilingualAsrManager.downloadVariant(languageCode: language, chunkMs: 560)
-        let m = StreamingNemotronMultilingualAsrManager()
-        try await m.loadModels(from: dir)
-        streamMgr = m
+        streamShared = try await StreamingNemotronMultilingualAsrManager.preloadShared(from: dir)
         streamVariant = variant
+        streamMgrs.removeAll()  // model variant changed → drop per-channel sessions
     }
-    let m = streamMgr!
+    if streamMgrs[channel] == nil {
+        let m = StreamingNemotronMultilingualAsrManager()
+        try await m.loadFromShared(streamShared!)
+        streamMgrs[channel] = m
+    }
+    let m = streamMgrs[channel]!
     await m.reset()
     await m.setLanguage(language)
     return m
@@ -122,13 +130,15 @@ while let line = readLine() {
             let speakers = Array(Set(result.segments.map { $0.speakerId })).sorted()
             emit(["ok": true, "speakers": speakers, "segments": segs])
         case "stream-start":
-            // Open/reset a live streaming session for this recording.
+            // Open/reset a live streaming session for this channel ("mic" | "sys").
             let lang = (req["language"] as? String) ?? "en"
-            _ = try await ensureStream(lang)
+            let channel = (req["channel"] as? String) ?? "mic"
+            _ = try await ensureStream(channel, lang)
             emit(["ok": true])
         case "stream-feed":
             // Append the NEW audio segment; return the growing partial (confirmed prefix is stable).
-            guard let wav = req["wav"] as? String, let m = streamMgr else {
+            let channel = (req["channel"] as? String) ?? "mic"
+            guard let wav = req["wav"] as? String, let m = streamMgrs[channel] else {
                 emit(["ok": false, "error": "no stream session"]); continue
             }
             let samples = try converter.resampleAudioFile(path: wav)
@@ -136,8 +146,9 @@ while let line = readLine() {
             let partial = await m.getPartialTranscript()
             emit(["ok": true, "partial": partial])
         case "stream-finish":
-            // End the stream → final text (== what was on screen). Caller then diarizes.
-            guard let m = streamMgr else { emit(["ok": false, "error": "no stream session"]); continue }
+            // End the stream → final text (== what was on screen).
+            let channel = (req["channel"] as? String) ?? "mic"
+            guard let m = streamMgrs[channel] else { emit(["ok": false, "error": "no stream session"]); continue }
             let text = try await m.finish()
             await m.reset()
             emit(["ok": true, "text": text])

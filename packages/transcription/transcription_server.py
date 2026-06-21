@@ -947,6 +947,18 @@ def _filter_spurious_speakers(segments, min_fraction=0.12, min_abs_s=3.0):
     return segs
 
 
+def _renumber_speakers(segments):
+    """Map arbitrary speaker labels to contiguous 'Speaker 1/2/...' in first-appearance order
+    (Sortformer uses non-contiguous slot ids like 0,2 → would show 'Speaker 1, Speaker 3')."""
+    mapping = {}
+    n = 0
+    for s in sorted(segments, key=lambda x: x["start"]):
+        if s["speaker"] not in mapping:
+            n += 1
+            mapping[s["speaker"]] = f"Speaker {n}"
+    return [{**s, "speaker": mapping[s["speaker"]]} for s in segments]
+
+
 def _diarize_parakeet(wav_path, srt_path=None):
     """Diarization via the FluidAudio sidecar (Apple Silicon, no gated token).
     Returns the SAME contract as the pyannote path so callers don't branch.
@@ -1303,10 +1315,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(result)
 
         elif self.path == "/stream/start":
-            # Open/reset the live streaming session (Apple Silicon / Parakeet sidecar only).
+            # Open/reset the live streaming ASR session for a channel ("mic" | "sys").
             try:
                 import engines
-                ok = engines.get_parakeet().stream_start(body.get("language") or "en") if active_engine == "parakeet" else False
+                ch = body.get("channel") or "mic"
+                ok = engines.get_parakeet().stream_start(body.get("language") or "en", ch) if active_engine == "parakeet" else False
                 self._json({"ok": bool(ok)})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)[:120]}, 200)
@@ -1315,7 +1328,8 @@ class Handler(BaseHTTPRequestHandler):
             # Append NEW audio → growing partial (stable prefix). Also assess audio quality.
             try:
                 import engines
-                partial = engines.get_parakeet().stream_feed(body["wav_path"]) if active_engine == "parakeet" else ""
+                ch = body.get("channel") or "mic"
+                partial = engines.get_parakeet().stream_feed(body["wav_path"], ch) if active_engine == "parakeet" else ""
                 _peak = None
                 try:
                     import wave as _wave, struct as _struct
@@ -1334,8 +1348,28 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/stream/finish":
             try:
                 import engines
-                text = engines.get_parakeet().stream_finish() if active_engine == "parakeet" else ""
+                ch = body.get("channel") or "mic"
+                text = engines.get_parakeet().stream_finish(ch) if active_engine == "parakeet" else ""
                 self._json({"ok": True, "text": text})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)[:120]}, 200)
+
+        elif self.path in ("/diar/start", "/diar/feed", "/diar/finish"):
+            # Live streaming diarization (Sortformer) for the SYSTEM channel.
+            try:
+                import engines
+                eng = engines.get_parakeet() if active_engine == "parakeet" else None
+                if eng is None:
+                    self._json({"ok": False, "error": "no streaming diarizer"}, 200)
+                elif self.path == "/diar/start":
+                    self._json({"ok": eng.diar_start()})
+                elif self.path in ("/diar/feed", "/diar/finish"):
+                    raw = eng.diar_feed(body["wav_path"]) if self.path == "/diar/feed" else eng.diar_finish()
+                    segs = _renumber_speakers(_filter_spurious_speakers([
+                        {"start": float(s["start"]), "end": float(s["end"]), "speaker": str(s["speaker"])}
+                        for s in raw
+                    ]))
+                    self._json({"ok": True, "segments": segs})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)[:120]}, 200)
 

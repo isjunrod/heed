@@ -29,3 +29,7 @@ docs/competitive-analysis.md
 # Swift sidecar build artifacts (heed-parakeet) — rebuilt by the installer
 packages/transcription/native/**/.build/
 packages/transcription/native/**/.swiftpm/
+
+# worktree dep symlinks (not real dirs, so node_modules/ rule misses them)
+/node_modules
+packages/*/node_modules

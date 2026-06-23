@@ -60,6 +60,19 @@ export function SpeakerView({
 	const showToast = useUIStore((s) => s.showToast);
 	const [mergeMenu, setMergeMenu] = useState<{ x: number; y: number; speaker: string } | null>(null);
 
+	// Auto-scroll: keep the transcript pinned to the bottom as it grows, UNLESS the user scrolled
+	// up to read (then we don't fight them; scrolling back to the bottom re-enables auto-follow).
+	const containerRef = useRef<HTMLDivElement>(null);
+	const stickToBottom = useRef(true);
+	const onScroll = () => {
+		const el = containerRef.current;
+		if (el) stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+	};
+	useEffect(() => {
+		const el = containerRef.current;
+		if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
+	}, [segments]);
+
 	const colorMap = useMemo(() => {
 		const map: Record<string, string> = {};
 		speakers.forEach((s, i) => { map[s] = speakerColor(i); });
@@ -107,7 +120,7 @@ export function SpeakerView({
 
 	let lastSpeaker = "";
 	return (
-		<div className={styles.container}>
+		<div className={styles.container} ref={containerRef} onScroll={onScroll}>
 			<div className={styles.hint}>Click to rename · Right-click to merge with another speaker</div>
 			<div className={styles.chips} data-tour="speaker-chips">
 				{speakers.map((s) => (

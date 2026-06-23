@@ -1353,6 +1353,14 @@ let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
 // NEW audio since lastStreamOffset each tick and show the model's append-only partial.
 let lastStreamOffset = 0;
 let streamStarted = false;
+// Karaoke turn-tracking: split the two append-only partials (mic + sys) into CHRONOLOGICAL turns
+// so the live transcript interleaves "Me / Speaker 1 / Me / Speaker 2 …" instead of two blocks.
+let liveTurnId = 0;
+let liveTurnKey = "";       // "channel|speaker" of the currently-open turn
+let micTurnBase = 0;        // char index in the mic partial where the open mic turn starts
+let sysTurnBase = 0;        // char index in the sys partial where the open sys turn starts
+let lastMicLen = 0;
+let lastSysLen = 0;
 
 // Engine-adaptive live cadence, fetched from the Python /health on record-start.
 // Parakeet (Apple Neural Engine) polls fast with short windows for near-instant words;
@@ -1473,19 +1481,21 @@ async function processStreamLive(
 	const start = lastStreamOffset;
 	lastStreamOffset = fileDurationS;
 
-	// --- MIC channel ("Me") ---
+	// Feed the new audio of each channel; gather the full append-only partials + live speakers.
+	let micPartial = "";
+	let sysPartial = "";
+	let sysSpeaker = "Speaker 1";
+
 	const micSeg = extractChannelSeg(wavPath, 0, start, newAudio);
 	if (micSeg) {
 		try {
 			const tx = await postJSON("/stream/feed", { wav_path: micSeg, channel: "mic", audio_s: newAudio });
 			if (tx) {
-				send("live", { speaker: "Me", channel: "mic", text: (tx.partial || "").trim(), start: 0, end: fileDurationS, live: true });
+				micPartial = (tx.partial || "");
 				if (tx.quality) send("quality", tx.quality.ok === false ? { ok: false, reason: tx.quality.reason, hint: tx.quality.hint } : { ok: true });
 			}
 		} finally { try { unlinkSync(micSeg); } catch {} }
 	}
-
-	// --- SYSTEM channel (remote party): live transcript + live diarization ---
 	if (isDual) {
 		const sysSeg = extractChannelSeg(wavPath, 1, start, newAudio);
 		if (sysSeg) {
@@ -1494,18 +1504,38 @@ async function processStreamLive(
 					postJSON("/stream/feed", { wav_path: sysSeg, channel: "sys", audio_s: newAudio }),
 					postJSON("/diar/feed", { wav_path: sysSeg }),
 				]);
-				const sysText = (sx?.partial || "").trim();
-				if (sysText) {
-					// Live speaker = the dominant one in the streaming diarization timeline so far.
-					const segs: Array<{ speaker: string; start: number; end: number }> = dx?.segments || [];
-					const totals: Record<string, number> = {};
-					for (const s of segs) totals[s.speaker] = (totals[s.speaker] || 0) + (s.end - s.start);
-					const speaker = Object.keys(totals).sort((a, b) => totals[b] - totals[a])[0] || "Speaker 1";
-					send("live", { speaker, channel: "sys", text: sysText, start: 0, end: fileDurationS, live: true });
-				}
+				sysPartial = (sx?.partial || "");
+				// Live speaker = whoever is talking NOW (the latest diarization segment).
+				const segs: Array<{ speaker: string; start: number; end: number }> = dx?.segments || [];
+				if (segs.length) sysSpeaker = segs[segs.length - 1].speaker;
 			} finally { try { unlinkSync(sysSeg); } catch {} }
 		}
 	}
+
+	// --- Karaoke turn assignment ---
+	// Pick the channel that gained NEW text this tick (mic wins on overlap — it's prioritized).
+	const micDelta = micPartial.length - lastMicLen;
+	const sysDelta = sysPartial.length - lastSysLen;
+	let active: "mic" | "sys" | null = null;
+	if (micDelta > 1) active = "mic";
+	else if (sysDelta > 1) active = "sys";
+
+	if (active) {
+		const speaker = active === "mic" ? "Me" : sysSpeaker;
+		const key = `${active}|${speaker}`;
+		if (key !== liveTurnKey) {
+			// Speaker changed → close the current turn and open a NEW chronological turn.
+			liveTurnId += 1;
+			liveTurnKey = key;
+			if (active === "mic") micTurnBase = lastMicLen; else sysTurnBase = lastSysLen;
+		}
+		const base = active === "mic" ? micTurnBase : sysTurnBase;
+		const fullPartial = active === "mic" ? micPartial : sysPartial;
+		const text = fullPartial.slice(base).trim();
+		if (text) send("turn", { id: liveTurnId, channel: active, speaker, text });
+	}
+	lastMicLen = micPartial.length;
+	lastSysLen = sysPartial.length;
 }
 
 function handleLiveTranscribe(reqUrl?: URL): Response {
@@ -1755,6 +1785,12 @@ function stopLiveTranscribe() {
 	liveChunkProcessing = false;
 	lastStreamOffset = 0;
 	streamStarted = false;
+	liveTurnId = 0;
+	liveTurnKey = "";
+	micTurnBase = 0;
+	sysTurnBase = 0;
+	lastMicLen = 0;
+	lastSysLen = 0;
 	// Any in-flight whisper call will still complete but its result will be
 	// dropped because processChunk checks `!recorderProc` at the top.
 }

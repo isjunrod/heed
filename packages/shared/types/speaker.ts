@@ -3,6 +3,8 @@ export interface Segment {
 	start: number;
 	end: number;
 	text: string;
+	/** Live "turn" id (karaoke): identifies a contiguous speaker turn so the client can update it in place. */
+	id?: number;
 	/** True when this segment overlaps in time with a segment from a different channel (mic vs system). */
 	overlap?: boolean;
 	/** Source channel: "mic" (you) or "sys" (other party). Only set on dual-capture sessions. */

@@ -91,6 +91,12 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 						useRecordingStore.getState().setLiveSegment(JSON.parse(e.data));
 					} catch {}
 				});
+				// "turn" = stream mode (karaoke): chronological turns, upsert by id.
+				liveEventRef.current.addEventListener("turn", (e) => {
+					try {
+						useRecordingStore.getState().upsertLiveTurn(JSON.parse(e.data));
+					} catch {}
+				});
 				// Audio-quality hint (heed differentiator): warn when the mic is too quiet/echoey.
 				liveEventRef.current.addEventListener("quality", (e) => {
 					try {

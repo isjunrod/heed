@@ -26,6 +26,8 @@ interface RecordingState {
 	appendSegment: (seg: Segment) => void;
 	/** Live "full" mode: REPLACE the single live segment for this channel each tick (full re-transcribe). */
 	setLiveSegment: (seg: Segment) => void;
+	/** Live "stream" mode (karaoke): upsert a chronological turn by id — append new, update text in place. */
+	upsertLiveTurn: (turn: { id: number; speaker: string; channel?: "mic" | "sys"; text: string }) => void;
 	/** Live audio-quality hint (heed differentiator): warns when the mic is too quiet / echoey / unclear. */
 	liveQuality: { ok: boolean; hint?: string } | null;
 	setLiveQuality: (q: { ok: boolean; hint?: string }) => void;
@@ -83,6 +85,20 @@ export const useRecordingStore = create<RecordingState>((set) => ({
 
 	liveQuality: null,
 	setLiveQuality: (q) => set({ liveQuality: q.ok ? null : q }),
+
+	upsertLiveTurn: (turn) =>
+		set((s) => {
+			const idx = s.segments.findIndex((x) => x.id === turn.id);
+			let next: Segment[];
+			if (idx >= 0) {
+				next = s.segments.slice();
+				next[idx] = { ...next[idx], speaker: turn.speaker, text: turn.text };
+			} else {
+				next = [...s.segments, { id: turn.id, speaker: turn.speaker, channel: turn.channel, text: turn.text, start: 0, end: 0 }];
+			}
+			const newSpeakers = next.reduce<string[]>((acc, x) => acc.includes(x.speaker) ? acc : [...acc, x.speaker], []);
+			return { segments: next, speakers: newSpeakers, transcript: next.map((x) => x.text).join("\n") };
+		}),
 
 	setLiveSegment: (seg) =>
 		set((s) => {

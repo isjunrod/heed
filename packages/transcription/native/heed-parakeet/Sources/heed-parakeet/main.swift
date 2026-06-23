@@ -128,7 +128,26 @@ while let line = readLine() {
                 ["speaker": $0.speakerId, "start": Double($0.startTimeSeconds), "end": Double($0.endTimeSeconds)] as [String: Any]
             }
             let speakers = Array(Set(result.segments.map { $0.speakerId })).sorted()
-            emit(["ok": true, "speakers": speakers, "segments": segs])
+            // Per-speaker 256-dim voice embedding (WeSpeaker v2) for cross-session recognition.
+            // Duration-weighted centroid of each speaker's segment embeddings, L2-normalized — the
+            // representative voiceprint the Python side matches against ~/.heed-app/voices.json.
+            var sums: [String: [Float]] = [:]
+            var weights: [String: Float] = [:]
+            for s in result.segments {
+                let dur = max(0.0, s.endTimeSeconds - s.startTimeSeconds)
+                if sums[s.speakerId] == nil { sums[s.speakerId] = [Float](repeating: 0, count: s.embedding.count) }
+                for i in 0..<s.embedding.count { sums[s.speakerId]![i] += s.embedding[i] * dur }
+                weights[s.speakerId, default: 0] += dur
+            }
+            var embeddings: [String: [Any]] = [:]
+            for (sid, vec) in sums {
+                var norm: Float = 0
+                for v in vec { norm += v * v }
+                norm = norm.squareRoot()
+                guard norm > 0 else { continue }
+                embeddings[sid] = vec.map { Double($0 / norm) }
+            }
+            emit(["ok": true, "speakers": speakers, "segments": segs, "embeddings": embeddings])
         case "stream-start":
             // Open/reset a live streaming session for this channel ("mic" | "sys").
             let lang = (req["language"] as? String) ?? "en"

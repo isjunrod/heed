@@ -9,6 +9,8 @@ export interface Segment {
 	overlap?: boolean;
 	/** Source channel: "mic" (you) or "sys" (other party). Only set on dual-capture sessions. */
 	channel?: "mic" | "sys";
+	/** True when this speaker was auto-recognized from a saved voice (cross-session). Shown as a subtle badge so a wrong match is easy to correct. */
+	auto?: boolean;
 }
 
 export interface DiarizationResult {
@@ -17,4 +19,5 @@ export interface DiarizationResult {
 	segments: Segment[];
 	text: string;
 	embeddings?: Record<string, number[]>;
+	auto_named?: Record<string, { name: string; score: number }>;
 }

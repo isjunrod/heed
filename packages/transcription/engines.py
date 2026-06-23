@@ -189,9 +189,12 @@ class ParakeetEngine:
         return iter(segs), _Info(language or "auto")
 
     def diarize(self, wav_path):
-        """Speaker segments via FluidAudio CoreML (no gated token). Apple Silicon only."""
+        """Speaker segments + per-speaker 256-dim voice embeddings via FluidAudio CoreML
+        (no gated token). Apple Silicon only. Returns {"segments": [...], "embeddings": {sid: [...]}}."""
         r = self._request({"cmd": "diarize", "wav": wav_path})
-        return r.get("segments", []) if r.get("ok") else []
+        if not r.get("ok"):
+            return {"segments": [], "embeddings": {}}
+        return {"segments": r.get("segments", []), "embeddings": r.get("embeddings", {})}
 
     # --- Live streaming (Nemotron multilingual): real-time commit/partial, per channel ---
     def stream_start(self, language=None, channel="mic"):

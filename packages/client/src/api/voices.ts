@@ -8,3 +8,10 @@ export const voicesApi = {
 	delete: (name: string) =>
 		apiClient.post<{ ok: boolean }>("/api/voices/delete", { name }),
 };
+
+// The user's own (mic) channel label — a fixed name, not a voiceprint. Renaming the "Me" speaker
+// stores it here so it persists as the default mic label across sessions.
+export const userNameApi = {
+	get: () => apiClient.get<{ name: string }>("/api/user-name"),
+	set: (name: string) => apiClient.post<{ ok: boolean; name: string }>("/api/user-name", { name }),
+};

@@ -48,6 +48,23 @@
 	font-size: 13px;
 }
 
+/* Subtle "auto" marker on a voice recognized cross-session — present but unobtrusive, so a
+   wrong match is visible and easy to correct (click the chip to rename). */
+.autoBadge {
+	margin-left: 6px;
+	padding: 1px 5px;
+	border-radius: 6px;
+	font-size: 9px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	font-family: var(--mono);
+	color: var(--text-muted, #94a3b8);
+	background: color-mix(in srgb, currentColor 14%, transparent);
+	vertical-align: middle;
+	cursor: help;
+}
+
 .speakerLine {
 	padding-left: 12px;
 	font-size: 14px;

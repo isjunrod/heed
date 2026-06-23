@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import type { Segment } from "@heed/shared";
 import { speakerColor } from "@/lib/colors.ts";
 import { useUIStore } from "@/stores/ui.ts";
-import { voicesApi } from "@/api/voices.ts";
+import { voicesApi, userNameApi } from "@/api/voices.ts";
 import { SpeakerMergeMenu } from "./SpeakerMergeMenu.tsx";
 import styles from "./SpeakerView.module.css";
 
@@ -79,6 +79,11 @@ export function SpeakerView({
 		return map;
 	}, [speakers]);
 
+	// Speakers auto-recognized from a saved voice (show a subtle badge so a wrong match is easy to
+	// fix), and speakers that are the user's own mic channel (renaming them sets the mic name, not a voice).
+	const autoSpeakers = useMemo(() => new Set(segments.filter((s) => s.auto).map((s) => s.speaker)), [segments]);
+	const micSpeakers = useMemo(() => new Set(segments.filter((s) => s.channel === "mic").map((s) => s.speaker)), [segments]);
+
 	if (!segments?.length) {
 		return (
 			<div className={styles.placeholder}>
@@ -108,7 +113,18 @@ export function SpeakerView({
 		}
 
 		onRename(speaker, finalName);
-		// Save voice embedding
+
+		// The mic channel is the user, not a diarized voice — renaming "Me" sets the persistent
+		// mic label (no embedding to save).
+		if (micSpeakers.has(speaker)) {
+			try {
+				await userNameApi.set(finalName);
+				showToast(`Your name: ${finalName}`);
+			} catch {}
+			return;
+		}
+
+		// Otherwise save/refresh the voiceprint so this person is auto-recognized next time.
 		const emb = embeddings?.[speaker] || embeddings?.[current];
 		if (emb) {
 			try {
@@ -136,6 +152,9 @@ export function SpeakerView({
 					>
 						<span className={styles.chipDot} style={{ background: colorMap[s] }} />
 						<span>{speakerNames[s] || s}</span>
+						{autoSpeakers.has(s) && (
+							<span className={styles.autoBadge} title="Voz reconocida automáticamente — clic para corregir">auto</span>
+						)}
 					</div>
 				))}
 			</div>
@@ -150,6 +169,7 @@ export function SpeakerView({
 						{showHeader && (
 							<div className={styles.speakerHeader} style={{ color }}>
 								{displayName}
+								{seg.auto && <span className={styles.autoBadge} title="Voz reconocida automáticamente — clic en el chip para corregir">auto</span>}
 							</div>
 						)}
 						<div className={`${styles.speakerLine} ${isLast ? styles.speakerLineTyping : ""}`}>

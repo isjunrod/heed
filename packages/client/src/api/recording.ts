@@ -8,7 +8,9 @@ export const recordingApi = {
 		path: string;
 		streaming?: boolean;
 		streamText?: string;
-		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string }>;
+		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; auto?: boolean }>;
+		embeddings?: Record<string, number[]>;
+		autoNamed?: Record<string, { name: string; score: number }>;
 	}>("/api/sysrecord/stop"),
 	levelsUrl: () => "/api/sysrecord/levels",
 };

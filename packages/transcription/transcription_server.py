@@ -876,12 +876,24 @@ def format_ts(seconds):
 # --- Voice memory (saved speaker embeddings) ---
 VOICES_PATH = os.path.join(os.path.expanduser("~"), ".heed-app", "voices.json")
 
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+def _normalize_voice_entry(val):
+    # Legacy format was a bare embedding list (always pyannote on Linux). Tag it so the
+    # per-backend matcher treats it correctly (pyannote and wespeaker live in different spaces).
+    if isinstance(val, list):
+        return {"embedding": val, "backend": "pyannote", "dim": len(val), "count": 1}
+    return val
+
 def load_voices():
     if not os.path.exists(VOICES_PATH):
         return {}
     try:
         with open(VOICES_PATH) as f:
-            return json.load(f)
+            raw = json.load(f)
+        return {name: _normalize_voice_entry(v) for name, v in raw.items()}
     except Exception:
         return {}
 
@@ -889,6 +901,22 @@ def save_voices(voices):
     os.makedirs(os.path.dirname(VOICES_PATH), exist_ok=True)
     with open(VOICES_PATH, "w") as f:
         json.dump(voices, f, indent=2)
+
+def current_backend():
+    """Embedding-model id for the active diarizer. pyannote and FluidAudio's WeSpeaker produce
+    incompatible vector spaces, so voices are tagged and matched within the same backend only."""
+    if diarize_backend == "parakeet":
+        return "wespeaker"
+    if diarize_backend == "pyannote":
+        return "pyannote"
+    return "unknown"
+
+# Cross-session match threshold is per embedding-model (different vector spaces, different scales).
+#   pyannote   : cosine-sim >= 0.7 (original Linux value).
+#   wespeaker  : 0.5, tuned on M5 (FluidAudio WeSpeaker v2, 256-dim L2-normalized). Measured a
+#                huge separation: SAME voice across disjoint 70s windows = 0.71 (near windows 0.94),
+#                DIFFERENT voices = ~0.0 (orthogonal). 0.5 sits well clear of both sides.
+MATCH_THRESHOLD = {"pyannote": 0.7, "wespeaker": 0.5}
 
 def cosine_similarity(a, b):
     import math
@@ -899,21 +927,48 @@ def cosine_similarity(a, b):
         return 0
     return dot / (norm_a * norm_b)
 
-def match_voice(embedding, threshold=0.7):
-    """Compare embedding to all known voices, return best match name or None."""
-    voices = load_voices()
-    if not voices:
-        return None, 0
-    best_name = None
-    best_score = 0
-    for name, saved_emb in voices.items():
-        score = cosine_similarity(embedding, saved_emb)
+def match_voice(embedding, backend, threshold=None):
+    """Best known voice for this embedding WITHIN the same backend. Returns (name|None, score)."""
+    if threshold is None:
+        threshold = MATCH_THRESHOLD.get(backend, 0.7)
+    best_name, best_score = None, 0.0
+    for name, entry in load_voices().items():
+        if entry.get("backend") != backend:
+            continue
+        score = cosine_similarity(embedding, entry.get("embedding", []))
         if score > best_score:
-            best_score = score
-            best_name = name
-    if best_score >= threshold:
+            best_score, best_name = score, name
+    if best_name and best_score >= threshold:
         return best_name, best_score
     return None, best_score
+
+def save_voice(name, embedding, backend):
+    """Store a voiceprint (overwrites any prior one for that name)."""
+    voices = load_voices()
+    emb = list(embedding)
+    voices[name] = {"embedding": emb, "backend": backend, "dim": len(emb),
+                    "count": 1, "updatedAt": _now_iso()}
+    save_voices(voices)
+    return len(voices)
+
+def update_voice(name, embedding, backend):
+    """Running-mean update so a recognized voice's profile sharpens over sessions (decision 4).
+    Re-normalizes (embeddings are L2-normalized) and bumps the sample count."""
+    import math
+    voices = load_voices()
+    entry = voices.get(name)
+    if not entry or entry.get("backend") != backend:
+        return
+    old = entry.get("embedding", [])
+    if len(old) != len(embedding):
+        return
+    count = int(entry.get("count", 1))
+    merged = [(o * count + n) / (count + 1) for o, n in zip(old, embedding)]
+    norm = math.sqrt(sum(x * x for x in merged)) or 1.0
+    merged = [x / norm for x in merged]
+    entry.update({"embedding": merged, "count": count + 1, "updatedAt": _now_iso()})
+    voices[name] = entry
+    save_voices(voices)
 
 
 # --- Diarization ---
@@ -962,14 +1017,15 @@ def _renumber_speakers(segments):
 def _diarize_parakeet(wav_path, srt_path=None):
     """Diarization via the FluidAudio sidecar (Apple Silicon, no gated token).
     Returns the SAME contract as the pyannote path so callers don't branch.
-    Note: cross-session voice naming (embeddings/match_voice) is pyannote-only for now;
-    here speakers are stable per-session labels ("Speaker N") mapped from FluidAudio IDs."""
+    Cross-session voice naming works here too: the sidecar exposes per-speaker WeSpeaker
+    embeddings, which we match against ~/.heed-app/voices.json (backend-tagged)."""
     import engines
-    raw_segments = engines.get_parakeet().diarize(wav_path)  # [{speaker, start, end}, ...]
+    diar = engines.get_parakeet().diarize(wav_path)  # {"segments":[...], "embeddings":{sid:[...]}}
+    raw_embeddings = diar.get("embeddings", {})       # keyed by RAW FluidAudio speaker id
     # Drop phantom speakers, then map remaining ids -> contiguous "Speaker 1/2/...".
     raw_segments = _filter_spurious_speakers([
         {"start": float(s.get("start", 0.0)), "end": float(s.get("end", 0.0)), "speaker": str(s.get("speaker", "?"))}
-        for s in raw_segments
+        for s in diar.get("segments", [])
     ])
 
     # Map FluidAudio speaker ids -> "Speaker 1/2/..." in first-appearance order.
@@ -988,6 +1044,10 @@ def _diarize_parakeet(wav_path, srt_path=None):
         })
     diar_segments.sort(key=lambda s: s["start"])
 
+    # Cross-session voice recognition: match each speaker's voiceprint to known voices,
+    # auto-rename on a hit (decision 3), and average the profile in (decision 4).
+    speaker_embeddings, auto_named = _name_known_voices(speakers_map, raw_embeddings, diar_segments)
+
     if srt_path and os.path.exists(srt_path):
         srt_segments = parse_srt(srt_path)
         merged = assign_speakers(diar_segments, srt_segments)
@@ -1003,13 +1063,42 @@ def _diarize_parakeet(wav_path, srt_path=None):
         merged = diar_segments
         text = ""
 
+    final_speakers = sorted({s["speaker"] for s in diar_segments})
     return {
-        "speakers": list(set(speakers_map.values())),
-        "speaker_count": len(set(speakers_map.values())),
+        "speakers": final_speakers,
+        "speaker_count": len(final_speakers),
         "segments": merged,
         "text": text,
-        "embeddings": {},  # FluidAudio embeddings not exposed yet → no cross-session match
+        "embeddings": speaker_embeddings,
+        "auto_named": auto_named,
     }
+
+
+def _name_known_voices(speakers_map, raw_embeddings, diar_segments):
+    """Given raw-sid->label map + raw-sid->embedding, match each speaker against saved voices
+    (current backend). On a hit: rename the label IN PLACE in diar_segments, mark it auto, and
+    average the embedding into the stored profile. Returns (speaker_embeddings, auto_named)
+    keyed by the FINAL speaker label. Shared by the FluidAudio path (pyannote builds its own)."""
+    backend = current_backend()
+    speaker_embeddings = {}
+    auto_named = {}
+    rename = {}
+    for sid, label in speakers_map.items():
+        emb = raw_embeddings.get(sid) or raw_embeddings.get(str(sid))
+        if not emb:
+            continue
+        speaker_embeddings[label] = emb
+        matched, score = match_voice(emb, backend)
+        if matched and matched != label:
+            rename[label] = matched
+            auto_named[matched] = {"name": matched, "score": round(float(score), 3)}
+            update_voice(matched, emb, backend)
+    if rename:
+        for s in diar_segments:
+            if s["speaker"] in rename:
+                s["speaker"] = rename[s["speaker"]]
+        speaker_embeddings = {rename.get(k, k): v for k, v in speaker_embeddings.items()}
+    return speaker_embeddings, auto_named
 
 
 def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
@@ -1047,30 +1136,18 @@ def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
     # Get speaker embeddings (one per detected speaker)
     embeddings = result.speaker_embeddings  # numpy array, shape (num_speakers, embedding_dim)
 
-    # Build speaker map: pyannote label -> human name
+    # Build speaker map: pyannote label -> "Speaker N", with raw embeddings kept per raw label.
     raw_labels = list(annotation.labels())
     speakers_map = {}
-    speaker_embeddings = {}
+    raw_embeddings = {}
     counter = 0
-
     for i, raw_label in enumerate(raw_labels):
-        emb = embeddings[i].tolist() if i < len(embeddings) else None
+        counter += 1
+        speakers_map[raw_label] = f"Speaker {counter}"
+        if i < len(embeddings):
+            raw_embeddings[raw_label] = embeddings[i].tolist()
 
-        # Try to match against known voices
-        matched_name = None
-        if emb:
-            matched_name, _ = match_voice(emb)
-
-        if matched_name:
-            speakers_map[raw_label] = matched_name
-        else:
-            counter += 1
-            speakers_map[raw_label] = f"Speaker {counter}"
-
-        if emb:
-            speaker_embeddings[speakers_map[raw_label]] = emb
-
-    # Build segments using the human labels
+    # Build segments using the "Speaker N" labels
     diar_segments = []
     for turn, _, speaker in annotation.itertracks(yield_label=True):
         diar_segments.append({
@@ -1080,6 +1157,11 @@ def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
         })
     # Drop phantom over-counted speakers (reassign their segments to the nearest real speaker).
     diar_segments = _filter_spurious_speakers(diar_segments)
+    # Cross-session voice recognition (auto-rename known voices in place + average the profile).
+    # Re-key embeddings from raw labels -> "Speaker N" before matching (shared helper).
+    label_embeddings = {speakers_map[rl]: emb for rl, emb in raw_embeddings.items()}
+    sid_map = {lbl: lbl for lbl in label_embeddings}  # labels are already final "Speaker N"
+    speaker_embeddings, auto_named = _name_known_voices(sid_map, label_embeddings, diar_segments)
     kept_speakers = {s["speaker"] for s in diar_segments}
     speaker_embeddings = {k: v for k, v in speaker_embeddings.items() if k in kept_speakers}
 
@@ -1105,6 +1187,7 @@ def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
         "segments": merged,
         "text": text,
         "embeddings": speaker_embeddings,
+        "auto_named": auto_named,
     }
 
 
@@ -1492,16 +1575,17 @@ class Handler(BaseHTTPRequestHandler):
                 sse("error", {"message": str(e)})
 
         elif self.path == "/voices/save":
-            # body: { name: "Junior", embedding: [...] }
+            # body: { name: "Junior", embedding: [...], backend?: "wespeaker"|"pyannote" }
             name = body.get("name", "").strip()
             emb = body.get("embedding")
             if not name or not emb:
                 self._json({"error": "name and embedding required"}, 400)
                 return
-            voices = load_voices()
-            voices[name] = emb
-            save_voices(voices)
-            self._json({"ok": True, "name": name, "total": len(voices)})
+            # The embedding came from the active diarizer, so tag it with that backend
+            # (the client doesn't need to know which embedding space it's in).
+            backend = body.get("backend") or current_backend()
+            total = save_voice(name, emb, backend)
+            self._json({"ok": True, "name": name, "total": total, "backend": backend})
 
         elif self.path == "/voices/delete":
             name = body.get("name", "").strip()

@@ -43,7 +43,14 @@ for (const dir of [UPLOAD_DIR, APP_DIR, SESSIONS_DIR, TEMPLATES_DIR]) {
 interface TrxConfig {
 	ollama_model?: string;
 	ollama_num_gpu?: number; // 0 = CPU-only, undefined = let Ollama decide, 999 = all layers on GPU
+	user_name?: string; // label for the user's own (mic) channel; defaults to "Me"
 	[k: string]: unknown; // forward-compat for legacy keys
+}
+
+// The mic channel is always the user; let them put their real name on it instead of "Me".
+function micLabel(): string {
+	const n = (loadConfig().user_name || "").trim();
+	return n || "Me";
 }
 
 function loadConfig(): TrxConfig {
@@ -645,6 +652,19 @@ async function handleListVoices(): Promise<Response> {
 	} catch (e) {
 		return Response.json({ voices: [] });
 	}
+}
+
+// The user's own (mic) channel label. Renaming "Me" stores a name here (a fixed label, not a
+// voiceprint — the mic is never diarized), so it persists as the default across sessions.
+function handleGetUserName(): Response {
+	return Response.json({ name: micLabel() });
+}
+
+async function handleSetUserName(req: Request): Promise<Response> {
+	const body = await req.json() as { name?: string };
+	const name = (body.name || "").trim();
+	saveConfig({ user_name: name }); // empty string → falls back to "Me"
+	return Response.json({ ok: true, name: name || "Me" });
 }
 
 // --- Models API: hardware-aware catalog + selection + streaming download ---
@@ -1402,7 +1422,7 @@ async function processFullLive(
 
 	// channel filter: mic = c0; (dual also has sys = c1)
 	const channels: Array<{ ch: string; filter: string; speaker: string; label: "mic" | "sys" }> = [
-		{ ch: "mic", filter: isDual ? "pan=mono|c0=c0," : "", speaker: "Me", label: "mic" },
+		{ ch: "mic", filter: isDual ? "pan=mono|c0=c0," : "", speaker: micLabel(), label: "mic" },
 	];
 	if (isDual) channels.push({ ch: "sys", filter: "pan=mono|c0=c1,", speaker: "???", label: "sys" });
 
@@ -1524,7 +1544,7 @@ async function processStreamLive(
 	else if (sysDelta > 1) active = "sys";
 
 	if (active) {
-		const speaker = active === "mic" ? "Me" : sysSpeaker;
+		const speaker = active === "mic" ? micLabel() : sysSpeaker;
 		const key = `${active}|${speaker}`;
 		if (key !== liveTurnKey) {
 			// Speaker changed → close the current turn and open a NEW chronological turn.
@@ -1697,7 +1717,7 @@ function handleLiveTranscribe(reqUrl?: URL): Response {
 						console.log(`[heed] live: whisper text="${text.slice(0, 50)}" (${text.length} chars)`);
 						if (text && text.length > 3) {
 							send("segment", {
-								speaker: "Me",
+								speaker: micLabel(),
 								start: Math.round(startTime * 100) / 100,
 								end: Math.round(Math.min(startTime + chunkDur, fileDurationS) * 100) / 100,
 								text,
@@ -1832,7 +1852,9 @@ async function handleSysRecordStop(): Promise<Response> {
 	// text, diar-finish for the precise speaker timeline, then REFINE the live karaoke turns IN
 	// PLACE (final text per turn + precise system speaker) — NO full re-transcribe / re-collapse.
 	let streamText = "";
-	let refinedTurns: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string }> = [];
+	let refinedTurns: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; auto?: boolean }> = [];
+	let speakerEmbeddings: Record<string, number[]> = {};
+	let autoNamed: Record<string, { name: string; score: number }> = {};
 	if (wasStreaming) {
 		try {
 			const isDual = path.includes("dual-capture-");
@@ -1844,10 +1866,7 @@ async function handleSysRecordStop(): Promise<Response> {
 				if (isDual) {
 					const sysTail = extractChannelSeg(path, 1, streamOffset, dur - streamOffset);
 					if (sysTail) {
-						await Promise.all([
-							postJSON("/stream/feed", { wav_path: sysTail, channel: "sys" }),
-							postJSON("/diar/feed", { wav_path: sysTail }),
-						]);
+						await postJSON("/stream/feed", { wav_path: sysTail, channel: "sys" });
 						try { unlinkSync(sysTail); } catch {}
 					}
 				}
@@ -1858,16 +1877,24 @@ async function handleSysRecordStop(): Promise<Response> {
 			let sysFinal = "";
 			let diarSegs: Array<{ speaker: string; start: number; end: number }> = [];
 			if (isDual) {
-				const [sysFin, diarFin] = await Promise.all([
-					postJSON("/stream/finish", { channel: "sys" }),
-					postJSON("/diar/finish", {}),
-				]);
+				const sysFin = await postJSON("/stream/finish", { channel: "sys" });
 				sysFinal = (sysFin?.text || "").trim();
-				diarSegs = diarFin?.segments || [];
+				await postJSON("/diar/finish", {}); // close/reset the live Sortformer session
+				// Precise speaker timeline + per-speaker WeSpeaker voiceprints: one-shot diarize on the
+				// FULL system channel (tuned 0.74 clustering + cross-session recognition + auto-naming).
+				const sysFull = extractChannelSeg(path, 1, 0, dur);
+				if (sysFull) {
+					const diar = await postJSON("/diarize", { wav_path: sysFull });
+					diarSegs = diar?.segments || [];
+					speakerEmbeddings = diar?.embeddings || {};
+					autoNamed = diar?.auto_named || {};
+					try { unlinkSync(sysFull); } catch {}
+				}
 			}
 
 			// Build refined turns: re-slice each turn's text from its channel's FINAL text (turn.base
-			// → next same-channel turn's base) and, for system turns, relabel with the precise diarization.
+			// → next same-channel turn's base) and, for system turns, relabel with the precise diarization
+			// (which already carries recognized voice names where matched).
 			const finalText = (ch: "mic" | "sys") => (ch === "mic" ? micFinal : sysFinal);
 			for (let i = 0; i < turns.length; i++) {
 				const t = turns[i];
@@ -1876,6 +1903,7 @@ async function handleSysRecordStop(): Promise<Response> {
 				const text = ft.slice(t.base, next ? next.base : ft.length).trim();
 				if (!text) continue;
 				let speaker = t.speaker;
+				let auto = false;
 				if (t.channel === "sys" && diarSegs.length) {
 					// dominant precise speaker overlapping [startT, endT]
 					const overlap: Record<string, number> = {};
@@ -1884,14 +1912,14 @@ async function handleSysRecordStop(): Promise<Response> {
 						if (o > 0) overlap[d.speaker] = (overlap[d.speaker] || 0) + o;
 					}
 					const best = Object.keys(overlap).sort((a, b) => overlap[b] - overlap[a])[0];
-					if (best) speaker = best;
+					if (best) { speaker = best; auto = !!autoNamed[best]; }
 				}
-				refinedTurns.push({ id: t.id, speaker, channel: t.channel, text });
+				refinedTurns.push({ id: t.id, speaker, channel: t.channel, text, auto });
 			}
 		} catch {}
 	}
 
-	return Response.json({ path, liveOffset: offset, streaming: wasStreaming, streamText, turns: refinedTurns });
+	return Response.json({ path, liveOffset: offset, streaming: wasStreaming, streamText, turns: refinedTurns, embeddings: speakerEmbeddings, autoNamed });
 }
 
 // --- Meeting auto-detector ---
@@ -2137,6 +2165,8 @@ const server = Bun.serve({
 		if (method === "GET" && url.pathname === "/api/voices") return handleListVoices();
 		if (method === "POST" && url.pathname === "/api/voices/save") return handleSaveVoice(req);
 		if (method === "POST" && url.pathname === "/api/voices/delete") return handleDeleteVoice(req);
+		if (method === "GET" && url.pathname === "/api/user-name") return handleGetUserName();
+		if (method === "POST" && url.pathname === "/api/user-name") return handleSetUserName(req);
 		if (method === "GET" && url.pathname === "/api/models") return handleListModels();
 		if (method === "POST" && url.pathname === "/api/models/select") return handleSelectModel(req);
 		if (method === "GET" && url.pathname === "/api/models/pull") return handleModelPull(url);

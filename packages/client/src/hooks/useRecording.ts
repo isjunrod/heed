@@ -187,8 +187,8 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 		store.stopRecording();
 
 		try {
-			const { path, streaming, streamText, turns } = await recordingApi.stop();
-			await finalizeRecording(path, streaming, streamText, turns);
+			const { path, streaming, streamText, turns, embeddings, autoNamed } = await recordingApi.stop();
+			await finalizeRecording(path, streaming, streamText, turns, embeddings, autoNamed);
 		} catch (e) {
 			showToast(`Stop failed: ${(e as Error).message}`);
 		}
@@ -198,15 +198,18 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 		audioPath: string,
 		streaming?: boolean,
 		streamText?: string,
-		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string }>,
+		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; auto?: boolean }>,
+		embeddings?: Record<string, number[]>,
+		_autoNamed?: Record<string, { name: string; score: number }>,
 	) => {
 		const lang = effectiveLanguage(getLanguage());
 		const seconds = useRecordingStore.getState().seconds;
 
 		// SEAMLESS stop (streaming): keep the live KARAOKE turns IN PLACE — the server already
-		// refined each turn's final text + precise system speaker. No re-transcribe, no re-collapse.
+		// refined each turn's final text + precise system speaker, and auto-named recognized voices.
+		// No re-transcribe, no re-collapse.
 		if (streaming && turns && turns.length) {
-			const segments = turns.map((t) => ({ id: t.id, speaker: t.speaker, channel: t.channel, text: t.text, start: 0, end: 0 }));
+			const segments = turns.map((t) => ({ id: t.id, speaker: t.speaker, channel: t.channel, text: t.text, start: 0, end: 0, auto: t.auto }));
 			const text = turns.map((t) => t.text).join("\n");
 			const words = text.split(/\s+/).filter(Boolean);
 			if (words.length === 0) {
@@ -215,17 +218,18 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 				return;
 			}
 			const speakers = [...new Set(turns.map((t) => t.speaker))];
+			const emb = embeddings || {};
 			useRecordingStore.getState().setResult({
 				success: true, text,
 				files: { wav: audioPath, srt: "", txt: "" },
 				metadata: { language: lang, model: "parakeet-stream" },
-				speakers, segments, embeddings: {}, wordCount: words.length,
+				speakers, segments, embeddings: emb, wordCount: words.length,
 			});
 			try {
 				const created = await sessionsApi.create({
 					title: words.slice(0, 8).join(" ") + (words.length > 8 ? "..." : ""),
 					createdAt: new Date().toISOString(), duration: seconds, language: lang,
-					transcript: text, speakers, segments, embeddings: {},
+					transcript: text, speakers, segments, embeddings: emb,
 					files: { wav: audioPath, srt: "", txt: "" }, aiNotes: "", summary: "", tags: [], pinned: false,
 				});
 				useRecordingStore.getState().setSessionId(created.id);

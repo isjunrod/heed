@@ -1361,6 +1361,9 @@ let micTurnBase = 0;        // char index in the mic partial where the open mic 
 let sysTurnBase = 0;        // char index in the sys partial where the open sys turn starts
 let lastMicLen = 0;
 let lastSysLen = 0;
+// The full ordered turn list (server owns it) so the STOP can refine each turn IN PLACE
+// (final text + precise diarization speaker) instead of re-transcribing and collapsing the karaoke.
+let liveTurns: Array<{ id: number; channel: "mic" | "sys"; speaker: string; base: number; startT: number; endT: number }> = [];
 
 // Engine-adaptive live cadence, fetched from the Python /health on record-start.
 // Parakeet (Apple Neural Engine) polls fast with short windows for near-instant words;
@@ -1527,8 +1530,12 @@ async function processStreamLive(
 			// Speaker changed → close the current turn and open a NEW chronological turn.
 			liveTurnId += 1;
 			liveTurnKey = key;
-			if (active === "mic") micTurnBase = lastMicLen; else sysTurnBase = lastSysLen;
+			const turnBase = active === "mic" ? lastMicLen : lastSysLen;
+			if (active === "mic") micTurnBase = turnBase; else sysTurnBase = turnBase;
+			liveTurns.push({ id: liveTurnId, channel: active, speaker, base: turnBase, startT: start, endT: fileDurationS });
 		}
+		const last = liveTurns[liveTurns.length - 1];
+		if (last) last.endT = fileDurationS;
 		const base = active === "mic" ? micTurnBase : sysTurnBase;
 		const fullPartial = active === "mic" ? micPartial : sysPartial;
 		const text = fullPartial.slice(base).trim();
@@ -1791,6 +1798,7 @@ function stopLiveTranscribe() {
 	sysTurnBase = 0;
 	lastMicLen = 0;
 	lastSysLen = 0;
+	liveTurns = [];
 	// Any in-flight whisper call will still complete but its result will be
 	// dropped because processChunk checks `!recorderProc` at the top.
 }
@@ -1799,6 +1807,7 @@ async function handleSysRecordStop(): Promise<Response> {
 	const offset = liveTranscribeOffset; // save before reset
 	const wasStreaming = streamStarted;
 	const streamOffset = lastStreamOffset;
+	const turns = liveTurns.map((t) => ({ ...t })); // capture before stopLiveTranscribe resets it
 	stopLiveTranscribe();
 	if (!recorderProc || !recorderPath) return Response.json({ error: "Not recording" }, { status: 400 });
 
@@ -1819,44 +1828,70 @@ async function handleSysRecordStop(): Promise<Response> {
 
 	if (!existsSync(path)) return Response.json({ error: "Recording file not created" }, { status: 500 });
 
-	// Seamless stop for streaming: feed the final tail of audio, then stream-finish to get the
-	// authoritative final text (== what's on screen) — NO full re-transcribe / re-type.
+	// Seamless stop for streaming: feed the final tail, stream-finish for the authoritative final
+	// text, diar-finish for the precise speaker timeline, then REFINE the live karaoke turns IN
+	// PLACE (final text per turn + precise system speaker) — NO full re-transcribe / re-collapse.
 	let streamText = "";
+	let refinedTurns: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string }> = [];
 	if (wasStreaming) {
 		try {
 			const isDual = path.includes("dual-capture-");
 			const dur = (Bun.file(path).size - 44) / (isDual ? 64000 : 32000);
+			// Feed the final audio tail of each channel so the last turn captures the closing words.
 			if (dur - streamOffset > 0.1) {
-				const segPath = join(UPLOAD_DIR, `live-seg-final-${Date.now()}.wav`);
-				const cf = isDual ? ["-af", "pan=mono|c0=c0"] : [];
-				Bun.spawnSync(["ffmpeg", "-y", "-loglevel", "error", "-i", path, ...cf,
-					"-ss", String(streamOffset), "-t", String(dur - streamOffset),
-					"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", segPath]);
-				if (existsSync(segPath) && Bun.file(segPath).size > 1000) {
-					await fetch(`${TRANSCRIPTION_SERVER}/stream/feed`, {
-						method: "POST", headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({ wav_path: segPath }),
-					}).catch(() => {});
+				const micTail = extractChannelSeg(path, 0, streamOffset, dur - streamOffset);
+				if (micTail) { await postJSON("/stream/feed", { wav_path: micTail, channel: "mic" }); try { unlinkSync(micTail); } catch {} }
+				if (isDual) {
+					const sysTail = extractChannelSeg(path, 1, streamOffset, dur - streamOffset);
+					if (sysTail) {
+						await Promise.all([
+							postJSON("/stream/feed", { wav_path: sysTail, channel: "sys" }),
+							postJSON("/diar/feed", { wav_path: sysTail }),
+						]);
+						try { unlinkSync(sysTail); } catch {}
+					}
 				}
-				try { unlinkSync(segPath); } catch {}
 			}
-			const r = await fetch(`${TRANSCRIPTION_SERVER}/stream/finish`, {
-				method: "POST", headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ channel: "mic" }),
-			});
-			if (r.ok) streamText = ((await r.json() as { text?: string }).text || "").trim();
-			// Close the system streaming + diarization sessions too (dual). The accurate final
-			// transcript + speakers for the system channel still come from the process-stream pass.
-			if (path.includes("dual-capture-")) {
-				await fetch(`${TRANSCRIPTION_SERVER}/stream/finish`, {
-					method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channel: "sys" }),
-				}).catch(() => {});
-				await fetch(`${TRANSCRIPTION_SERVER}/diar/finish`, { method: "POST" }).catch(() => {});
+			const micFin = await postJSON("/stream/finish", { channel: "mic" });
+			const micFinal = (micFin?.text || "").trim();
+			streamText = micFinal;
+			let sysFinal = "";
+			let diarSegs: Array<{ speaker: string; start: number; end: number }> = [];
+			if (isDual) {
+				const [sysFin, diarFin] = await Promise.all([
+					postJSON("/stream/finish", { channel: "sys" }),
+					postJSON("/diar/finish", {}),
+				]);
+				sysFinal = (sysFin?.text || "").trim();
+				diarSegs = diarFin?.segments || [];
+			}
+
+			// Build refined turns: re-slice each turn's text from its channel's FINAL text (turn.base
+			// → next same-channel turn's base) and, for system turns, relabel with the precise diarization.
+			const finalText = (ch: "mic" | "sys") => (ch === "mic" ? micFinal : sysFinal);
+			for (let i = 0; i < turns.length; i++) {
+				const t = turns[i];
+				const next = turns.slice(i + 1).find((x) => x.channel === t.channel);
+				const ft = finalText(t.channel);
+				const text = ft.slice(t.base, next ? next.base : ft.length).trim();
+				if (!text) continue;
+				let speaker = t.speaker;
+				if (t.channel === "sys" && diarSegs.length) {
+					// dominant precise speaker overlapping [startT, endT]
+					const overlap: Record<string, number> = {};
+					for (const d of diarSegs) {
+						const o = Math.max(0, Math.min(t.endT, d.end) - Math.max(t.startT, d.start));
+						if (o > 0) overlap[d.speaker] = (overlap[d.speaker] || 0) + o;
+					}
+					const best = Object.keys(overlap).sort((a, b) => overlap[b] - overlap[a])[0];
+					if (best) speaker = best;
+				}
+				refinedTurns.push({ id: t.id, speaker, channel: t.channel, text });
 			}
 		} catch {}
 	}
 
-	return Response.json({ path, liveOffset: offset, streaming: wasStreaming, streamText });
+	return Response.json({ path, liveOffset: offset, streaming: wasStreaming, streamText, turns: refinedTurns });
 }
 
 // --- Meeting auto-detector ---

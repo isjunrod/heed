@@ -4,6 +4,11 @@ import { apiClient } from "./client.ts";
 export const recordingApi = {
 	start: (mode: "mic" | "system" | "both" = "both") =>
 		apiClient.post<SystemRecordStartResponse>("/api/sysrecord/start", { mode }),
-	stop: () => apiClient.post<{ path: string; streaming?: boolean; streamText?: string }>("/api/sysrecord/stop"),
+	stop: () => apiClient.post<{
+		path: string;
+		streaming?: boolean;
+		streamText?: string;
+		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string }>;
+	}>("/api/sysrecord/stop"),
 	levelsUrl: () => "/api/sysrecord/levels",
 };

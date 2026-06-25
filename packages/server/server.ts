@@ -1285,6 +1285,13 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 		}
 	}
 
+	// CRITICAL for live transcription: force ffmpeg to flush each packet to disk so the WAV file
+	// GROWS continuously. Without this, ffmpeg buffers output in ~256KB (~4s) blocks → the file
+	// stays 0 bytes then jumps in 4s steps. The live loop derives "new audio" from the file SIZE,
+	// so a non-growing file means it never feeds the streaming model → live never appears and the
+	// whole recording is only processed at stop. `-flush_packets 1` makes the file grow in real time.
+	args.splice(args.length - 1, 0, "-flush_packets", "1");
+
 	recorderProc = Bun.spawn(args, stdinStream ? { stdin: stdinStream, stdout: "pipe", stderr: "pipe" } : { stdout: "pipe", stderr: "pipe" });
 
 	// Start PipeWire/BlackHole loopback so browser can visualize system audio (BlackHole path only).

@@ -92,6 +92,69 @@ models_ready = {"whisper": False, "pyannote": False}
 MIC_GATE_RMS = float(os.environ.get("HEED_MIC_GATE_RMS", "0.016"))
 _last_partial = {}  # channel -> last partial returned, so a gated tick keeps the text stable
 
+# --- Live AEC (Layer 2 of echo handling): WebRTC AEC3 via the LiveKit SDK ---
+# Cancels the SYSTEM channel (clean far-end reference) out of the MIC before transcription, so the
+# other speaker's voice that leaks into the mic (speakers / non-isolating headphones, esp. during
+# double-talk where the energy gate can't help) gets removed at the signal level. The APM is
+# persistent so its adaptive filter converges across chunks; reset per recording on /stream/start.
+_apm = None
+_apm_ok = None  # None=untried, True=loaded, False=unavailable (graceful: AEC just off)
+
+def _get_apm():
+    global _apm, _apm_ok
+    if _apm_ok is False:
+        return None
+    if _apm is None:
+        try:
+            from livekit import rtc
+            _apm = rtc.AudioProcessingModule(
+                echo_cancellation=True, noise_suppression=True,
+                high_pass_filter=True, auto_gain_control=False,
+            )
+            _apm_ok = True
+            print("[heed] AEC (WebRTC AEC3) armed for mic echo cancellation", flush=True)
+        except Exception as e:
+            _apm_ok = False
+            print(f"[heed] AEC unavailable (echo cancellation off, gate still on): {str(e)[:80]}", flush=True)
+            return None
+    return _apm
+
+def _reset_apm():
+    global _apm
+    _apm = None  # recreate fresh on the next recording so the filter starts clean
+
+def _aec_clean(mic_path, ref_path):
+    """Cancel the system reference out of the mic chunk (AEC3, 10 ms frames). Returns a cleaned
+    temp WAV path, or the original mic_path if AEC is unavailable / fails (never breaks the feed)."""
+    apm = _get_apm()
+    if apm is None:
+        return mic_path
+    try:
+        from livekit import rtc
+        import numpy as _np, wave as _wave, tempfile as _tf
+        def _load(p):
+            with _wave.open(p) as wf:
+                return _np.frombuffer(wf.readframes(wf.getnframes()), dtype=_np.int16)
+        near = _load(mic_path); far = _load(ref_path)
+        m = min(len(near), len(far))
+        if m < 160:
+            return mic_path
+        near = near[:m].copy(); far = far[:m]
+        FR = 160  # 10 ms @ 16 kHz
+        for i in range(0, m - FR + 1, FR):
+            apm.process_reverse_stream(rtc.AudioFrame(far[i:i+FR].tobytes(), 16000, 1, FR))
+            nf = rtc.AudioFrame(near[i:i+FR].tobytes(), 16000, 1, FR)
+            apm.process_stream(nf)
+            near[i:i+FR] = _np.frombuffer(bytes(nf.data), dtype=_np.int16)
+        tmp = _tf.mktemp(suffix=".wav")
+        with _wave.open(tmp, "w") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+            wf.writeframes(near.tobytes())
+        return tmp
+    except Exception as e:
+        print(f"[heed] AEC chunk failed (passing mic through): {str(e)[:80]}", flush=True)
+        return mic_path
+
 
 # --- Ollama model catalog ---
 # Curated list of LLMs we recommend for meeting note generation.
@@ -1430,6 +1493,8 @@ class Handler(BaseHTTPRequestHandler):
                 ch = body.get("channel") or "mic"
                 ok = engines.get_parakeet().stream_start(body.get("language") or "en", ch) if active_engine == "parakeet" else False
                 _last_partial[ch] = ""  # fresh session → no stale gated text
+                if ch == "mic":
+                    _reset_apm()  # new recording → fresh AEC filter
                 self._json({"ok": bool(ok)})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)[:120]}, 200)
@@ -1439,12 +1504,20 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import engines
                 ch = body.get("channel") or "mic"
-                # Read the chunk once → peak (for quality) AND rms (for the echo gate).
+                wav_path = body["wav_path"]
+                # LAYER 2 — AEC: cancel the system reference out of the mic BEFORE gating/transcribing.
+                _aec_tmp = None
+                if ch == "mic" and body.get("ref_wav_path"):
+                    cleaned = _aec_clean(wav_path, body["ref_wav_path"])
+                    if cleaned != wav_path:
+                        _aec_tmp = cleaned
+                        wav_path = cleaned
+                # Read the (post-AEC) chunk once → peak (for quality) AND rms (for the echo gate).
                 _peak = None
                 _rms = None
                 try:
                     import wave as _wave, struct as _struct
-                    with _wave.open(body["wav_path"]) as _wf:
+                    with _wave.open(wav_path) as _wf:
                         _frames = _wf.readframes(_wf.getnframes())
                     _samples = _struct.unpack('<' + 'h' * (len(_frames) // 2), _frames)
                     _step = max(1, len(_samples) // 50000)
@@ -1460,8 +1533,11 @@ class Handler(BaseHTTPRequestHandler):
                 if ch == "mic" and _rms is not None and _rms < MIC_GATE_RMS:
                     partial = _last_partial.get(ch, "")
                 else:
-                    partial = engines.get_parakeet().stream_feed(body["wav_path"], ch) if active_engine == "parakeet" else ""
+                    partial = engines.get_parakeet().stream_feed(wav_path, ch) if active_engine == "parakeet" else ""
                     _last_partial[ch] = partial
+                if _aec_tmp:
+                    try: os.remove(_aec_tmp)
+                    except Exception: pass
                 self._json({"ok": True, "partial": partial,
                             "quality": assess_audio_quality(partial, float(body.get("audio_s", 0) or 0), _peak)})
             except Exception as e:

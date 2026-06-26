@@ -1474,30 +1474,30 @@ async function processStreamLive(
 	let sysPartial = "";
 	let sysSpeaker = "Speaker 1";
 
+	// Extract the SYSTEM channel first so it can serve as the AEC reference for the mic feed
+	// (cancel the other speaker's voice that leaked into the mic). Kept until both feeds are done.
 	const micSeg = extractChannelSeg(wavPath, 0, start, newAudio);
+	const sysSeg = isDual ? extractChannelSeg(wavPath, 1, start, newAudio) : null;
 	if (micSeg) {
 		try {
-			const tx = await postJSON("/stream/feed", { wav_path: micSeg, channel: "mic", audio_s: newAudio });
+			const tx = await postJSON("/stream/feed", { wav_path: micSeg, channel: "mic", audio_s: newAudio, ref_wav_path: sysSeg || undefined });
 			if (tx) {
 				micPartial = (tx.partial || "");
 				if (tx.quality) send("quality", tx.quality.ok === false ? { ok: false, reason: tx.quality.reason, hint: tx.quality.hint } : { ok: true });
 			}
 		} finally { try { unlinkSync(micSeg); } catch {} }
 	}
-	if (isDual) {
-		const sysSeg = extractChannelSeg(wavPath, 1, start, newAudio);
-		if (sysSeg) {
-			try {
-				const [sx, dx] = await Promise.all([
-					postJSON("/stream/feed", { wav_path: sysSeg, channel: "sys", audio_s: newAudio }),
-					postJSON("/diar/feed", { wav_path: sysSeg }),
-				]);
-				sysPartial = (sx?.partial || "");
-				// Live speaker = whoever is talking NOW (the latest diarization segment).
-				const segs: Array<{ speaker: string; start: number; end: number }> = dx?.segments || [];
-				if (segs.length) sysSpeaker = segs[segs.length - 1].speaker;
-			} finally { try { unlinkSync(sysSeg); } catch {} }
-		}
+	if (isDual && sysSeg) {
+		try {
+			const [sx, dx] = await Promise.all([
+				postJSON("/stream/feed", { wav_path: sysSeg, channel: "sys", audio_s: newAudio }),
+				postJSON("/diar/feed", { wav_path: sysSeg }),
+			]);
+			sysPartial = (sx?.partial || "");
+			// Live speaker = whoever is talking NOW (the latest diarization segment).
+			const segs: Array<{ speaker: string; start: number; end: number }> = dx?.segments || [];
+			if (segs.length) sysSpeaker = segs[segs.length - 1].speaker;
+		} finally { try { unlinkSync(sysSeg); } catch {} }
 	}
 
 	// --- Karaoke turn assignment ---

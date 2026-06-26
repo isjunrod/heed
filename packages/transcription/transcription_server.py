@@ -82,6 +82,16 @@ diarize_pipeline = None
 diarize_backend = None
 models_ready = {"whisper": False, "pyannote": False}
 
+# --- Live mic echo gate (Layer 1 of echo handling) ---
+# When YOU aren't really talking, the mic only carries faint LEAKAGE of the system audio (measured
+# ~28 dB below the source on an M5 with headphones). Parakeet is sensitive enough to transcribe that
+# faint echo into your transcript. We gate the MIC channel: if a live chunk's RMS is below the speech
+# floor, we DON'T feed it to the ASR (the system channel still transcribes the other voice cleanly).
+# Calibrated on a real M5 recording: echo maxed at RMS 0.0148, the user's quiet speech started at
+# 0.0201 — so 0.016 separates them with margin both ways. Tunable per setup.
+MIC_GATE_RMS = float(os.environ.get("HEED_MIC_GATE_RMS", "0.016"))
+_last_partial = {}  # channel -> last partial returned, so a gated tick keeps the text stable
+
 
 # --- Ollama model catalog ---
 # Curated list of LLMs we recommend for meeting note generation.
@@ -1419,6 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
                 import engines
                 ch = body.get("channel") or "mic"
                 ok = engines.get_parakeet().stream_start(body.get("language") or "en", ch) if active_engine == "parakeet" else False
+                _last_partial[ch] = ""  # fresh session → no stale gated text
                 self._json({"ok": bool(ok)})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)[:120]}, 200)
@@ -1428,17 +1439,29 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import engines
                 ch = body.get("channel") or "mic"
-                partial = engines.get_parakeet().stream_feed(body["wav_path"], ch) if active_engine == "parakeet" else ""
+                # Read the chunk once → peak (for quality) AND rms (for the echo gate).
                 _peak = None
+                _rms = None
                 try:
                     import wave as _wave, struct as _struct
                     with _wave.open(body["wav_path"]) as _wf:
                         _frames = _wf.readframes(_wf.getnframes())
                     _samples = _struct.unpack('<' + 'h' * (len(_frames) // 2), _frames)
                     _step = max(1, len(_samples) // 50000)
-                    _peak = max((abs(s) for s in _samples[::_step]), default=0)
+                    _sub = _samples[::_step]
+                    _peak = max((abs(s) for s in _sub), default=0)
+                    _rms = (sum(s * s for s in _sub) / len(_sub)) ** 0.5 / 32768.0 if _sub else 0.0
                 except Exception:
                     pass
+                # LAYER 1 — mic echo gate: when the mic chunk is below the speech floor, the user
+                # isn't really talking; it's faint leakage of the system audio. Skip the ASR feed so
+                # that echo never enters the transcript; keep the partial stable. Mic channel only —
+                # the system channel must always transcribe (that's the other speaker).
+                if ch == "mic" and _rms is not None and _rms < MIC_GATE_RMS:
+                    partial = _last_partial.get(ch, "")
+                else:
+                    partial = engines.get_parakeet().stream_feed(body["wav_path"], ch) if active_engine == "parakeet" else ""
+                    _last_partial[ch] = partial
                 self._json({"ok": True, "partial": partial,
                             "quality": assess_audio_quality(partial, float(body.get("audio_s", 0) or 0), _peak)})
             except Exception as e:

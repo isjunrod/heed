@@ -90,7 +90,9 @@ models_warm = False  # True once the live ASR + diarization are pre-warmed (firs
 # floor, we DON'T feed it to the ASR (the system channel still transcribes the other voice cleanly).
 # Calibrated on a real M5 recording: echo maxed at RMS 0.0148, the user's quiet speech started at
 # 0.0201 — so 0.016 separates them with margin both ways. Tunable per setup.
-MIC_GATE_RMS = float(os.environ.get("HEED_MIC_GATE_RMS", "0.016"))
+# Default OFF: a 12-recording eval showed the energy gate cut the user's own quiet speech more than
+# it removed echo (the text dedup, Layer 3, handles echo far better). Kept tunable for heavy-leak setups.
+MIC_GATE_RMS = float(os.environ.get("HEED_MIC_GATE_RMS", "0"))
 _last_partial = {}  # channel -> last partial returned, so a gated tick keeps the text stable
 
 # --- Live AEC (Layer 2 of echo handling): WebRTC AEC3 via the LiveKit SDK ---
@@ -155,6 +157,104 @@ def _aec_clean(mic_path, ref_path):
     except Exception as e:
         print(f"[heed] AEC chunk failed (passing mic through): {str(e)[:80]}", flush=True)
         return mic_path
+
+
+def _wav_rms_peak(path):
+    """RMS (0-1, normalized) and peak (int16) of a WAV. Cheap, subsampled."""
+    try:
+        import wave as _w, struct as _s
+        with _w.open(path) as wf:
+            fr = wf.readframes(wf.getnframes())
+        n = len(fr) // 2
+        if n == 0:
+            return 0.0, 0
+        smp = _s.unpack("<" + "h" * n, fr)
+        step = max(1, n // 50000)
+        sub = smp[::step]
+        rms = (sum(x * x for x in sub) / len(sub)) ** 0.5 / 32768.0
+        peak = max((abs(x) for x in sub), default=0)
+        return rms, peak
+    except Exception:
+        return 0.0, 0
+
+
+# --- Adaptive AEC (Task 2): only cancel when there's ACTUAL echo ---
+# AEC3 slightly degrades the near-end voice even with no echo, so for users with isolating
+# headphones (no leakage) we should NOT run it. We watch "listening" windows (system playing, mic
+# below the speech floor) and estimate the leak ratio = mic_energy / system_energy there. If the mic
+# picks up a real fraction of the system audio → echo present → keep AEC on; if the mic is ~silent
+# when the system plays → no leak (clean headphones) → turn AEC off for the rest of the recording.
+# Default ON until decided (never leak a foreign voice while we're still measuring).
+AEC_MODE = os.environ.get("HEED_AEC_MODE", "off")  # off | always | adaptive — eval: off wins (AEC hurt voice in aggregate)
+AEC_LEAK_RATIO = float(os.environ.get("HEED_AEC_LEAK_RATIO", "0.06"))
+AEC_DECIDE_AFTER = int(os.environ.get("HEED_AEC_DECIDE_AFTER", "5"))
+_echo = {"mic": 0.0, "sys": 0.0, "n": 0, "on": True}
+
+def _reset_echo():
+    global _echo
+    _echo = {"mic": 0.0, "sys": 0.0, "n": 0, "on": True}
+
+def _echo_observe_and_decide(raw_mic_rms, sys_rms):
+    """Update the leak estimate from a listening window and (once enough seen) latch AEC on/off."""
+    if sys_rms > 0.02 and raw_mic_rms < MIC_GATE_RMS:
+        _echo["mic"] += raw_mic_rms
+        _echo["sys"] += sys_rms
+        _echo["n"] += 1
+        if _echo["n"] == AEC_DECIDE_AFTER:
+            ratio = _echo["mic"] / (_echo["sys"] + 1e-9)
+            _echo["on"] = ratio > AEC_LEAK_RATIO
+            print(f"[heed] AEC adaptive: leak ratio={ratio:.3f} -> AEC {'ON' if _echo['on'] else 'OFF (clean, no echo)'}", flush=True)
+    return _echo["on"]
+
+
+# --- Layer 3: cross-channel TEXT dedup (the winner, per the multi-sample eval) ---
+# We always have the OTHER speaker's CLEAN transcript (the system channel). Any words in the MIC
+# transcript that match it are residual echo → strip them. A rigorous 12-recording eval showed this
+# removes the foreign echo (echo→0) while keeping ~0.78 of the user's own words — beating the signal
+# gate + AEC, which hurt voice preservation in aggregate. Operates purely on text (no audio damage).
+import re as _re_dd
+from difflib import SequenceMatcher as _SM
+_DD_STOP = set("de la el en y a que los las un una por con para se su lo le del al es e o u me mi tu".split())
+
+def _dd_words(t):
+    return [w for w in _re_dd.findall(r"[a-záéíóúñü0-9']+", (t or "").lower()) if w]
+
+def _dd_index(grams):
+    idx = {}
+    for g in grams:
+        for w in g:
+            if w not in _DD_STOP:
+                idx.setdefault(w, []).append(g)
+    return idx
+
+def _dd_match(g, idx, thr):
+    seen = set(); gs = " ".join(g)
+    for w in g:
+        if w in _DD_STOP:
+            continue
+        for cg in idx.get(w, ()):
+            if cg in seen:
+                continue
+            seen.add(cg)
+            if _SM(None, gs, " ".join(cg)).ratio() >= thr:
+                return True
+    return False
+
+DEDUP_THR = float(os.environ.get("HEED_DEDUP_THR", "0.63"))
+
+def dedup_echo(mic_txt, sys_txt, thr=None):
+    """Remove from mic_txt any 3-word run that matches the system (other speaker) transcript."""
+    thr = DEDUP_THR if thr is None else thr
+    mw = _dd_words(mic_txt)
+    if len(mw) < 3 or not (sys_txt or "").strip():
+        return mic_txt
+    sg = [tuple(_dd_words(sys_txt)[i:i+3]) for i in range(len(_dd_words(sys_txt)) - 2)]
+    idx = _dd_index(sg)
+    flag = [False] * len(mw)
+    for i in range(len(mw) - 2):
+        if _dd_match(tuple(mw[i:i+3]), idx, thr):
+            flag[i] = flag[i+1] = flag[i+2] = True
+    return " ".join(w for w, f in zip(mw, flag) if not f)
 
 
 # --- Ollama model catalog ---
@@ -1505,10 +1605,18 @@ class Handler(BaseHTTPRequestHandler):
                 ok = engines.get_parakeet().stream_start(body.get("language") or "en", ch) if active_engine == "parakeet" else False
                 _last_partial[ch] = ""  # fresh session → no stale gated text
                 if ch == "mic":
-                    _reset_apm()  # new recording → fresh AEC filter
+                    _reset_apm()   # new recording → fresh AEC filter
+                    _reset_echo()  # new recording → re-decide whether echo is present
                 self._json({"ok": bool(ok)})
             except Exception as e:
                 self._json({"ok": False, "error": str(e)[:120]}, 200)
+
+        elif self.path == "/dedup":
+            # Layer 3: strip foreign-speaker echo from a mic transcript using the system transcript.
+            try:
+                self._json({"ok": True, "text": dedup_echo(body.get("mic", ""), body.get("sys", ""))})
+            except Exception as e:
+                self._json({"ok": True, "text": body.get("mic", ""), "error": str(e)[:120]})
 
         elif self.path == "/stream/feed":
             # Append NEW audio → growing partial (stable prefix). Also assess audio quality.
@@ -1516,36 +1624,42 @@ class Handler(BaseHTTPRequestHandler):
                 import engines
                 ch = body.get("channel") or "mic"
                 wav_path = body["wav_path"]
-                # LAYER 2 — AEC: cancel the system reference out of the mic BEFORE gating/transcribing.
+                ref = body.get("ref_wav_path")
                 _aec_tmp = None
-                if ch == "mic" and body.get("ref_wav_path"):
-                    cleaned = _aec_clean(wav_path, body["ref_wav_path"])
-                    if cleaned != wav_path:
-                        _aec_tmp = cleaned
-                        wav_path = cleaned
-                # Read the (post-AEC) chunk once → peak (for quality) AND rms (for the echo gate).
-                _peak = None
-                _rms = None
-                try:
-                    import wave as _wave, struct as _struct
-                    with _wave.open(wav_path) as _wf:
-                        _frames = _wf.readframes(_wf.getnframes())
-                    _samples = _struct.unpack('<' + 'h' * (len(_frames) // 2), _frames)
-                    _step = max(1, len(_samples) // 50000)
-                    _sub = _samples[::_step]
-                    _peak = max((abs(s) for s in _sub), default=0)
-                    _rms = (sum(s * s for s in _sub) / len(_sub)) ** 0.5 / 32768.0 if _sub else 0.0
-                except Exception:
-                    pass
-                # LAYER 1 — mic echo gate: when the mic chunk is below the speech floor, the user
-                # isn't really talking; it's faint leakage of the system audio. Skip the ASR feed so
-                # that echo never enters the transcript; keep the partial stable. Mic channel only —
-                # the system channel must always transcribe (that's the other speaker).
-                if ch == "mic" and _rms is not None and _rms < MIC_GATE_RMS:
-                    partial = _last_partial.get(ch, "")
+                if ch == "mic":
+                    # Raw mic + system levels → adaptive AEC decision (only cancel real echo).
+                    raw_rms, _peak = _wav_rms_peak(wav_path)
+                    aec_on = True
+                    if ref:
+                        sys_rms, _ = _wav_rms_peak(ref)
+                        if AEC_MODE == "off":
+                            aec_on = False
+                        elif AEC_MODE == "always":
+                            aec_on = True
+                        else:  # adaptive
+                            aec_on = _echo_observe_and_decide(raw_rms, sys_rms)
+                    # LAYER 2 — AEC: cancel the system reference out of the mic (only if echo present).
+                    if ref and aec_on:
+                        cleaned = _aec_clean(wav_path, ref)
+                        if cleaned != wav_path:
+                            _aec_tmp = cleaned
+                            wav_path = cleaned
+                            _rms, _peak = _wav_rms_peak(wav_path)  # gate on the cleaned mic
+                        else:
+                            _rms = raw_rms
+                    else:
+                        _rms = raw_rms
+                    # LAYER 1 — gate: mic below the speech floor = not really talking (faint echo) →
+                    # skip the ASR feed so it never enters the transcript; keep the partial stable.
+                    if _rms is not None and _rms < MIC_GATE_RMS:
+                        partial = _last_partial.get(ch, "")
+                    else:
+                        partial = engines.get_parakeet().stream_feed(wav_path, ch) if active_engine == "parakeet" else ""
+                        _last_partial[ch] = partial
                 else:
+                    # System channel: always transcribe (that's the other speaker), no AEC/gate.
+                    _rms, _peak = _wav_rms_peak(wav_path)
                     partial = engines.get_parakeet().stream_feed(wav_path, ch) if active_engine == "parakeet" else ""
-                    _last_partial[ch] = partial
                 if _aec_tmp:
                     try: os.remove(_aec_tmp)
                     except Exception: pass

@@ -1534,7 +1534,14 @@ async function processStreamLive(
 		if (last) last.endT = fileDurationS;
 		const base = active === "mic" ? micTurnBase : sysTurnBase;
 		const fullPartial = active === "mic" ? micPartial : sysPartial;
-		const text = fullPartial.slice(base).trim();
+		let text = fullPartial.slice(base).trim();
+		// LAYER 3 — live echo dedup: strip from a MIC turn any words that match what the other
+		// speaker said (the system transcript), so their voice leaking into your mic never shows
+		// up under YOUR name. (The 12-recording eval picked this over the signal gate/AEC.)
+		if (text && active === "mic" && sysPartial.trim()) {
+			const dd = await postJSON("/dedup", { mic: text, sys: sysPartial });
+			if (dd && typeof dd.text === "string") text = dd.text.trim();
+		}
 		if (text) send("turn", { id: liveTurnId, channel: active, speaker, text });
 	}
 	lastMicLen = micPartial.length;
@@ -1877,7 +1884,13 @@ async function handleSysRecordStop(): Promise<Response> {
 				const t = turns[i];
 				const next = turns.slice(i + 1).find((x) => x.channel === t.channel);
 				const ft = finalText(t.channel);
-				const text = ft.slice(t.base, next ? next.base : ft.length).trim();
+				let text = ft.slice(t.base, next ? next.base : ft.length).trim();
+				// LAYER 3 — final echo dedup: strip foreign-speaker echo from MIC turns using the
+				// full system transcript, so the saved transcript matches the cleaned live view.
+				if (text && t.channel === "mic" && sysFinal.trim()) {
+					const dd = await postJSON("/dedup", { mic: text, sys: sysFinal });
+					if (dd && typeof dd.text === "string") text = dd.text.trim();
+				}
 				if (!text) continue;
 				let speaker = t.speaker;
 				let auto = false;

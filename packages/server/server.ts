@@ -2,7 +2,10 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, unlink
 import { join, resolve, extname } from "node:path";
 import { homedir, cpus } from "node:os";
 import { downloadFromUrl, normalizeAudio } from "./lib/media.ts";
-const TRANSCRIPTION_SERVER = process.env.HEED_TRANSCRIPTION_URL || "http://127.0.0.1:5002";
+import { APP_DIR, CONFIG_PATH, SESSIONS_DIR, TEMPLATES_DIR, type TrxConfig, ensureAppDirs, loadConfig, saveConfig, micLabel } from "./lib/app-config.ts";
+import { TRANSCRIPTION_SERVER, pyPost as postJSON } from "./lib/transcription-client.ts";
+import { track, gracefulStop, installShutdownHooks } from "./lib/process.ts";
+import { sseResponse } from "./lib/sse.ts";
 
 const PORT = Number(process.env.PORT) || 5001;
 
@@ -22,50 +25,16 @@ const LANGUAGE_NAMES: Record<string, string> = {
 const STATIC_ROOT = join(import.meta.dir, "..", "client", "dist");
 // Recordings stored in the project root
 const UPLOAD_DIR = join(import.meta.dir, "..", "..", "recordings");
-const APP_DIR = join(homedir(), ".heed-app");
-const SESSIONS_DIR = join(APP_DIR, "sessions");
-const TEMPLATES_DIR = join(APP_DIR, "templates");
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
 // Hard fallback only — actual model is read from ~/.heed-app/config.json (set by hardware
 // auto-detection on first launch, or by the user via the model picker modal).
 // Opt-in override ONLY (for power users / tests). No silent hardcoded default — the user
 // must pick the notes model explicitly (see getCurrentModel + the model picker).
 const FALLBACK_MODEL = process.env.HEED_MODEL || null;
-const CONFIG_PATH = join(homedir(), ".heed-app", "config.json");
 
-for (const dir of [UPLOAD_DIR, APP_DIR, SESSIONS_DIR, TEMPLATES_DIR]) {
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-}
-
-// --- Persistent config (current model + GPU layer count) ---
-// Note: this file may also contain legacy CLI fields (language, modelSize, etc.).
-// We preserve those on write so we don't break the old CLI tool.
-interface TrxConfig {
-	ollama_model?: string;
-	ollama_num_gpu?: number; // 0 = CPU-only, undefined = let Ollama decide, 999 = all layers on GPU
-	user_name?: string; // label for the user's own (mic) channel; defaults to "Me"
-	[k: string]: unknown; // forward-compat for legacy keys
-}
-
-// The mic channel is always the user; let them put their real name on it instead of "Me".
-function micLabel(): string {
-	const n = (loadConfig().user_name || "").trim();
-	return n || "Me";
-}
-
-function loadConfig(): TrxConfig {
-	if (existsSync(CONFIG_PATH)) {
-		try {
-			return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-		} catch {}
-	}
-	return {};
-}
-
-function saveConfig(patch: Partial<TrxConfig>) {
-	const merged = { ...loadConfig(), ...patch };
-	writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2));
-}
+// App paths + persistent config (loadConfig/saveConfig/micLabel/TrxConfig) now live in
+// ./lib/app-config.ts — single source of truth (the stale lib/config.ts duplicate was deleted).
+ensureAppDirs([UPLOAD_DIR]);
 
 function getCurrentModel(): string | null {
 	// The model the USER explicitly selected, or null if none chosen yet. We deliberately
@@ -1130,7 +1099,7 @@ async function spawnSyscap(): Promise<{ proc: ReturnType<typeof Bun.spawn> | nul
 	const bin = getSyscapBin();
 	if (!bin) return { proc: null, denied: false };
 	try {
-		const proc = Bun.spawn([bin], { stdout: "pipe", stderr: "pipe" });
+		const proc = track(Bun.spawn([bin], { stdout: "pipe", stderr: "pipe" }));
 		const handshake = await Promise.race([
 			(async () => {
 				const reader = (proc.stderr as ReadableStream).getReader();
@@ -1287,12 +1256,11 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 
 	// CRITICAL for live transcription: force ffmpeg to flush each packet to disk so the WAV file
 	// GROWS continuously. Without this, ffmpeg buffers output in ~256KB (~4s) blocks → the file
-	// stays 0 bytes then jumps in 4s steps. The live loop derives "new audio" from the file SIZE,
-	// so a non-growing file means it never feeds the streaming model → live never appears and the
-	// whole recording is only processed at stop. `-flush_packets 1` makes the file grow in real time.
+	// stays 0 bytes then jumps; the live loop derives "new audio" from the file SIZE, so a
+	// non-growing file means it never feeds the streaming model → live never appears until stop.
 	args.splice(args.length - 1, 0, "-flush_packets", "1");
 
-	recorderProc = Bun.spawn(args, stdinStream ? { stdin: stdinStream, stdout: "pipe", stderr: "pipe" } : { stdout: "pipe", stderr: "pipe" });
+	recorderProc = track(Bun.spawn(args, stdinStream ? { stdin: stdinStream, stdout: "pipe", stderr: "pipe" } : { stdout: "pipe", stderr: "pipe" }));
 
 	// Start PipeWire/BlackHole loopback so browser can visualize system audio (BlackHole path only).
 	if ((mode === "system" || mode === "both") && !usedSyscap) {
@@ -1311,11 +1279,11 @@ function startLevelMeter() {
 	if (!monitor) return;
 
 	// ffmpeg reads the monitor and outputs raw PCM to stdout
-	levelProc = Bun.spawn([
+	levelProc = track(Bun.spawn([
 		"ffmpeg", "-f", AUDIO_FMT, "-i", monitor,
 		"-f", "s16le", "-ar", "16000", "-ac", "1",
 		"-"  // output to stdout
-	], { stdout: "pipe", stderr: "pipe" });
+	], { stdout: "pipe", stderr: "pipe" }));
 
 	// Read stdout in chunks and compute levels
 	const stdout = levelProc.stdout as ReadableStream<Uint8Array>;
@@ -1350,22 +1318,19 @@ function stopLevelMeter() {
 }
 
 function handleSysLevelsSSE(): Response {
-	const encoder = new TextEncoder();
-	const stream = new ReadableStream({
-		start(controller) {
+	// Adopts the shared SSE helper (lib/sse.ts): one place owns the stream/encoder/headers plumbing
+	// and the producer stops cleanly when the client disconnects (sink.closed).
+	return sseResponse((sink) => {
+		return new Promise<void>((resolve) => {
 			const iv = setInterval(() => {
-				try {
-					controller.enqueue(encoder.encode(`data: ${JSON.stringify(sysLevels)}\n\n`));
-				} catch {
+				if (sink.closed) {
 					clearInterval(iv);
+					resolve();
+					return;
 				}
-			}, 50); // 20fps — smooth enough, low overhead
-
-			// Close when recording stops (checked every tick above via try/catch)
-		}
-	});
-	return new Response(stream, {
-		headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+				sink.data(sysLevels); // 20fps audio level meter
+			}, 50);
+		});
 	});
 }
 
@@ -1476,14 +1441,7 @@ function extractChannelSeg(wavPath: string, channelIdx: number, start: number, d
 	return existsSync(segPath) && Bun.file(segPath).size > 1000 ? segPath : null;
 }
 
-async function postJSON(path: string, body: unknown): Promise<any | null> {
-	try {
-		const r = await fetch(`${TRANSCRIPTION_SERVER}${path}`, {
-			method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-		});
-		return r.ok ? await r.json() : null;
-	} catch { return null; }
-}
+// postJSON (→ pyPost) and TRANSCRIPTION_SERVER now come from ./lib/transcription-client.ts.
 
 // Live STREAM mode (Parakeet): persistent ASR session(s) in the sidecar. Each tick feeds ONLY the
 // NEW contiguous audio. MIC → "Me". On DUAL recordings the SYSTEM channel is ALSO streamed (its own
@@ -1843,8 +1801,9 @@ async function handleSysRecordStop(): Promise<Response> {
 		try { syscapProc.kill(); } catch {}
 		syscapProc = null;
 	}
-	recorderProc.kill("SIGINT");
-	await recorderProc.exited.catch(() => {});
+	// SIGINT lets ffmpeg flush the WAV cleanly; gracefulStop adds a SIGKILL fallback so a hung
+	// ffmpeg can't wedge the stop forever (previously this awaited .exited with no timeout).
+	await gracefulStop(recorderProc, 1500, "SIGINT");
 	await new Promise(r => setTimeout(r, 500));
 
 	const path = recorderPath;
@@ -2193,6 +2152,11 @@ const server = Bun.serve({
 		return serveStatic(url.pathname) || new Response("Not Found", { status: 404 });
 	},
 });
+
+// Never leave an orphaned ffmpeg/syscap holding the mic: on SIGINT/SIGTERM/exit, gracefully reap
+// every tracked child (the recorder, the system-audio capture, the level meter). Previously there
+// was NO signal handler — a server crash/exit left ffmpeg running and the mic "stuck busy".
+installShutdownHooks(() => { stopLiveTranscribe(); });
 
 console.log(`
   ┌──────────────────────────────────┐

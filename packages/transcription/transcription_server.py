@@ -81,6 +81,7 @@ diarize_pipeline = None
 # Silicon, via the FluidAudio sidecar — no gated HF token). None = diarization off.
 diarize_backend = None
 models_ready = {"whisper": False, "pyannote": False}
+models_warm = False  # True once the live ASR + diarization are pre-warmed (first record is instant)
 
 # --- Live mic echo gate (Layer 1 of echo handling) ---
 # When YOU aren't really talking, the mic only carries faint LEAKAGE of the system audio (measured
@@ -644,7 +645,7 @@ def _swap_live_model(new_model):
 
 def load_models():
     global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info, diarize_backend
-    global live_governor, _devices, _warmup_path, live_tuning, active_engine
+    global live_governor, _devices, _warmup_path, live_tuning, active_engine, models_warm
 
     devices = get_device_config()
     _devices = devices
@@ -763,6 +764,7 @@ def load_models():
     if engine_kind == "parakeet":
         warm_clip = _warmup_path
         def _prewarm_stream():
+            global models_warm
             try:
                 eng = engines.get_parakeet()
                 have_clip = bool(warm_clip) and os.path.exists(warm_clip)
@@ -775,10 +777,18 @@ def load_models():
                 if have_clip:
                     eng.diar_feed(warm_clip)
                 eng.diar_finish()
+                models_warm = True
                 print("[heed] Live models pre-warmed (ASR mic+sys + diarization) — first record is instant", flush=True)
             except Exception as e:
+                models_warm = True  # don't block recording forever if warm fails
                 print(f"[heed] Stream pre-warm skipped: {str(e)[:80]}", flush=True)
-        threading.Thread(target=_prewarm_stream, daemon=True).start()
+        # SYNCHRONOUS: load_models (itself a background thread) doesn't report fully done until the
+        # warm finishes, and /health exposes `warm`. The recorder waits for `warm` before starting
+        # so the FIRST record never contends with the warm-up (the old cold-start). The Sortformer
+        # model load (~the cost) happens here, once, up front.
+        _prewarm_stream()
+    else:
+        models_warm = True  # non-parakeet engines have no streaming pre-warm gate
 
     # Now safe to go offline for pyannote
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -1456,6 +1466,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json({
                 "ready": all(models_ready.values()),
+                "warm": models_warm,
                 **models_ready,
                 "whisper_info": whisper_runtime_info,
                 "pyannote_info": pyannote_runtime_info,

@@ -1345,6 +1345,7 @@ let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
 // NEW audio since lastStreamOffset each tick and show the model's append-only partial.
 let lastStreamOffset = 0;
 let streamStarted = false;
+let liveWarmLatched = false; // once the sidecar reports warm, stop polling (server stays warm)
 // Karaoke turn-tracking: split the two append-only partials (mic + sys) into CHRONOLOGICAL turns
 // so the live transcript interleaves "Me / Speaker 1 / Me / Speaker 2 …" instead of two blocks.
 let liveTurnId = 0;
@@ -1452,6 +1453,16 @@ async function processStreamLive(
 	send: (event: string, data: unknown) => void,
 ): Promise<void> {
 	if (!existsSync(wavPath)) return;
+	// Wait for the models to be WARM before the first feed, so the first record never contends with
+	// the boot-time pre-warm (the cold-start). The recorder keeps capturing meanwhile, so no audio
+	// is lost — live text just starts once warm. Latches true (the server stays warm after boot).
+	if (!liveWarmLatched) {
+		try {
+			const h = await fetch(`${TRANSCRIPTION_SERVER}/health`, { signal: AbortSignal.timeout(1000) }).then((r) => r.json()).catch(() => null);
+			if (h?.warm) liveWarmLatched = true;
+			else return; // not warm yet — skip this tick, recorder still capturing
+		} catch { return; }
+	}
 	if (!streamStarted) {
 		const ok = await postJSON("/stream/start", { language: lang, channel: "mic" });
 		if (!ok) return;

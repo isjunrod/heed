@@ -176,16 +176,23 @@ while let line = readLine() {
             _ = try await ensureDiarStream()
             emit(["ok": true])
         case "diar-feed":
-            // Append the NEW audio; return the current finalized speaker timeline (stable).
+            // Append the NEW audio; return the LIVE speaker timeline. Include tentative segments,
+            // not just finalized, so a speaker shows up in ~1-2s instead of waiting ~5s for the
+            // Sortformer confirmation delay. Tentative labels may shift slightly but the live UI
+            // refines them, and the one-shot diarize at stop gives the precise final timeline.
             guard let wav = req["wav"] as? String, let d = diarStream else {
                 emit(["ok": false, "error": "no diar session"]); continue
             }
             let samples = try converter.resampleAudioFile(path: wav)
             d.addAudio(samples)
             _ = try d.process()
-            let segs = d.timeline.speakers.values.flatMap { $0.finalizedSegments }
-                .sorted { $0.startTime < $1.startTime }
-                .map { ["speaker": $0.speakerIndex, "start": Double($0.startTime), "end": Double($0.endTime)] as [String: Any] }
+            var allSegs: [DiarizerSegment] = []
+            for sp in d.timeline.speakers.values {
+                allSegs.append(contentsOf: sp.finalizedSegments)
+                allSegs.append(contentsOf: sp.tentativeSegments)
+            }
+            allSegs.sort { $0.startTime < $1.startTime }
+            let segs = allSegs.map { ["speaker": $0.speakerIndex, "start": Double($0.startTime), "end": Double($0.endTime)] as [String: Any] }
             emit(["ok": true, "segments": segs])
         case "diar-finish":
             guard let d = diarStream else { emit(["ok": false, "error": "no diar session"]); continue }

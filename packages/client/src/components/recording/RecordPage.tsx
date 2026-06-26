@@ -1,6 +1,10 @@
 import { useRef, useEffect, useState } from "react";
 import { useRecording } from "@/hooks/useRecording.ts";
 import { useRecordingStore } from "@/stores/recording.ts";
+import {
+	useIsRecording, useIsProcessing, useProcessStep, useSegments,
+	useTranscript, useLiveQuality, useCurrentSessionId, useSeconds,
+} from "@/stores/selectors.ts";
 import { useLocalStorage } from "@/hooks/useLocalStorage.ts";
 import { RecordButton } from "./RecordButton.tsx";
 import { Timer } from "./Timer.tsx";
@@ -8,6 +12,7 @@ import { Visualizer } from "./Visualizer.tsx";
 import vizStyles from "./Visualizer.module.css";
 import { LanguageSelect } from "./LanguageSelect.tsx";
 import { ResultCard } from "./ResultCard.tsx";
+import { ErrorBoundary } from "@/components/ErrorBoundary.tsx";
 import styles from "./RecordPage.module.css";
 
 const FAST_PROCESS_MESSAGES_EN = [
@@ -30,8 +35,15 @@ export function RecordPage() {
 		getLanguage: () => language,
 	});
 
-	const { recording, processing, processStep, segments, transcript } = useRecordingStore();
-	const liveQuality = useRecordingStore((s) => s.liveQuality);
+	// Atomic selectors (stores/selectors.ts): subscribe to the narrowest slices instead of the whole
+	// store, so RecordPage doesn't re-render on every unrelated store write (e.g. live segment ticks).
+	const recording = useIsRecording();
+	const processing = useIsProcessing();
+	const processStep = useProcessStep();
+	const segments = useSegments();
+	const transcript = useTranscript();
+	const liveQuality = useLiveQuality();
+	const currentSessionId = useCurrentSessionId();
 	// Show result card when recording (live preview) or after stop (final result)
 	const showResult = recording || processing || segments.length > 0 || !!transcript;
 	// Block recording button while processing (transcribing + diarizing after stop)
@@ -78,7 +90,7 @@ export function RecordPage() {
 	return (
 		<div>
 			<div className={styles.center}>
-				<Timer seconds={useRecordingStore((s) => s.seconds)} />
+				<Timer seconds={useSeconds()} />
 				<div className={vizStyles.dualWrap}>
 					<Visualizer ref={micBars} barCount={24} variant="mic" label="Microphone" />
 					<Visualizer ref={systemBars} barCount={24} variant="system" label="System" />
@@ -109,7 +121,13 @@ export function RecordPage() {
 				)}
 			</div>
 
-			{showResult && <ResultCard />}
+			{/* Transcript view is isolated: a render crash here must never take down the page or the
+			    record/stop controls above. Auto-recovers when a new session loads (resetKeys). */}
+			{showResult && (
+				<ErrorBoundary resetKeys={[currentSessionId]}>
+					<ResultCard />
+				</ErrorBoundary>
+			)}
 		</div>
 	);
 }

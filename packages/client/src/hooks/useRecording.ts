@@ -8,6 +8,7 @@ import { useUIStore } from "@/stores/ui.ts";
 import { useHealthStore } from "@/stores/health.ts";
 import { fmtDate } from "@/lib/format.ts";
 import { resolveLanguage } from "@/lib/languages.ts";
+import { subscribeLiveEvents } from "@/lib/liveEvents.ts";
 
 // Always send a language the ACTIVE engine can transcribe (Parakeet has no auto-detect),
 // resolved at send-time from the live health info — independent of UI render timing.
@@ -80,28 +81,14 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 				if (!useRecordingStore.getState().recording) return;
 				const liveLang = encodeURIComponent(effectiveLanguage(getLanguage()));
 				liveEventRef.current = new EventSource(`/api/sysrecord/live?lang=${liveLang}`);
-				// "segment" = chunk mode (append, Whisper/CPU); "live" = full mode (replace, Parakeet/MLX).
-				liveEventRef.current.addEventListener("segment", (e) => {
-					try {
-						useRecordingStore.getState().appendSegment(JSON.parse(e.data));
-					} catch {}
-				});
-				liveEventRef.current.addEventListener("live", (e) => {
-					try {
-						useRecordingStore.getState().setLiveSegment(JSON.parse(e.data));
-					} catch {}
-				});
-				// "turn" = stream mode (karaoke): chronological turns, upsert by id.
-				liveEventRef.current.addEventListener("turn", (e) => {
-					try {
-						useRecordingStore.getState().upsertLiveTurn(JSON.parse(e.data));
-					} catch {}
-				});
-				// Audio-quality hint (heed differentiator): warn when the mic is too quiet/echoey.
-				liveEventRef.current.addEventListener("quality", (e) => {
-					try {
-						useRecordingStore.getState().setLiveQuality(JSON.parse(e.data));
-					} catch {}
+				// Typed live-transcription contract (@heed/shared). Each live MODE produces one event:
+				//   segment = chunk mode (append, Whisper/CPU) · live = full mode (replace, Parakeet/MLX)
+				//   turn = stream mode (karaoke, upsert by id) · quality = audio-quality hint (heed diff).
+				subscribeLiveEvents(liveEventRef.current, {
+					segment: (seg) => useRecordingStore.getState().appendSegment(seg),
+					live: (seg) => useRecordingStore.getState().setLiveSegment(seg),
+					turn: (turn) => useRecordingStore.getState().upsertLiveTurn(turn),
+					quality: (q) => useRecordingStore.getState().setLiveQuality(q),
 				});
 				liveEventRef.current.onerror = () => {
 					liveEventRef.current?.close();

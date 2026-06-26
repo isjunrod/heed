@@ -678,15 +678,31 @@ def load_models():
         live_tuning = {"chunk_s": 3.0, "interval_ms": 2000, "mode": "chunk"}
     print(f"[heed] Live: mode={live_tuning['mode']} interval={live_tuning['interval_ms']}ms ({engine_kind})", flush=True)
 
-    # Pre-warm the streaming model in the BACKGROUND so the FIRST recording doesn't stall on a
-    # ~30s download / model load. "en" loads the shared 'latin' variant that also covers
-    # es/fr/it/pt/de (most users), so the first real record is instant. Non-blocking: the server
-    # is ready immediately; the warm finishes in the background within seconds of boot.
+    # Pre-warm the live models in the BACKGROUND so the FIRST recording is instant (no cold-start
+    # stall). Warms THREE things that previously lazy-loaded on the first record:
+    #   - streaming ASR on BOTH channels (dual records use mic+sys): "en" loads the shared 'latin'
+    #     variant that also covers es/fr/it/pt/de (most users);
+    #   - the streaming DIARIZATION model (Sortformer) — this was the main culprit: it lazy-loaded
+    #     on the first diar-start, so diarization took several seconds the first time only;
+    # and exercises the first ANE inference compile with a tiny silent clip.
+    # Non-blocking: the server is ready immediately; the warm finishes within seconds of boot. If
+    # the user records before it finishes, the lazy path still works (just the old cold-start).
     if engine_kind == "parakeet":
+        warm_clip = _warmup_path
         def _prewarm_stream():
             try:
-                engines.get_parakeet().stream_start("en")
-                print("[heed] Live streaming model pre-warmed (ready for instant first record)", flush=True)
+                eng = engines.get_parakeet()
+                have_clip = bool(warm_clip) and os.path.exists(warm_clip)
+                for ch in ("mic", "sys"):
+                    eng.stream_start("en", ch)
+                    if have_clip:
+                        eng.stream_feed(warm_clip, ch)
+                    eng.stream_finish(ch)
+                eng.diar_start()
+                if have_clip:
+                    eng.diar_feed(warm_clip)
+                eng.diar_finish()
+                print("[heed] Live models pre-warmed (ASR mic+sys + diarization) — first record is instant", flush=True)
             except Exception as e:
                 print(f"[heed] Stream pre-warm skipped: {str(e)[:80]}", flush=True)
         threading.Thread(target=_prewarm_stream, daemon=True).start()

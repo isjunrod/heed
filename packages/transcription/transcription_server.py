@@ -92,7 +92,11 @@ models_warm = False  # True once the live ASR + diarization are pre-warmed (firs
 # 0.0201 — so 0.016 separates them with margin both ways. Tunable per setup.
 # Default OFF: a 12-recording eval showed the energy gate cut the user's own quiet speech more than
 # it removed echo (the text dedup, Layer 3, handles echo far better). Kept tunable for heavy-leak setups.
-MIC_GATE_RMS = float(os.environ.get("HEED_MIC_GATE_RMS", "0"))
+MIC_GATE_RMS = float(os.environ.get("HEED_MIC_GATE_RMS", "0"))  # absolute gate (off by default)
+# Relative echo gate (default ON): gate the mic when the system is playing (sys RMS > active) AND
+# the mic is echo-level relative to it (mic RMS < ratio * sys RMS). Stable, no transcript lag.
+SYS_ACTIVE_RMS = float(os.environ.get("HEED_SYS_ACTIVE_RMS", "0.02"))
+ECHO_GATE_RATIO = float(os.environ.get("HEED_ECHO_GATE_RATIO", "0.2"))  # conservative: only clear echo
 _last_partial = {}  # channel -> last partial returned, so a gated tick keeps the text stable
 
 # --- Live AEC (Layer 2 of echo handling): WebRTC AEC3 via the LiveKit SDK ---
@@ -1213,7 +1217,7 @@ def _renumber_speakers(segments):
     return [{**s, "speaker": mapping[s["speaker"]]} for s in segments]
 
 
-def _diarize_parakeet(wav_path, srt_path=None):
+def _diarize_parakeet(wav_path, srt_path=None, recognize_only=False):
     """Diarization via the FluidAudio sidecar (Apple Silicon, no gated token).
     Returns the SAME contract as the pyannote path so callers don't branch.
     Cross-session voice naming works here too: the sidecar exposes per-speaker WeSpeaker
@@ -1245,7 +1249,7 @@ def _diarize_parakeet(wav_path, srt_path=None):
 
     # Cross-session voice recognition: match each speaker's voiceprint to known voices,
     # auto-rename on a hit (decision 3), and average the profile in (decision 4).
-    speaker_embeddings, auto_named = _name_known_voices(speakers_map, raw_embeddings, diar_segments)
+    speaker_embeddings, auto_named = _name_known_voices(speakers_map, raw_embeddings, diar_segments, recognize_only)
 
     if srt_path and os.path.exists(srt_path):
         srt_segments = parse_srt(srt_path)
@@ -1273,7 +1277,7 @@ def _diarize_parakeet(wav_path, srt_path=None):
     }
 
 
-def _name_known_voices(speakers_map, raw_embeddings, diar_segments):
+def _name_known_voices(speakers_map, raw_embeddings, diar_segments, recognize_only=False):
     """Given raw-sid->label map + raw-sid->embedding, match each speaker against saved voices
     (current backend). On a hit: rename the label IN PLACE in diar_segments, mark it auto, and
     average the embedding into the stored profile. Returns (speaker_embeddings, auto_named)
@@ -1291,7 +1295,8 @@ def _name_known_voices(speakers_map, raw_embeddings, diar_segments):
         if matched and matched != label:
             rename[label] = matched
             auto_named[matched] = {"name": matched, "score": round(float(score), 3)}
-            update_voice(matched, emb, backend)
+            if not recognize_only:  # live recognition just reads; only the final pass averages/saves
+                update_voice(matched, emb, backend)
     if rename:
         for s in diar_segments:
             if s["speaker"] in rename:
@@ -1300,9 +1305,9 @@ def _name_known_voices(speakers_map, raw_embeddings, diar_segments):
     return speaker_embeddings, auto_named
 
 
-def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None):
+def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None, recognize_only=False):
     if diarize_backend == "parakeet":
-        return _diarize_parakeet(wav_path, srt_path)
+        return _diarize_parakeet(wav_path, srt_path, recognize_only)
     # Tune clustering for accuracy (slightly conservative to avoid splitting same voice)
     params = diarize_pipeline.parameters(instantiated=True)
     params["clustering"]["threshold"] = 0.8
@@ -1627,31 +1632,33 @@ class Handler(BaseHTTPRequestHandler):
                 ref = body.get("ref_wav_path")
                 _aec_tmp = None
                 if ch == "mic":
-                    # Raw mic + system levels → adaptive AEC decision (only cancel real echo).
                     raw_rms, _peak = _wav_rms_peak(wav_path)
-                    aec_on = True
+                    sys_rms = 0.0
+                    aec_on = False
                     if ref:
                         sys_rms, _ = _wav_rms_peak(ref)
-                        if AEC_MODE == "off":
-                            aec_on = False
-                        elif AEC_MODE == "always":
+                        if AEC_MODE == "always":
                             aec_on = True
-                        else:  # adaptive
+                        elif AEC_MODE == "adaptive":
                             aec_on = _echo_observe_and_decide(raw_rms, sys_rms)
-                    # LAYER 2 — AEC: cancel the system reference out of the mic (only if echo present).
+                    # LAYER 2 — AEC (default off): cancel the system reference out of the mic.
                     if ref and aec_on:
                         cleaned = _aec_clean(wav_path, ref)
                         if cleaned != wav_path:
-                            _aec_tmp = cleaned
-                            wav_path = cleaned
-                            _rms, _peak = _wav_rms_peak(wav_path)  # gate on the cleaned mic
+                            _aec_tmp = cleaned; wav_path = cleaned
+                            _rms, _peak = _wav_rms_peak(wav_path)
                         else:
                             _rms = raw_rms
                     else:
                         _rms = raw_rms
-                    # LAYER 1 — gate: mic below the speech floor = not really talking (faint echo) →
-                    # skip the ASR feed so it never enters the transcript; keep the partial stable.
-                    if _rms is not None and _rms < MIC_GATE_RMS:
+                    # RELATIVE ECHO GATE (stable, no lag): gate the mic ONLY when the system is
+                    # actively playing AND the mic is echo-level relative to it (mic << system).
+                    # This kills the other voice leaking into the mic while you're listening, WITHOUT
+                    # cutting your own speech when nothing is playing (the flaw of an absolute gate).
+                    # Double-talk (you + them, mic hot) passes through and is cleaned by the stop dedup.
+                    relative_echo = (ref and sys_rms > SYS_ACTIVE_RMS and raw_rms < ECHO_GATE_RATIO * sys_rms)
+                    absolute_low = (_rms is not None and MIC_GATE_RMS > 0 and _rms < MIC_GATE_RMS)
+                    if relative_echo or absolute_low:
                         partial = _last_partial.get(ch, "")
                     else:
                         partial = engines.get_parakeet().stream_feed(wav_path, ch) if active_engine == "parakeet" else ""
@@ -1764,6 +1771,7 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("srt_path"),
                 body.get("min_speakers"),
                 body.get("max_speakers"),
+                bool(body.get("recognize_only", False)),
             )
             result["time_ms"] = int((time.time() - t) * 1000)
             self._json(result)

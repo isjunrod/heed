@@ -1346,6 +1346,12 @@ let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
 let lastStreamOffset = 0;
 let streamStarted = false;
 let liveWarmLatched = false; // once the sidecar reports warm, stop polling (server stays warm)
+// Real-time voice recognition: periodically re-run the one-shot diarize (which matches saved voices)
+// on the system channel and cache the recognized timeline, so live speakers get their saved NAME
+// (e.g. "Learn") instead of "Speaker N" while recording — not only at stop.
+let liveRecog: Array<{ speaker: string; start: number; end: number }> = [];
+let recogBusy = false;
+let lastRecogAt = 0;
 // Karaoke turn-tracking: split the two append-only partials (mic + sys) into CHRONOLOGICAL turns
 // so the live transcript interleaves "Me / Speaker 1 / Me / Speaker 2 …" instead of two blocks.
 let liveTurnId = 0;
@@ -1508,7 +1514,33 @@ async function processStreamLive(
 			// Live speaker = whoever is talking NOW (the latest diarization segment).
 			const segs: Array<{ speaker: string; start: number; end: number }> = dx?.segments || [];
 			if (segs.length) sysSpeaker = segs[segs.length - 1].speaker;
+			// REAL-TIME voice recognition: if the periodic one-shot recognition matched a saved
+			// voice overlapping NOW, use its NAME (e.g. "Learn") instead of the raw "Speaker N".
+			if (liveRecog.length) {
+				let best: string | null = null, bestOv = 0;
+				for (const r of liveRecog) {
+					const ov = Math.min(fileDurationS, r.end) - Math.max(fileDurationS - 3, r.start);
+					if (ov > bestOv) { bestOv = ov; best = r.speaker; }
+				}
+				if (best) sysSpeaker = best;
+			}
 		} finally { try { unlinkSync(sysSeg); } catch {} }
+	}
+	// Kick off periodic voice recognition on the full system channel (~every 8s), fire-and-forget:
+	// the one-shot diarize matches saved voices; we cache the recognized timeline for the label above.
+	if (isDual && !recogBusy && fileDurationS - lastRecogAt > 8) {
+		recogBusy = true; lastRecogAt = fileDurationS;
+		(async () => {
+			try {
+				const sysFull = extractChannelSeg(wavPath, 1, 0, fileDurationS);
+				if (sysFull) {
+					const diar = await postJSON("/diarize", { wav_path: sysFull, recognize_only: true });
+					if (diar?.segments) liveRecog = diar.segments;
+					try { unlinkSync(sysFull); } catch {}
+				}
+			} catch {}
+			recogBusy = false;
+		})();
 	}
 
 	// --- Karaoke turn assignment ---
@@ -1534,14 +1566,11 @@ async function processStreamLive(
 		if (last) last.endT = fileDurationS;
 		const base = active === "mic" ? micTurnBase : sysTurnBase;
 		const fullPartial = active === "mic" ? micPartial : sysPartial;
-		let text = fullPartial.slice(base).trim();
-		// LAYER 3 — live echo dedup: strip from a MIC turn any words that match what the other
-		// speaker said (the system transcript), so their voice leaking into your mic never shows
-		// up under YOUR name. (The 12-recording eval picked this over the signal gate/AEC.)
-		if (text && active === "mic" && sysPartial.trim()) {
-			const dd = await postJSON("/dedup", { mic: text, sys: sysPartial });
-			if (dd && typeof dd.text === "string") text = dd.text.trim();
-		}
+		const text = fullPartial.slice(base).trim();
+		// NOTE: no live text-dedup here — it re-processed the whole turn each tick against the
+		// growing system transcript, which made stable lines get rewritten (append-only broke).
+		// Live echo is handled at the AUDIO level (the relative gate in /stream/feed, stable +
+		// no lag); the final transcript is cleaned by the dedup at stop.
 		if (text) send("turn", { id: liveTurnId, channel: active, speaker, text });
 	}
 	lastMicLen = micPartial.length;
@@ -1802,6 +1831,9 @@ function stopLiveTranscribe() {
 	lastMicLen = 0;
 	lastSysLen = 0;
 	liveTurns = [];
+	liveRecog = [];
+	recogBusy = false;
+	lastRecogAt = 0;
 	// Any in-flight whisper call will still complete but its result will be
 	// dropped because processChunk checks `!recorderProc` at the top.
 }

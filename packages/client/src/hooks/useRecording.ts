@@ -174,7 +174,7 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 		store.stopRecording();
 
 		try {
-			const { path, streaming, streamText, turns, embeddings, autoNamed } = await recordingApi.stop();
+			const { path, streaming, streamText, turns, embeddings, autoNamed } = await recordingApi.stop(effectiveLanguage(getLanguage()));
 			await finalizeRecording(path, streaming, streamText, turns, embeddings, autoNamed);
 		} catch (e) {
 			showToast(`Stop failed: ${(e as Error).message}`);
@@ -185,18 +185,17 @@ export function useRecording({ micBars, systemBars, getLanguage }: UseRecordingO
 		audioPath: string,
 		streaming?: boolean,
 		streamText?: string,
-		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; auto?: boolean }>,
+		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; start?: number; end?: number; auto?: boolean }>,
 		embeddings?: Record<string, number[]>,
 		_autoNamed?: Record<string, { name: string; score: number }>,
 	) => {
 		const lang = effectiveLanguage(getLanguage());
 		const seconds = useRecordingStore.getState().seconds;
 
-		// SEAMLESS stop (streaming): keep the live KARAOKE turns IN PLACE — the server already
-		// refined each turn's final text + precise system speaker, and auto-named recognized voices.
-		// No re-transcribe, no re-collapse.
+		// AUTHORITATIVE stop: the server re-transcribed the whole recording via /finalize, so each
+		// turn now carries REAL start/end timestamps + coherent segmentation + echo-free attribution.
 		if (streaming && turns && turns.length) {
-			const segments = turns.map((t) => ({ id: t.id, speaker: t.speaker, channel: t.channel, text: t.text, start: 0, end: 0, auto: t.auto }));
+			const segments = turns.map((t) => ({ id: t.id, speaker: t.speaker, channel: t.channel, text: t.text, start: t.start ?? 0, end: t.end ?? 0, auto: t.auto }));
 			const text = turns.map((t) => t.text).join("\n");
 			const words = text.split(/\s+/).filter(Boolean);
 			if (words.length === 0) {

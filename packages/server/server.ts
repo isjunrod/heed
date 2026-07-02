@@ -963,6 +963,56 @@ function handleInstallFfmpeg(): Response {
 	return spawnSSEStream(cmd);
 }
 
+// Start a locally-installed Ollama that isn't running yet (the common "installed but not up" case).
+// Spawns `ollama serve` in the background and polls until the API answers, so the header badge can
+// go green without the user touching a terminal. No-op (fast success) if it's already up.
+async function handleStartOllama(): Promise<Response> {
+	if (await isOllamaRunning()) {
+		return Response.json({ running: true, alreadyRunning: true });
+	}
+	if (!which("ollama")) {
+		return Response.json({ running: false, error: "Ollama is not installed" }, { status: 400 });
+	}
+	try {
+		// Detached: outlives this request and keeps serving (same pattern as desktop/main.py).
+		Bun.spawn(["ollama", "serve"], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+	} catch (e) {
+		return Response.json({ running: false, error: (e as Error).message }, { status: 500 });
+	}
+	// Poll up to ~6s for the API to come up.
+	for (let i = 0; i < 12; i++) {
+		await new Promise((r) => setTimeout(r, 500));
+		if (await isOllamaRunning()) return Response.json({ running: true });
+	}
+	return Response.json({ running: false, error: "Ollama did not start in time" }, { status: 504 });
+}
+
+// Launch the floating desktop panel (Chrome/Chromium --app window that floats over Zoom/Meet).
+// Works on macOS and Linux — desktop/main.py finds chrome/chromium and, on Linux, uses wmctrl to
+// pin it always-on-top. Detached like handleStartOllama so it outlives this request.
+async function handleDesktopFloat(): Promise<Response> {
+	const python = which("python3") || which("python");
+	if (!python) {
+		return Response.json({ ok: false, error: "python3 is not installed" }, { status: 400 });
+	}
+	const script = join(import.meta.dir, "..", "desktop", "main.py");
+	if (!existsSync(script)) {
+		return Response.json({ ok: false, error: "desktop panel script not found" }, { status: 500 });
+	}
+	// --prod: the button only exists in the built app, which serves on the prod port.
+	try {
+		Bun.spawn([python, script, "--prod"], {
+			cwd: join(import.meta.dir, "..", ".."),
+			stdout: "ignore",
+			stderr: "ignore",
+			stdin: "ignore",
+		});
+	} catch (e) {
+		return Response.json({ ok: false, error: (e as Error).message }, { status: 500 });
+	}
+	return Response.json({ ok: true });
+}
+
 // --- Sessions CRUD ---
 function handleListSessions(): Response {
 	const files = readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".json"));
@@ -1262,57 +1312,62 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 
 	recorderProc = track(Bun.spawn(args, stdinStream ? { stdin: stdinStream, stdout: "pipe", stderr: "pipe" } : { stdout: "pipe", stderr: "pipe" }));
 
-	// Start PipeWire/BlackHole loopback so browser can visualize system audio (BlackHole path only).
-	if ((mode === "system" || mode === "both") && !usedSyscap) {
-		startLevelMeter();
+	// Feed the System (green) visualizer. We sample the growing recorder WAV directly instead of
+	// spawning a second ffmpeg on the monitor device — this works whether the system channel comes
+	// from ScreenCaptureKit (mac default) OR a BlackHole/PipeWire monitor (Linux). Channel layout:
+	// dual-capture WAV is stereo (L=mic, R=system) so system is channel 1; system-only WAV is mono.
+	if ((mode === "system" || mode === "both") && haveSystem) {
+		startLevelMeter(recorderPath, isDual ? 2 : 1, isDual ? 1 : 0);
 	}
 
 	return Response.json({ recording: true, mode, path: recorderPath, source: usedSyscap ? "screencapturekit" : (monitor ? "system-monitor" : "mic-only"), monitor: monitor || null, mic });
 }
 
-// --- System audio level meter via ffmpeg reading monitor source ---
-let levelProc: ReturnType<typeof Bun.spawn> | null = null;
+// --- System audio level meter (24-bin RMS of the System channel) ---
+// Instead of a second ffmpeg on the monitor device (which doesn't exist under ScreenCaptureKit),
+// we periodically sample the TAIL of the growing recorder WAV. The recorder writes with
+// -flush_packets 1, so the file grows continuously and the newest ~100ms of PCM is always readable.
+// This is source-agnostic: it works for SCK (mac) and BlackHole/PipeWire (Linux) alike.
+let levelInterval: ReturnType<typeof setInterval> | null = null;
 let sysLevels: number[] = new Array(24).fill(0);
+const WAV_HEADER_BYTES = 44; // canonical PCM WAV header ffmpeg emits
 
-function startLevelMeter() {
-	const monitor = getMonitorSource();
-	if (!monitor) return;
+function startLevelMeter(path: string, channels: number, sysChannel: number) {
+	const bytesPerFrame = 2 * channels;      // s16le → 2 bytes/sample
+	const windowFrames = 1600;               // ~100ms @ 16kHz
+	const windowBytes = windowFrames * bytesPerFrame;
 
-	// ffmpeg reads the monitor and outputs raw PCM to stdout
-	levelProc = track(Bun.spawn([
-		"ffmpeg", "-f", AUDIO_FMT, "-i", monitor,
-		"-f", "s16le", "-ar", "16000", "-ac", "1",
-		"-"  // output to stdout
-	], { stdout: "pipe", stderr: "pipe" }));
-
-	// Read stdout in chunks and compute levels
-	const stdout = levelProc.stdout as ReadableStream<Uint8Array>;
-	(async () => {
-		const reader = stdout.getReader();
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			// value is Uint8Array of 16-bit PCM samples
-			const samples = new Int16Array(value.buffer, value.byteOffset, Math.floor(value.byteLength / 2));
-			if (samples.length < 24) continue;
-			const binSize = Math.floor(samples.length / 24);
-			for (let i = 0; i < 24; i++) {
+	levelInterval = setInterval(async () => {
+		try {
+			const file = Bun.file(path);
+			const size = file.size;
+			if (size <= WAV_HEADER_BYTES + bytesPerFrame) return;
+			// Read the newest window, aligned to a frame boundary so channel order stays correct.
+			let start = size - windowBytes;
+			if (start < WAV_HEADER_BYTES) start = WAV_HEADER_BYTES;
+			start = WAV_HEADER_BYTES + Math.floor((start - WAV_HEADER_BYTES) / bytesPerFrame) * bytesPerFrame;
+			const buf = new Uint8Array(await file.slice(start, size).arrayBuffer());
+			const view = new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 2));
+			const nFrames = Math.floor(view.length / channels);
+			if (nFrames < 24) return;
+			const binSize = Math.floor(nFrames / 24);
+			for (let b = 0; b < 24; b++) {
 				let sumSq = 0;
 				for (let j = 0; j < binSize; j++) {
-					const s = samples[i * binSize + j] || 0;
+					const s = view[(b * binSize + j) * channels + sysChannel] || 0;
 					sumSq += s * s;
 				}
 				const rms = Math.sqrt(sumSq / binSize) / 32768;
-				sysLevels[i] = Math.round(Math.pow(rms, 0.5) * 255);
+				sysLevels[b] = Math.round(Math.pow(rms, 0.5) * 255);
 			}
-		}
-	})().catch(() => {});
+		} catch {}
+	}, 50);
 }
 
 function stopLevelMeter() {
-	if (levelProc) {
-		try { levelProc.kill(); } catch {}
-		levelProc = null;
+	if (levelInterval) {
+		clearInterval(levelInterval);
+		levelInterval = null;
 	}
 	sysLevels = new Array(24).fill(0);
 }
@@ -1346,12 +1401,26 @@ let liveChunkProcessing = false; // lock to prevent concurrent whisper calls
 let lastStreamOffset = 0;
 let streamStarted = false;
 let liveWarmLatched = false; // once the sidecar reports warm, stop polling (server stays warm)
-// Real-time voice recognition: periodically re-run the one-shot diarize (which matches saved voices)
-// on the system channel and cache the recognized timeline, so live speakers get their saved NAME
-// (e.g. "Learn") instead of "Speaker N" while recording — not only at stop.
-let liveRecog: Array<{ speaker: string; start: number; end: number }> = [];
-let recogBusy = false;
+// Live speaker label: the periodic offline-rolling diarization (/diar/live) runs the same engine as
+// the post-stop on a rolling window of the sys channel and returns the STABLE, conservatively-named
+// speaker talking NOW. Cached here and refreshed ~every DIAR_LIVE_STEP_S. See eval_diar/DIAR_TUNING.md.
+let liveSpeakerNow = "Speaker 1";   // display (name or generic) shown for the current sys speaker
+let liveSpeakerLabel = "Speaker 1"; // stable session identity — turns are keyed by this so a speaker
+                                    // refining from "Speaker 1" to "Learn" updates in place, not split
+// Voice-RAG MIC filter: is the current mic audio the OWNER (Junior)? When false, the mic feed is gated
+// so external audio the laptop mic picks up (a TV in the room, another person) never enters HIS
+// transcript — the case the echo layers can't touch (no system reference for external audio).
+let micIsOwner = true;
+let micFilterBusy = false;
+let lastMicFilterAt = 0;
+let recogBusy = false;      // a /diar/live call is in flight (fire-and-forget throttle)
 let lastRecogAt = 0;
+const DIAR_LIVE_WINDOW_S = 240; // LARGE rolling window (~4min) so the diarizer clusters with near-global
+                                // context = post-stop quality (a speaker is ONE cluster, not split). A
+                                // 30s window had too little context and split one speaker into many.
+const DIAR_LIVE_STEP_S = 2;     // cadence — re-diarize the big window every 2s on the GPU sidecar
+                                // (~0.6s/run, no ASR contention). Label settles in ~2-3s; text instant.
+const MIC_FILTER_WINDOW_S = 30; // the mic voice-filter only needs the CURRENT voice → small window (cheap)
 // Karaoke turn-tracking: split the two append-only partials (mic + sys) into CHRONOLOGICAL turns
 // so the live transcript interleaves "Me / Speaker 1 / Me / Speaker 2 …" instead of two blocks.
 let liveTurnId = 0;
@@ -1482,7 +1551,9 @@ async function processStreamLive(
 	const fileSize = Bun.file(wavPath).size;
 	const fileDurationS = (fileSize - 44) / (isDual ? 64000 : 32000);
 	const newAudio = fileDurationS - lastStreamOffset;
-	if (newAudio < 0.4) return; // wait until ~0.4s of new audio accumulated
+	// First feed fires at 0.2s so the very first words appear ~twice as fast; steady state stays 0.4s.
+	const minNew = lastStreamOffset === 0 ? 0.2 : 0.4;
+	if (newAudio < minNew) return;
 	const start = lastStreamOffset;
 	lastStreamOffset = fileDurationS;
 
@@ -1497,7 +1568,7 @@ async function processStreamLive(
 	const sysSeg = isDual ? extractChannelSeg(wavPath, 1, start, newAudio) : null;
 	if (micSeg) {
 		try {
-			const tx = await postJSON("/stream/feed", { wav_path: micSeg, channel: "mic", audio_s: newAudio, ref_wav_path: sysSeg || undefined });
+			const tx = await postJSON("/stream/feed", { wav_path: micSeg, channel: "mic", audio_s: newAudio, ref_wav_path: sysSeg || undefined, mic_is_owner: micIsOwner });
 			if (tx) {
 				micPartial = (tx.partial || "");
 				if (tx.quality) send("quality", tx.quality.ok === false ? { ok: false, reason: tx.quality.reason, hint: tx.quality.hint } : { ok: true });
@@ -1506,40 +1577,54 @@ async function processStreamLive(
 	}
 	if (isDual && sysSeg) {
 		try {
-			const [sx, dx] = await Promise.all([
-				postJSON("/stream/feed", { wav_path: sysSeg, channel: "sys", audio_s: newAudio }),
-				postJSON("/diar/feed", { wav_path: sysSeg }),
-			]);
+			const sx = await postJSON("/stream/feed", { wav_path: sysSeg, channel: "sys", audio_s: newAudio });
 			sysPartial = (sx?.partial || "");
-			// Live speaker = whoever is talking NOW (the latest diarization segment).
-			const segs: Array<{ speaker: string; start: number; end: number }> = dx?.segments || [];
-			if (segs.length) sysSpeaker = segs[segs.length - 1].speaker;
-			// REAL-TIME voice recognition: if the periodic one-shot recognition matched a saved
-			// voice overlapping NOW, use its NAME (e.g. "Learn") instead of the raw "Speaker N".
-			if (liveRecog.length) {
-				let best: string | null = null, bestOv = 0;
-				for (const r of liveRecog) {
-					const ov = Math.min(fileDurationS, r.end) - Math.max(fileDurationS - 3, r.start);
-					if (ov > bestOv) { bestOv = ov; best = r.speaker; }
-				}
-				if (best) sysSpeaker = best;
-			}
 		} finally { try { unlinkSync(sysSeg); } catch {} }
+		// Live speaker = the STABLE, conservatively-named speaker from the periodic offline-rolling
+		// diarization below (cached; refreshed ~every 2s). No phantom speakers, never a wrong name.
+		sysSpeaker = liveSpeakerNow;
 	}
-	// Kick off periodic voice recognition on the full system channel (~every 8s), fire-and-forget:
-	// the one-shot diarize matches saved voices; we cache the recognized timeline for the label above.
-	if (isDual && !recogBusy && fileDurationS - lastRecogAt > 8) {
+	// Periodic OFFLINE-ROLLING diarization (~every 2s), fire-and-forget: run the SAME engine as the
+	// brilliant post-stop on a rolling window of the sys channel; it returns the stable, correctly-
+	// named speaker talking NOW. Replaces streaming Sortformer (which over-segmented one speaker into
+	// phantom Speaker 2/3) AND the old recognition pass. Proven in eval_diar/ over 3 recordings:
+	// 0 phantoms, conservative naming. Bounded cost (window capped) as the recording grows.
+	if (isDual && !recogBusy && fileDurationS - lastRecogAt > DIAR_LIVE_STEP_S) {
 		recogBusy = true; lastRecogAt = fileDurationS;
+		const winStart = Math.max(0, fileDurationS - DIAR_LIVE_WINDOW_S);
 		(async () => {
 			try {
-				const sysFull = extractChannelSeg(wavPath, 1, 0, fileDurationS);
-				if (sysFull) {
-					const diar = await postJSON("/diarize", { wav_path: sysFull, recognize_only: true });
-					if (diar?.segments) liveRecog = diar.segments;
-					try { unlinkSync(sysFull); } catch {}
+				const sysWin = extractChannelSeg(wavPath, 1, winStart, fileDurationS - winStart);
+				if (sysWin) {
+					const d = await postJSON("/diar/live", { wav_path: sysWin, window_s: fileDurationS - winStart });
+					if (d?.ok && typeof d.speaker === "string" && d.speaker) {
+						liveSpeakerNow = d.speaker;
+						if (typeof d.label === "string" && d.label) liveSpeakerLabel = d.label;
+					}
+					try { unlinkSync(sysWin); } catch {}
 				}
 			} catch {}
 			recogBusy = false;
+		})();
+	}
+	// Voice-RAG MIC FILTER (~every 1s, fire-and-forget): diarize the MIC channel to tell the owner's
+	// voice from external audio the mic picks up (a TV in the room, someone else) — the case the echo
+	// layers can't touch (no system-channel reference). Caches micIsOwner; when false the mic feed
+	// above is gated so the foreign audio never enters the owner's transcript. Auto-learns the owner's
+	// voiceprint at stop (/diar/finish). Conservative: a single-voice mic is always kept.
+	if (!micFilterBusy && fileDurationS - lastMicFilterAt > DIAR_LIVE_STEP_S) {
+		micFilterBusy = true; lastMicFilterAt = fileDurationS;
+		const winStart = Math.max(0, fileDurationS - MIC_FILTER_WINDOW_S); // small window: just the current voice
+		(async () => {
+			try {
+				const micWin = extractChannelSeg(wavPath, 0, winStart, fileDurationS - winStart);
+				if (micWin) {
+					const d = await postJSON("/mic/filter", { wav_path: micWin, window_s: fileDurationS - winStart });
+					if (d?.ok && typeof d.keep === "boolean") micIsOwner = d.keep;
+					try { unlinkSync(micWin); } catch {}
+				}
+			} catch {}
+			micFilterBusy = false;
 		})();
 	}
 
@@ -1552,8 +1637,9 @@ async function processStreamLive(
 	else if (sysDelta > 1) active = "sys";
 
 	if (active) {
-		const speaker = active === "mic" ? micLabel() : sysSpeaker;
-		const key = `${active}|${speaker}`;
+		const speaker = active === "mic" ? micLabel() : sysSpeaker;          // what's SHOWN (refines live)
+		const speakerKey = active === "mic" ? micLabel() : liveSpeakerLabel; // stable identity for turn keying
+		const key = `${active}|${speakerKey}`;
 		if (key !== liveTurnKey) {
 			// Speaker changed → close the current turn and open a NEW chronological turn.
 			liveTurnId += 1;
@@ -1831,14 +1917,22 @@ function stopLiveTranscribe() {
 	lastMicLen = 0;
 	lastSysLen = 0;
 	liveTurns = [];
-	liveRecog = [];
+	liveSpeakerNow = "Speaker 1";
+	liveSpeakerLabel = "Speaker 1";
+	micIsOwner = true;
+	micFilterBusy = false;
+	lastMicFilterAt = 0;
 	recogBusy = false;
 	lastRecogAt = 0;
 	// Any in-flight whisper call will still complete but its result will be
 	// dropped because processChunk checks `!recorderProc` at the top.
 }
 
-async function handleSysRecordStop(): Promise<Response> {
+async function handleSysRecordStop(req: Request): Promise<Response> {
+	// Language for the post-stop re-transcription. Passing the real code (not "auto") stops Parakeet
+	// from flipping to English on Spanish-with-tech-terms speech.
+	let stopLang = "auto";
+	try { const b = await req.json(); if (b?.language) stopLang = String(b.language); } catch {}
 	const offset = liveTranscribeOffset; // save before reset
 	const wasStreaming = streamStarted;
 	const streamOffset = lastStreamOffset;
@@ -1864,80 +1958,41 @@ async function handleSysRecordStop(): Promise<Response> {
 
 	if (!existsSync(path)) return Response.json({ error: "Recording file not created" }, { status: 500 });
 
-	// Seamless stop for streaming: feed the final tail, stream-finish for the authoritative final
-	// text, diar-finish for the precise speaker timeline, then REFINE the live karaoke turns IN
-	// PLACE (final text per turn + precise system speaker) — NO full re-transcribe / re-collapse.
+	// AUTHORITATIVE post-stop: re-transcribe the whole recording with REAL timestamps, diarize the
+	// system channel, acoustically strip the mic's echo (no-headphones), and name known voices — all
+	// in one /finalize call. Replaces the old "refine the live karaoke turns in place" path, which had
+	// no timestamps and inherited the live segmentation/echo. The live turns still power the instant
+	// on-screen karaoke; this rebuilds the saved transcript coherently.
 	let streamText = "";
-	let refinedTurns: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; auto?: boolean }> = [];
+	let refinedTurns: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; start: number; end: number; auto?: boolean }> = [];
 	let speakerEmbeddings: Record<string, number[]> = {};
 	let autoNamed: Record<string, { name: string; score: number }> = {};
 	if (wasStreaming) {
 		try {
 			const isDual = path.includes("dual-capture-");
-			const dur = (Bun.file(path).size - 44) / (isDual ? 64000 : 32000);
-			// Feed the final audio tail of each channel so the last turn captures the closing words.
-			if (dur - streamOffset > 0.1) {
-				const micTail = extractChannelSeg(path, 0, streamOffset, dur - streamOffset);
-				if (micTail) { await postJSON("/stream/feed", { wav_path: micTail, channel: "mic" }); try { unlinkSync(micTail); } catch {} }
-				if (isDual) {
-					const sysTail = extractChannelSeg(path, 1, streamOffset, dur - streamOffset);
-					if (sysTail) {
-						await postJSON("/stream/feed", { wav_path: sysTail, channel: "sys" });
-						try { unlinkSync(sysTail); } catch {}
-					}
-				}
-			}
-			const micFin = await postJSON("/stream/finish", { channel: "mic" });
-			const micFinal = (micFin?.text || "").trim();
-			streamText = micFinal;
-			let sysFinal = "";
-			let diarSegs: Array<{ speaker: string; start: number; end: number }> = [];
+			// Close the live streaming/diar sessions so the sidecar resets cleanly for the next recording.
+			try { await postJSON("/stream/finish", { channel: "mic" }); } catch {}
 			if (isDual) {
-				const sysFin = await postJSON("/stream/finish", { channel: "sys" });
-				sysFinal = (sysFin?.text || "").trim();
-				await postJSON("/diar/finish", {}); // close/reset the live Sortformer session
-				// Precise speaker timeline + per-speaker WeSpeaker voiceprints: one-shot diarize on the
-				// FULL system channel (tuned 0.74 clustering + cross-session recognition + auto-naming).
-				const sysFull = extractChannelSeg(path, 1, 0, dur);
-				if (sysFull) {
-					const diar = await postJSON("/diarize", { wav_path: sysFull });
-					diarSegs = diar?.segments || [];
-					speakerEmbeddings = diar?.embeddings || {};
-					autoNamed = diar?.auto_named || {};
-					try { unlinkSync(sysFull); } catch {}
-				}
+				try { await postJSON("/stream/finish", { channel: "sys" }); } catch {}
+				try { await postJSON("/diar/finish", {}); } catch {}
 			}
 
-			// Build refined turns: re-slice each turn's text from its channel's FINAL text (turn.base
-			// → next same-channel turn's base) and, for system turns, relabel with the precise diarization
-			// (which already carries recognized voice names where matched).
-			const finalText = (ch: "mic" | "sys") => (ch === "mic" ? micFinal : sysFinal);
-			for (let i = 0; i < turns.length; i++) {
-				const t = turns[i];
-				const next = turns.slice(i + 1).find((x) => x.channel === t.channel);
-				const ft = finalText(t.channel);
-				let text = ft.slice(t.base, next ? next.base : ft.length).trim();
-				// LAYER 3 — final echo dedup: strip foreign-speaker echo from MIC turns using the
-				// full system transcript, so the saved transcript matches the cleaned live view.
-				if (text && t.channel === "mic" && sysFinal.trim()) {
-					const dd = await postJSON("/dedup", { mic: text, sys: sysFinal });
-					if (dd && typeof dd.text === "string") text = dd.text.trim();
-				}
-				if (!text) continue;
-				let speaker = t.speaker;
-				let auto = false;
-				if (t.channel === "sys" && diarSegs.length) {
-					// dominant precise speaker overlapping [startT, endT]
-					const overlap: Record<string, number> = {};
-					for (const d of diarSegs) {
-						const o = Math.max(0, Math.min(t.endT, d.end) - Math.max(t.startT, d.start));
-						if (o > 0) overlap[d.speaker] = (overlap[d.speaker] || 0) + o;
-					}
-					const best = Object.keys(overlap).sort((a, b) => overlap[b] - overlap[a])[0];
-					if (best) { speaker = best; auto = !!autoNamed[best]; }
-				}
-				refinedTurns.push({ id: t.id, speaker, channel: t.channel, text, auto });
-			}
+			const fin = await postJSON("/finalize", { wav_path: path, language: stopLang, dual: isDual });
+			const finTurns: Array<{ start: number; end: number; speaker: string; text: string; channel?: "mic" | "sys" }> = fin?.turns || [];
+			speakerEmbeddings = fin?.embeddings || {};
+			autoNamed = fin?.auto_named || {};
+			refinedTurns = finTurns
+				.filter((t) => (t.text || "").trim())
+				.map((t, i) => ({
+					id: i,
+					speaker: t.speaker,
+					channel: t.channel === "mic" ? "mic" : "sys",
+					text: t.text.trim(),
+					start: t.start,
+					end: t.end,
+					auto: !!(autoNamed && autoNamed[t.speaker]),
+				}));
+			streamText = refinedTurns.map((t) => t.text).join(" ");
 		} catch {}
 	}
 
@@ -2195,10 +2250,12 @@ const server = Bun.serve({
 		if (method === "GET" && url.pathname === "/api/setup/check") return handleSetupCheck();
 		if (method === "GET" && url.pathname === "/api/setup/install-ollama") return handleInstallOllama();
 		if (method === "GET" && url.pathname === "/api/setup/install-ffmpeg") return handleInstallFfmpeg();
+		if (method === "POST" && url.pathname === "/api/setup/start-ollama") return handleStartOllama();
+		if (method === "POST" && url.pathname === "/api/desktop/float") return handleDesktopFloat();
 		if (method === "GET" && url.pathname === "/api/meeting-detector") return handleDetectorStream();
 		// /api/download and /api/recording removed — unused legacy endpoints
 		if (method === "POST" && url.pathname === "/api/sysrecord/start") return handleSysRecordStart(req);
-		if (method === "POST" && url.pathname === "/api/sysrecord/stop") return handleSysRecordStop();
+		if (method === "POST" && url.pathname === "/api/sysrecord/stop") return handleSysRecordStop(req);
 		if (method === "GET" && url.pathname === "/api/sysrecord/levels") return handleSysLevelsSSE();
 		if (method === "GET" && url.pathname === "/api/sysrecord/live") return handleLiveTranscribe(url);
 		if (method === "GET" && url.pathname === "/api/health") return handleHealth();

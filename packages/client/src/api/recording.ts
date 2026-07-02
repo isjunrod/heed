@@ -4,13 +4,13 @@ import { apiClient } from "./client.ts";
 export const recordingApi = {
 	start: (mode: "mic" | "system" | "both" = "both") =>
 		apiClient.post<SystemRecordStartResponse>("/api/sysrecord/start", { mode }),
-	stop: () => apiClient.post<{
+	stop: (language?: string) => apiClient.post<{
 		path: string;
 		streaming?: boolean;
 		streamText?: string;
-		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; auto?: boolean }>;
+		turns?: Array<{ id: number; speaker: string; channel: "mic" | "sys"; text: string; start?: number; end?: number; auto?: boolean }>;
 		embeddings?: Record<string, number[]>;
 		autoNamed?: Record<string, { name: string; score: number }>;
-	}>("/api/sysrecord/stop"),
+	}>("/api/sysrecord/stop", language ? { language } : undefined),
 	levelsUrl: () => "/api/sysrecord/levels",
 };

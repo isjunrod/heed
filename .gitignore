@@ -33,3 +33,10 @@ packages/transcription/native/**/.swiftpm/
 # worktree dep symlinks (not real dirs, so node_modules/ rule misses them)
 /node_modules
 packages/*/node_modules
+
+# Repo hygiene: keep large DERIVED artifacts out of the public repo (test recordings + eval caches).
+# The eval rig SCRIPTS still get committed — only the multi-MB caches/wavs are excluded.
+recordings/
+eval_diar/cache/
+eval_echo/cache/
+**/*.wav.json

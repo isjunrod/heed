@@ -11,10 +11,10 @@
  */
 
 import { execSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { platform, homedir, cpus } from "node:os";
+import { platform, homedir, cpus, totalmem } from "node:os";
 
 // --- Colors (ANSI) ---
 const C = {
@@ -48,7 +48,23 @@ function hasCommand(name) {
 	return cmd(`which ${name}`) !== null;
 }
 
+// --- Flags / non-interactive install ---
+// The core (record → transcribe → diarize → copy) installs with zero questions — only progress. The
+// one heavy OPTIONAL piece (AI notes = Ollama + LLM) is gated behind the preset. `--yes` / no-TTY
+// accept the safe defaults so `npx create-heed --yes` (or CI) runs unattended.
+const ARGV = process.argv.slice(2);
+const IS_TTY = Boolean(process.stdin.isTTY);
+const FLAGS = {
+	yes: ARGV.includes("--yes") || ARGV.includes("-y"),
+	// preset: explicit flag wins; else resolved later (TTY → ask once, non-TTY → "fast").
+	preset: ARGV.includes("--full") || ARGV.includes("--notes") ? "full"
+		: ARGV.includes("--fast") || ARGV.includes("--no-notes") ? "fast"
+		: (ARGV.find((a) => a.startsWith("--preset="))?.split("=")[1] || null),
+	engine: ARGV.find((a) => a.startsWith("--engine="))?.split("=")[1] || null,
+};
+
 async function ask(question) {
+	if (FLAGS.yes || !IS_TTY) return true;  // unattended → accept the safe default
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	return new Promise((resolve) => {
 		rl.question(`${C.cyan}?${C.reset} ${question} ${C.dim}(Y/n)${C.reset} `, (answer) => {
@@ -98,6 +114,20 @@ function run(command, label) {
 	}
 }
 
+// Poll the transcription server's /health until it reports ready (models loaded), or time out. Used
+// to open the UI exactly when heed is usable — no arbitrary sleep that opens a dead page or waits too long.
+async function waitForHealth(timeoutMs = 90000) {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		try {
+			const h = await fetch("http://localhost:5002/health", { signal: AbortSignal.timeout(1500) });
+			if (h.ok && (await h.json()).ready) return true;
+		} catch {}
+		await new Promise((r) => setTimeout(r, 1500));
+	}
+	return false;
+}
+
 // --- OS Detection ---
 const OS = platform();
 const IS_MAC = OS === "darwin";
@@ -128,11 +158,34 @@ async function main() {
 		process.exit(1);
 	}
 
-	info(`Detected: ${C.bold}${IS_MAC ? "macOS" : "Linux"}${C.reset} (${cpus()[0]?.model || "unknown CPU"})`);
+	const IS_APPLE_SILICON = IS_MAC && process.arch === "arm64";
+	const ramGB = Math.round(totalmem() / 1024 / 1024 / 1024);
+	info(`Detected: ${C.bold}${IS_MAC ? "macOS" : "Linux"}${C.reset} · ${cpus().length} cores · ${ramGB}GB RAM`);
+	info(`  ${cpus()[0]?.model || "unknown CPU"}`);
+	if (IS_APPLE_SILICON) {
+		ok(`Engine: ${C.bold}Parakeet on the Apple Neural Engine${C.reset} — fastest, 100% local`);
+	}
 	log("");
 
-	const IS_APPLE_SILICON = IS_MAC && process.arch === "arm64";
-	const TOTAL = IS_APPLE_SILICON ? 9 : 7;
+	// --- Preset: keep the core zero-friction; gate only the heavy OPTIONAL piece (AI notes). ---
+	let preset = (FLAGS.preset === "fast" || FLAGS.preset === "full") ? FLAGS.preset : null;
+	if (!preset) {
+		if (IS_TTY && !FLAGS.yes) {
+			log(`  ${C.bold}Fast${C.reset}     ${C.dim}record + transcribe + diarize + copy (lightweight)${C.reset}`);
+			log(`  ${C.bold}Complete${C.reset} ${C.dim}+ AI notes (Ollama + LLM, ~2-5GB — you can enable it later)${C.reset}`);
+			preset = (await ask("Add AI notes now (Complete)?  No = Fast")) ? "full" : "fast";
+		} else {
+			preset = "fast";  // unattended default: the lightweight core
+		}
+	}
+	ok(`Preset: ${C.bold}${preset === "full" ? "Complete (+ AI notes)" : "Fast"}${C.reset}`);
+
+	// Engine override (--engine=parakeet|mlx|ctranslate2) → HEED_ENGINE, inherited by the `bun run dev`
+	// spawn below (and read by engines.py/capability.py). Used by the fallback flow.
+	if (FLAGS.engine) process.env.HEED_ENGINE = FLAGS.engine;
+
+	// Dynamic step count: base + AI-notes (Ollama) if full + Parakeet/permission if Apple Silicon.
+	const TOTAL = 6 + (preset === "full" ? 1 : 0) + (IS_APPLE_SILICON ? 2 : 0);
 	let stepN = 0;
 
 	// --- Step 1: Bun ---
@@ -191,23 +244,28 @@ async function main() {
 		}
 	}
 
-	// --- Step 4: Ollama (local notes engine) ---
-	step(++stepN, TOTAL, "Ollama (local AI engine)");
-	if (hasCommand("ollama")) {
-		const ollamaVer = cmd("ollama --version");
-		ok(`Ollama ${ollamaVer || ""} already installed`);
-	} else {
-		warn("Ollama runs AI models locally for generating meeting notes.");
-		if (await ask("Install Ollama?")) {
-			if (IS_MAC) {
-				// macOS: the official app bundles the llama-server runner. The Homebrew
-				// *formula* (`brew install ollama`) ships WITHOUT that runner and cannot
-				// generate — so we install the cask (Ollama.app) instead.
-				if (!hasCommand("brew")) run('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', "Homebrew installed");
-				run("brew install --cask ollama-app", "Ollama installed");
-			} else {
-				// Linux: official install script (ships the runner correctly).
-				run("curl -fsSL https://ollama.com/install.sh | sh", "Ollama installed");
+	// --- Step 4: Ollama (local notes engine) — ONLY in the "Complete" preset ---
+	// AI notes are the one heavy, optional piece. In "Fast" we skip Ollama entirely (the LLM model is
+	// downloaded in-app later anyway) so the core stays light and zero-friction. Re-runnable: choosing
+	// Complete later installs it.
+	if (preset === "full") {
+		step(++stepN, TOTAL, "Ollama (local AI notes engine)");
+		if (hasCommand("ollama")) {
+			const ollamaVer = cmd("ollama --version");
+			ok(`Ollama ${ollamaVer || ""} already installed`);
+		} else {
+			warn("Ollama runs AI models locally for generating meeting notes (~2-5GB with the model).");
+			if (await ask("Install Ollama?")) {
+				if (IS_MAC) {
+					// macOS: the official app bundles the llama-server runner. The Homebrew
+					// *formula* (`brew install ollama`) ships WITHOUT that runner and cannot
+					// generate — so we install the cask (Ollama.app) instead.
+					if (!hasCommand("brew")) run('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', "Homebrew installed");
+					run("brew install --cask ollama-app", "Ollama installed");
+				} else {
+					// Linux: official install script (ships the runner correctly).
+					run("curl -fsSL https://ollama.com/install.sh | sh", "Ollama installed");
+				}
 			}
 		}
 	}
@@ -227,8 +285,11 @@ async function main() {
 	info("Installing JavaScript dependencies...");
 	run(`cd "${targetDir}" && bun install`, "Dependencies installed");
 
-	// --- Step 6: Python AI packages (isolated in a project-local .venv) ---
-	step(++stepN, TOTAL, "AI models (faster-whisper + pyannote + torch)");
+	// --- Step 6: Python runtime (isolated in a project-local .venv) ---
+	// Mac (Apple Silicon): the ENGINE is Parakeet on the Swift sidecar → Python only needs a TINY core
+	// (livekit + numpy), NOT the ~1.6GB torch/pyannote/whisper stack (that's the on-demand fallback).
+	// Linux / Intel Mac: unchanged — install the full requirements.txt (their engine IS whisper/torch).
+	step(++stepN, TOTAL, IS_APPLE_SILICON ? "Python runtime (lightweight core)" : "AI models (faster-whisper + pyannote + torch)");
 	// torch needs Python 3.10–3.12; a system python3 can be too new (e.g. 3.14 has no
 	// torch wheels yet). Prefer an explicit 3.12/3.11/3.10, and on macOS install
 	// python@3.12 if none is present. We ALWAYS install into `<heed>/.venv` so the
@@ -252,10 +313,17 @@ async function main() {
 	if (!existsSync(venvDir)) {
 		run(`${venvPy} -m venv "${venvDir}"`, "Virtualenv created (.venv)");
 	}
-	const reqPath = join(targetDir, "packages", "transcription", "requirements.txt");
-	const hasFW = cmd(`"${venvPython}" -c "import faster_whisper; print('ok')" 2>/dev/null`) === "ok";
-	if (hasFW) {
-		ok("AI packages already installed in .venv");
+	const reqFile = IS_APPLE_SILICON ? "requirements-core.txt" : "requirements.txt";
+	const reqPath = join(targetDir, "packages", "transcription", reqFile);
+	const marker = IS_APPLE_SILICON ? "livekit" : "faster_whisper";
+	const already = cmd(`"${venvPython}" -c "import ${marker}; print('ok')" 2>/dev/null`) === "ok";
+	if (already) {
+		ok(IS_APPLE_SILICON ? "Python core already installed in .venv" : "AI packages already installed in .venv");
+	} else if (IS_APPLE_SILICON) {
+		// Core = no questions, just progress (it's tiny and required for record→transcribe→copy).
+		info("Installing lightweight Python core (livekit + numpy, no torch)...");
+		run(`"${venvPython}" -m pip install --upgrade pip`, "pip upgraded");
+		run(`"${venvPython}" -m pip install -r "${reqPath}"`, "Python core installed");
 	} else {
 		warn("Installing AI packages (~3GB download first time). This powers the transcription.");
 		if (await ask("Install faster-whisper + pyannote + torch into .venv?")) {
@@ -276,12 +344,14 @@ async function main() {
 		if (existsSync(sidecarBin)) {
 			ok("Parakeet sidecar already built");
 		} else if (!hasCommand("swift")) {
-			info("Swift toolchain not found — skipping Parakeet (heed will use MLX-Whisper).");
-			info(`Install Xcode Command Line Tools (${C.cyan}xcode-select --install${C.reset}) then re-run to enable the fastest engine.`);
+			info("Swift toolchain not found — Parakeet skipped for now.");
+			info(`Install Xcode Command Line Tools (${C.cyan}xcode-select --install${C.reset}) then re-run for the fastest engine,`);
+			info(`or use the fallback engine now: ${C.bold}npx create-heed fallback${C.reset} ${C.dim}(MLX-Whisper, ~1.6GB)${C.reset}`);
 		} else if (existsSync(sidecarDir)) {
 			info("Building Parakeet sidecar (first build downloads CoreML deps, ~1-2 min)...");
 			if (!run(`cd "${sidecarDir}" && swift build -c release`, "Parakeet sidecar built (Apple Neural Engine)")) {
-				info("Parakeet build failed — heed will use MLX-Whisper instead (still fast). Continuing.");
+				warn("Parakeet build failed. Install the fallback engine on-demand:");
+				log(`  ${C.bold}npx create-heed fallback${C.reset}  ${C.dim}(MLX-Whisper, ~1.6GB — only if you need it)${C.reset}`);
 			}
 		}
 
@@ -310,8 +380,17 @@ async function main() {
 		}
 	}
 
-	// --- Step 9: Launch ---
+	// --- Step: Launch ---
 	step(++stepN, TOTAL, "Launch heed");
+	// Doctor-first: seal the install by confirming the whole chain works on THIS machine (non-fatal).
+	const doctorPy = join(targetDir, "packages", "transcription", "doctor.py");
+	if (existsSync(doctorPy) && existsSync(venvPython)) {
+		info("Health check (confirming transcription + diarization work here)...");
+		if (!run(`"${venvPython}" "${doctorPy}"`, "Health check passed")) {
+			warn("A check failed above. If transcription failed, install the fallback engine:");
+			log(`  ${C.bold}npx create-heed fallback${C.reset}`);
+		}
+	}
 	log("");
 	log(`${C.bold}${C.green}  All set!${C.reset}`);
 	log("");
@@ -331,9 +410,9 @@ async function main() {
 		});
 		devChild.unref();
 
-		// Wait a bit for services to start
-		info("Starting services...");
-		await new Promise(r => setTimeout(r, 8000));
+		// Wait until heed is actually ready (models loaded), not an arbitrary sleep.
+		info("Starting services (loading models)...");
+		await waitForHealth();
 
 		// Launch desktop panel
 		const panelChild = spawn("python3", ["packages/desktop/main.py"], {
@@ -353,7 +432,7 @@ async function main() {
 		});
 	} else {
 		log(`  ${C.dim}Starting heed...${C.reset}`);
-		log(`  ${C.dim}Open ${C.cyan}http://localhost:5000${C.dim} in your browser${C.reset}`);
+		log(`  ${C.dim}Open ${C.cyan}http://localhost:5170${C.dim} in your browser${C.reset}`);
 		log("");
 
 		const child = spawn("bun", ["run", "dev"], {
@@ -361,6 +440,13 @@ async function main() {
 			stdio: "inherit",
 			shell: true,
 		});
+
+		// Auto-open the browser once heed is ready (Mac only — `open`; Linux users open it themselves).
+		if (IS_MAC) {
+			waitForHealth().then((ready) => {
+				if (ready) { try { execSync("open http://localhost:5170", { stdio: "ignore" }); } catch {} }
+			});
+		}
 
 		child.on("exit", (code) => {
 			if (code !== 0) err(`heed exited with code ${code}`);
@@ -473,10 +559,73 @@ async function update() {
 	log("");
 }
 
+// --- Find an existing heed install (shared by update/fallback/doctor) ---
+function findHeedDir() {
+	const candidates = [
+		join(process.cwd(), "heed"),
+		process.cwd(),
+		join(homedir(), "heed"),
+		join(homedir(), "Desktop", "heed"),
+		join(homedir(), "Projects", "heed"),
+	];
+	for (const dir of candidates) {
+		if (existsSync(join(dir, "package.json")) && existsSync(join(dir, "packages", "server"))) return dir;
+	}
+	return null;
+}
+
+// --- Fallback subcommand: install the heavy engine ON-DEMAND (Parakeet unavailable/broken) ---
+async function fallback() {
+	log("");
+	log(`${C.bold}  heed fallback${C.reset} — install the fallback transcription engine`);
+	log("");
+	const heedDir = findHeedDir();
+	if (!heedDir) { err("heed installation not found. Run `npx create-heed` first."); process.exit(1); }
+	const venvPy = join(heedDir, ".venv", "bin", "python3");
+	if (!existsSync(venvPy)) { err("No .venv found. Run `npx create-heed` first."); process.exit(1); }
+	info(`Found heed at ${C.dim}${heedDir}${C.reset}`);
+	const reqPath = join(heedDir, "packages", "transcription", "requirements-fallback.txt");
+	warn("Installing fallback engine (~1.6GB: torch + pyannote + faster-whisper + mlx). One time.");
+	if (!run(`"${venvPy}" -m pip install --upgrade pip`, "pip upgraded")) { /* non-fatal */ }
+	if (!run(`"${venvPy}" -m pip install -r "${reqPath}"`, "Fallback engine installed")) {
+		err("Fallback install failed."); process.exit(1);
+	}
+	// Persist the engine so the server stops trying the (missing/broken) Parakeet sidecar.
+	const engine = IS_MAC ? "mlx" : "ctranslate2";
+	try {
+		mkdirSync(join(homedir(), ".heed-app"), { recursive: true });
+		writeFileSync(join(homedir(), ".heed-app", "overrides.json"), JSON.stringify({ engine }, null, 2));
+		ok(`Engine set to ${C.bold}${engine}${C.reset}`);
+	} catch (e) { warn(`Could not write overrides.json: ${e.message}`); }
+	log("");
+	ok(`Fallback ready. Restart heed:  ${C.bold}cd "${heedDir}" && bun run dev${C.reset}`);
+}
+
+// --- Doctor subcommand: run the health check against an existing install ---
+async function doctor() {
+	log("");
+	log(`${C.bold}  heed doctor${C.reset} — checking your install`);
+	log("");
+	const heedDir = findHeedDir();
+	if (!heedDir) { err("heed installation not found. Run `npx create-heed` first."); process.exit(1); }
+	const venvPy = join(heedDir, ".venv", "bin", "python3");
+	if (!existsSync(venvPy)) { err("No .venv found. Run `npx create-heed` first."); process.exit(1); }
+	const doctorPy = join(heedDir, "packages", "transcription", "doctor.py");
+	const okDoc = run(`"${venvPy}" "${doctorPy}"`, "Doctor finished");
+	if (!okDoc) {
+		warn("Some checks failed. If transcription failed, install the fallback engine:");
+		log(`  ${C.bold}npx create-heed fallback${C.reset}`);
+	}
+}
+
 // --- Route subcommand ---
 const subcommand = process.argv[2];
 if (subcommand === "update") {
 	update().catch((e) => { err(e.message); process.exit(1); });
+} else if (subcommand === "fallback") {
+	fallback().catch((e) => { err(e.message); process.exit(1); });
+} else if (subcommand === "doctor") {
+	doctor().catch((e) => { err(e.message); process.exit(1); });
 } else {
 	main().catch((e) => {
 		err(e.message);

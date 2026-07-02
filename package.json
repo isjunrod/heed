@@ -8,6 +8,7 @@
 		"dev:client": "cd packages/client && bun run dev",
 		"dev:python": ".venv/bin/python3 -u packages/transcription/transcription_server.py",
 		"build": "cd packages/client && bun run build",
+		"doctor": ".venv/bin/python3 packages/transcription/doctor.py",
 		"update": "node scripts/update.mjs",
 		"desktop": "python3 packages/desktop/main.py",
 		"desktop:prod": "python3 packages/desktop/main.py --prod"

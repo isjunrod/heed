@@ -23,7 +23,7 @@ from dataclasses import dataclass, asdict, field
 import engines
 
 CACHE_PATH = os.path.join(os.path.expanduser("~"), ".heed-app", "capabilities.json")
-CACHE_VERSION = 2  # bumped for v3: Parakeet engine detection (invalidates stale mlx caches)
+CACHE_VERSION = 3  # v3: torchless Apple Silicon detection (invalidates caches from the torch-gated path)
 
 # The benchmark transcribes with this reference model; other tiers are extrapolated from it.
 BENCH_MODEL = "small"
@@ -96,20 +96,18 @@ def _system_ram_mb() -> int:
 
 def _detect_accelerator():
     """Return (accelerator, gpu_name, total_vram_mb, engine)."""
+    # Apple Silicon: detect WITHOUT torch. On Mac the engine is Parakeet on the ANE (Swift sidecar);
+    # torch is only a Linux/CPU-fallback dep and a Mac-lite install has NONE. This MUST come before any
+    # `import torch` or a torchless Mac misclassifies as plain CPU and picks the wrong engine.
+    if engines.is_apple_silicon():
+        ram = _system_ram_mb()
+        # Engine pick (respects the HEED_ENGINE / overrides.json fallback): Parakeet on the ANE when its
+        # sidecar is built, else MLX (Apple GPU), else CTranslate2 (CPU).
+        engine = engines.select_engine_kind()
+        return "apple_gpu", "Apple Silicon", ram, engine
+    # non-Apple (Linux/Windows): torch probes CUDA; torchless → CPU.
     try:
         import torch
-        if platform.system() == "Darwin" and platform.machine() == "arm64" \
-                and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            ram = _system_ram_mb()
-            # Prefer Parakeet (Apple Neural Engine, far faster than Whisper) when its sidecar
-            # is built; fall back to MLX (Apple GPU), then CTranslate2 (CPU).
-            if engines.parakeet_available():
-                engine = "parakeet"
-            elif engines.mlx_available():
-                engine = "mlx"
-            else:
-                engine = "ctranslate2"
-            return "apple_gpu", "Apple Silicon (MPS)", ram, engine
         if torch.cuda.is_available():
             _, total = torch.cuda.mem_get_info(0)
             return "cuda", torch.cuda.get_device_name(0), int(total // 1024 // 1024), "ctranslate2"

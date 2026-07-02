@@ -1330,22 +1330,41 @@ async function handleSysRecordStart(req: Request): Promise<Response> {
 // This is source-agnostic: it works for SCK (mac) and BlackHole/PipeWire (Linux) alike.
 let levelInterval: ReturnType<typeof setInterval> | null = null;
 let sysLevels: number[] = new Array(24).fill(0);
-const WAV_HEADER_BYTES = 44; // canonical PCM WAV header ffmpeg emits
+
+// Find where PCM actually starts (the "data" chunk payload). ffmpeg does NOT always emit a 44-byte
+// header — with -flush_packets + encoder metadata it writes extra chunks (measured: PCM at byte 78).
+// A hardcoded 44 mis-aligns the interleaved stereo read by half a frame, so the System meter ends up
+// reading the MIC channel (green bars track your voice). Parse the real offset from the RIFF chunks.
+async function wavDataOffset(file: ReturnType<typeof Bun.file>): Promise<number> {
+	const head = new Uint8Array(await file.slice(0, 512).arrayBuffer());
+	for (let i = 12; i + 8 <= head.length; i++) {
+		if (head[i] === 0x64 && head[i + 1] === 0x61 && head[i + 2] === 0x74 && head[i + 3] === 0x61) {
+			return i + 8; // "data" + 4-byte size → PCM starts here
+		}
+	}
+	return 44; // fallback to the canonical header
+}
 
 function startLevelMeter(path: string, channels: number, sysChannel: number) {
 	const bytesPerFrame = 2 * channels;      // s16le → 2 bytes/sample
 	const windowFrames = 1600;               // ~100ms @ 16kHz
 	const windowBytes = windowFrames * bytesPerFrame;
+	let dataOffset = -1;                      // resolved once the header is on disk
 
 	levelInterval = setInterval(async () => {
 		try {
 			const file = Bun.file(path);
 			const size = file.size;
-			if (size <= WAV_HEADER_BYTES + bytesPerFrame) return;
-			// Read the newest window, aligned to a frame boundary so channel order stays correct.
+			if (dataOffset < 0) {
+				if (size < 64) return;        // header not fully written yet
+				dataOffset = await wavDataOffset(file);
+			}
+			if (size <= dataOffset + bytesPerFrame) return;
+			// Read the newest window, aligned to a real frame boundary (relative to PCM start) so the
+			// channel order is correct — otherwise the system meter reads the mic.
 			let start = size - windowBytes;
-			if (start < WAV_HEADER_BYTES) start = WAV_HEADER_BYTES;
-			start = WAV_HEADER_BYTES + Math.floor((start - WAV_HEADER_BYTES) / bytesPerFrame) * bytesPerFrame;
+			if (start < dataOffset) start = dataOffset;
+			start = dataOffset + Math.floor((start - dataOffset) / bytesPerFrame) * bytesPerFrame;
 			const buf = new Uint8Array(await file.slice(start, size).arrayBuffer());
 			const view = new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 2));
 			const nFrames = Math.floor(view.length / channels);

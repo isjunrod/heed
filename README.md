@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/100%25-Local-10B981?style=for-the-badge" alt="100% Local" />
   <img src="https://img.shields.io/badge/Open_Source-MIT-2563EB?style=for-the-badge" alt="MIT License" />
-  <img src="https://img.shields.io/badge/Linux_%2B_macOS-supported-F59E0B?style=for-the-badge" alt="Linux + macOS" />
+  <img src="https://img.shields.io/badge/macOS_%2B_Linux-supported-F59E0B?style=for-the-badge" alt="macOS + Linux" />
 </p>
 
 <p align="center">
@@ -14,9 +14,9 @@
 </p>
 
 <p align="center">
-  Self-hosted meeting transcription with real speaker diarization.<br/>
-  Runs on top of Zoom, Meet, Teams, Discord — without anyone knowing.<br/>
-  Your audio never leaves your machine. Ever.
+  Meeting transcription, diarization, and AI notes that run entirely on your Mac.<br/>
+  Live while you record — and a full, higher-accuracy pass the moment you stop.<br/>
+  Sits on top of Zoom, Meet, Teams, Discord. Your audio never leaves your machine. Ever.
 </p>
 
 ---
@@ -25,21 +25,27 @@
   <img src="assets/demo.gif" alt="heed demo — record, live transcription, AI notes, session tags" width="100%" />
 </p>
 
-> *4 speakers. Identified by voice, not by login. Live transcription while recording. AI notes with one click. Everything processed by YOUR GPU. $0/month.*
+> *4 speakers. Identified by voice, not by login. Live transcription while you record, a full re-transcription when you stop. AI notes with one click. Everything processed on YOUR machine. $0/month.*
 
 ---
 
 ## Why heed exists
 
-Your meeting audio is personal. It contains strategy discussions, salary negotiations, client calls, medical appointments. Today, every meeting tool sends that audio to someone else's servers.
+Your meeting audio is personal. It carries strategy calls, salary talks, client conversations, medical appointments. Almost every meeting tool today ships that audio to someone else's servers — and asks you to pay monthly for the privilege.
 
-**Granola** charges $40/month and only works on macOS. **Otter** and **Fireflies** send your audio to the cloud. **Meetily** promised open-source local transcription but [doesn't compile on most Linux distros](https://github.com/meetily/meetily/issues). **Fathom** is macOS-only and cloud-dependent.
+heed takes the opposite stance. Everything runs on your machine.
 
-heed is different:
+**If you work inside a company,** your meetings never touch a third-party server. That is the difference between "we transcribe internally" and "we uploaded a confidential roadmap discussion to a vendor's cloud." No processor to add to a DPA, no NDA to renegotiate, no client audio leaving your laptop. Compliance stops being a fight.
 
-- **Your audio stays on your disk.** Whisper, pyannote, and Ollama run on your machine. No API keys. No subscriptions. No data leaving your network.
-- **Works with everything.** Zoom, Google Meet, Teams, Discord, a YouTube video — if it plays on your computer, heed captures it. Nobody in the call needs to install anything.
-- **Real speaker diarization.** Not "Speaker 1, Speaker 2" assigned by login. Actual voice analysis that identifies people by how they sound — and remembers them next time.
+**If it's your own life,** the same guarantee, for free. A therapy session, a family call, a founder pitch, a lecture — the audio never leaves your disk, and there is no subscription. $0/month, forever, because there is no server to pay for.
+
+What makes heed different:
+
+- **Your audio stays on your disk.** ASR, diarization, and AI notes all run locally. No API keys, no subscriptions, nothing leaving your network.
+- **Fast now, thorough after.** Live transcription appears while you record. When you stop, heed runs a second, higher-accuracy pass with real timestamps — so you get speed *and* a clean final transcript, not a tradeoff.
+- **Speakers by voice, not by login.** heed identifies people by how they actually sound — and remembers them, so the same voice is recognized across future meetings.
+- **It hears people talk over each other.** Mic and system audio are captured on separate channels, so heed catches overlapping speech that mono-mixing tools lose forever.
+- **One command to install.** `npx create-heed`. No cmake, no CUDA SDK, no build gymnastics.
 
 ---
 
@@ -49,45 +55,45 @@ heed is different:
 <tr>
 <th></th>
 <th align="center"><strong>heed</strong></th>
+<th align="center">Meetily</th>
 <th align="center">Granola</th>
 <th align="center">Otter.ai</th>
 <th align="center">Fathom</th>
-<th align="center">Others</th>
 </tr>
 <tr>
 <td><strong>100% local processing</strong></td>
+<td align="center"><strong>Yes</strong></td>
 <td align="center">Yes</td>
 <td align="center">No (cloud AI)</td>
 <td align="center">No (full SaaS)</td>
 <td align="center">No (cloud)</td>
-<td align="center">No (cloud)</td>
 </tr>
 <tr>
-<td><strong>Linux support</strong></td>
-<td align="center"><strong>Native</strong></td>
-<td align="center">No</td>
-<td align="center">Web only</td>
-<td align="center">No</td>
-<td align="center">Web only</td>
+<td><strong>Apple Silicon engine</strong></td>
+<td align="center"><strong>Parakeet + FluidAudio on the ANE</strong></td>
+<td align="center">whisper.cpp</td>
+<td align="center">Cloud</td>
+<td align="center">Cloud</td>
+<td align="center">Cloud</td>
 </tr>
 <tr>
-<td><strong>macOS support</strong></td>
-<td align="center">Yes</td>
-<td align="center">Yes</td>
-<td align="center">Web</td>
-<td align="center">Yes</td>
-<td align="center">Web</td>
+<td><strong>Live + full post-stop pass</strong></td>
+<td align="center"><strong>Both</strong></td>
+<td align="center">Post-stop</td>
+<td align="center">Live</td>
+<td align="center">Live</td>
+<td align="center">Post-stop</td>
 </tr>
 <tr>
 <td><strong>Voice-based diarization</strong></td>
-<td align="center"><strong>pyannote 3.1</strong></td>
+<td align="center"><strong>Yes</strong></td>
 <td align="center">Basic</td>
-<td align="center">Cloud model</td>
+<td align="center">Basic</td>
 <td align="center">Cloud model</td>
 <td align="center">By login name</td>
 </tr>
 <tr>
-<td><strong>Voice memory</strong></td>
+<td><strong>Voice memory (recognizes recurring speakers)</strong></td>
 <td align="center"><strong>Yes</strong></td>
 <td align="center">No</td>
 <td align="center">No</td>
@@ -103,17 +109,25 @@ heed is different:
 <td align="center">No</td>
 </tr>
 <tr>
-<td><strong>Works with Zoom/Meet/Teams</strong></td>
+<td><strong>One-command install</strong></td>
+<td align="center"><strong>npx create-heed</strong></td>
+<td align="center">Build from source on Linux</td>
+<td align="center">App</td>
+<td align="center">Web</td>
+<td align="center">App</td>
+</tr>
+<tr>
+<td><strong>Works over Zoom/Meet/Teams</strong></td>
+<td align="center"><strong>Yes</strong></td>
 <td align="center">Yes</td>
 <td align="center">Yes</td>
 <td align="center">Bot joins</td>
 <td align="center">Yes</td>
-<td align="center">Must use their platform</td>
 </tr>
 <tr>
 <td><strong>Offline capable</strong></td>
 <td align="center"><strong>Yes</strong></td>
-<td align="center">No</td>
+<td align="center">Yes</td>
 <td align="center">No</td>
 <td align="center">No</td>
 <td align="center">No</td>
@@ -121,18 +135,18 @@ heed is different:
 <tr>
 <td><strong>Open source</strong></td>
 <td align="center"><strong>MIT</strong></td>
+<td align="center">MIT</td>
 <td align="center">No</td>
 <td align="center">No</td>
 <td align="center">No</td>
-<td align="center">Partial</td>
 </tr>
 <tr>
 <td><strong>Price</strong></td>
 <td align="center"><strong>$0</strong></td>
+<td align="center">$0</td>
 <td align="center">$40/mo</td>
 <td align="center">$17/mo</td>
 <td align="center">$32/mo</td>
-<td align="center">Free (broken)</td>
 </tr>
 </table>
 
@@ -146,12 +160,12 @@ One command. It detects your OS, checks dependencies, and installs everything:
 npx create-heed
 ```
 
-The installer walks you through each step:
+The installer is doctor-first — it inspects your machine, only downloads what's missing, and walks you through each step:
 
 ```
   heed — local-first meeting transcription
 
-> Detected: Linux (AMD Ryzen 5 5600X)
+> Detected: macOS (Apple M3, 8 cores, Neural Engine)
 
 [1/7] Bun runtime
 ✓ Bun 1.3.11 already installed
@@ -159,10 +173,9 @@ The installer walks you through each step:
 [2/7] Python 3.10+
 ✓ Python 3.12.3 found
 
-[3/7] AI models (faster-whisper + pyannote)
-! Installing AI packages (~3GB download first time)
-? Install faster-whisper + pyannote-audio + torch? (Y/n) y
-✓ AI packages installed
+[3/7] Apple Silicon engine (Parakeet + FluidAudio, runs on the Neural Engine)
+! Building the native sidecar (first time only)
+✓ heed-parakeet built
 
 [4/7] ffmpeg (audio capture)
 ✓ ffmpeg already installed
@@ -185,10 +198,10 @@ git clone https://github.com/isjunrod/heed.git
 cd heed
 bun install
 bun run dev
-# Open http://localhost:5000
+# Open http://localhost:5170
 ```
 
-**Requirements:** Bun, Python 3.10+, ffmpeg, Ollama, and one of: PipeWire (Linux) or BlackHole (macOS) for system audio capture.
+**Requirements:** Bun, Python 3.10+, ffmpeg, Ollama, and system-audio capture — ScreenCaptureKit or BlackHole on macOS, PipeWire on Linux.
 
 ---
 
@@ -206,42 +219,54 @@ Only downloads what changed. Auto-reinstalls dependencies if needed.
 
 ## How it works
 
+heed captures two audio streams — your mic and the system output — on **separate channels**, and keeps them separate all the way through. That single decision is what lets heed detect overlapping speech that other tools mix to mono and lose.
+
+**On Apple Silicon (the fast path):**
+
 ```
 Your mic ──┐
            ├── ffmpeg (stereo) ──► dual-capture.wav
-System ────┘                              │
-                                          ▼
-                           Split L (mic) / R (system)
-                                    │           │
-                              Whisper(mic)  Whisper(sys)
-                              label "Me"    + pyannote(sys)
-                                    │           │
-                                    └─► merge timelines
-                                            │
-                                    detect overlaps (≥300ms)
-                                            │
-                                    Speakers + AI Notes
+System ────┘         │
+                     ▼
+          ┌──────────┴───────────┐
+          │  LIVE (while you talk)│   Parakeet streaming + Sortformer
+          │  → text + speakers    │   diarization, on the Neural Engine
+          └──────────┬───────────┘
+                     │  ── you press stop ──
+                     ▼
+          ┌──────────┴───────────┐
+          │  POST-STOP (full pass)│   Parakeet re-transcribes with real
+          │  → timestamps         │   timestamps; FluidAudio embeds every
+          │  → voice clustering   │   segment; heed re-clusters by cosine
+          │  → speaker embeddings │   → separates and remembers each voice
+          └──────────┬───────────┘
+                     ▼
+            Speakers + AI Notes
 ```
 
-**Channel-based diarization.** Mic and system audio are captured as separate stereo channels. Whisper transcribes each independently. pyannote runs speaker diarization only on the system channel (your mic is always you). Timelines are merged and overlaps are flagged when two people spoke simultaneously.
+The whole ASR + diarization engine runs on the **Apple Neural Engine** through a native Swift/CoreML sidecar built on [FluidAudio](https://github.com/FluidInference/FluidAudio) — **zero CUDA, zero cloud.** ASR (Parakeet TDT v3) and diarization run as separate resident processes so the diarizer never blocks the transcriber. On Apple Silicon, FluidAudio benchmarks the Parakeet models at up to ~140x real-time — roughly an hour of audio processed in the time it takes to read this sentence.
 
-This is why heed detects overlapping voices that other tools miss — they mix everything to mono before processing, destroying the spatial information.
+The post-stop pass is where the accuracy lives: heed re-transcribes the recording with per-token timestamps, extracts a per-segment voice embedding (WeSpeaker v2, 256-dim), and **re-clusters by cosine similarity** — pulling apart speakers a single-pass diarizer would merge. Each speaker's embedding is stored, which is what powers voice memory across meetings.
+
+**On Linux / NVIDIA:** the same pipeline runs on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, CUDA fp16 — or int8 on CPU) with [pyannote 3.1](https://github.com/pyannote/pyannote-audio) for diarization. Fully supported and actively evolving.
 
 ---
 
 ## Key features
 
-**Live transcription** — Text appears in real-time as you record. You don't wait until the meeting ends to know what was said. Speakers are identified progressively while you're still talking.
+**Live and post-stop transcription** — Text streams in real time while you record, so you never wait for the meeting to end to know what was said. The moment you stop, heed runs a full, higher-accuracy re-transcription with real timestamps. Fast when you need it, thorough when it counts.
 
-**Overlap detection** — Two people talking at once? heed catches it. Because mic and system audio live in separate channels, it knows exactly when voices collide. Every other tool mixes to mono first and loses this information forever.
+**Voice memory** — Rename a speaker once. heed saves their voice embedding and recognizes them automatically in every future meeting. No training, no enrollment. It just remembers — a private "voice RAG" that lives only on your machine.
 
-**Voice memory** — Rename a speaker once. heed saves their voice embedding and recognizes them automatically in every future meeting. No training, no setup. It just remembers.
+**Overlap detection** — Two people talking at once? heed catches it. Because mic and system audio live in separate channels, it knows exactly when voices collide — information every mono-mixing tool destroys before it ever reaches the model.
 
-**Hardware-aware model picker** — On first launch, heed reads your GPU, VRAM, CPU, and RAM. Then it recommends the best AI model that actually fits your machine. 14 models from Llama, Qwen, Gemma families. Download in-app, one click, no terminal needed.
+**AI notes, adaptive to your hardware** — On first launch heed reads your GPU, VRAM, CPU, and RAM, then recommends AI models that actually fit your machine. You pick the one you want; it downloads in-app with one click and runs locally through Ollama. Choose a note template — general summary, 1-on-1, standup, interview, brainstorm, customer call, or your own — and get structured notes from the same transcript.
 
-**Smart auto-titles** — "Q3 Revenue Review with Sarah and Marcus" instead of "Meeting Apr 12, 2026". Ollama generates a real title from the transcript content, in whatever language was spoken.
+**Floating panel** — A small always-on-top window that floats over your Zoom or Meet call. Hit **Float** in the app (or launch straight into it from `npx create-heed`) and record without leaving your meeting.
 
-**Note templates** — Choose a prompt template before generating notes: general summary, sales call, 1-on-1, retrospective, or write your own. Same transcript, different output depending on what you need.
+**Smart auto-titles** — "Q3 Revenue Review with Sarah and Marcus" instead of "Meeting Apr 12, 2026". Generated locally from the transcript content, in whatever language was spoken.
+
+**Offline capable** — Once set up, no internet required. Record on a plane, transcribe on a train.
 
 <details>
 <summary><strong>All features</strong></summary>
@@ -251,14 +276,12 @@ This is why heed detects overlapping voices that other tools miss — they mix e
 - **Smart rename = merge** — Rename "Speaker 2" to "Sarah Chen". If she already exists, heed merges them automatically. No duplicates.
 - **Inline `#tag` autocomplete** — Type `#` in the session title to organize by project, client, or topic.
 - **Meeting auto-detector** — Detects Zoom, Meet, Teams, or Discord running and prompts you to record.
-- **VRAM intelligence** — Forces Ollama to release GPU memory immediately after generating notes, so pyannote doesn't crash. Critical on 4GB GPUs.
 - **Auto-recovery** — Crashed mid-recording? Audio is safe on disk. One click to recover on next launch.
-- **GPU/CPU split** — Auto-detects free VRAM and splits work: <1.5GB → all CPU, 1.5-6GB → mixed, 6GB+ → all GPU. Zero config.
-- **Offline capable** — No internet after setup. Record on a plane, transcribe on a train.
-- **Works with everything** — Zoom, Meet, Teams, Discord, YouTube, podcasts. If it plays audio, heed captures it. Nobody knows.
-- **Bilingual** — Setup wizard and in-app tour in English and Spanish. Auto-detected from your system.
-- **GPU/CPU transparency** — If a model doesn't fit in VRAM, heed tells you why and offers CPU mode. No cryptic CUDA errors.
-- **Ollama auto-retry** — Model crashed from RAM exhaustion? heed retries in 3 seconds automatically.
+- **Hardware-aware scaling** — heed measures your machine and targets ~70–80% of it, leaving headroom so your laptop doesn't freeze with a dozen windows open.
+- **Works with everything** — Zoom, Meet, Teams, Discord, YouTube, podcasts. If it plays audio, heed captures it. Nobody in the call needs to install a thing.
+- **Bilingual** — Setup wizard and in-app tour in English and Spanish, auto-detected from your system.
+- **Graceful fallbacks** — If the native sidecar isn't built, macOS falls back to MLX-Whisper; if system capture is denied, it falls back to BlackHole. No dead ends.
+- **VRAM discipline (Linux/CUDA)** — Forces Ollama to release GPU memory right after generating notes so diarization doesn't get starved. Auto-retries on RAM exhaustion.
 
 </details>
 
@@ -270,7 +293,11 @@ This is why heed detects overlapping voices that other tools miss — they mix e
 packages/
 ├── client/         Vite + React 19 + TypeScript + Zustand + CSS Modules
 ├── server/         Bun (HTTP, SSE, ffmpeg orchestration, Ollama proxy)
-├── transcription/  Python (faster-whisper + pyannote 3.1)
+├── transcription/  Python (engine router: Parakeet on Mac, faster-whisper on Linux/CPU)
+│   └── native/
+│       └── heed-parakeet/   Swift sidecar — Parakeet TDT v3 + FluidAudio
+│                            (CoreML on the Apple Neural Engine) + heed-syscap
+│                            (ScreenCaptureKit system-audio capture)
 ├── shared/types/   TypeScript interfaces (client ↔ server)
 ├── desktop/        Chrome --app launcher (floating panel)
 └── cli/            npx create-heed installer
@@ -280,11 +307,12 @@ packages/
 
 ## Compatibility
 
-| | Linux | macOS | Windows |
+| | macOS | Linux | Windows |
 |---|---|---|---|
-| **Status** | **Fully supported** | **Supported** | Coming soon |
-| Audio capture | PipeWire | BlackHole + avfoundation | — |
-| GPU acceleration | CUDA (NVIDIA) | MPS (Apple Silicon) | — |
+| **Status** | **First-class** | **Supported & evolving** | Coming soon |
+| ASR + diarization | Parakeet + FluidAudio on the ANE | faster-whisper + pyannote 3.1 | — |
+| Audio capture | ScreenCaptureKit / BlackHole + avfoundation | PipeWire | — |
+| Acceleration | Apple Neural Engine + Metal | CUDA (NVIDIA) / CPU | — |
 | Desktop panel | Chrome --app | Chrome --app | — |
 
 ---
@@ -303,19 +331,25 @@ npx create-heed update   # Update from anywhere
 
 ## Roadmap
 
-- [ ] Real-time streaming transcription during recording (partial — live preview active)
+heed ships continuously on **both** macOS and Linux.
+
 - [ ] Export to Markdown / Obsidian / Notion
 - [ ] Session search across all meetings
 - [ ] Keyboard shortcut for global record toggle
-- [ ] Weekly meeting digest via Ollama
+- [ ] Weekly meeting digest, generated locally
 - [ ] Google Calendar integration
+- [ ] Linux: bring live streaming diarization and voice-clustering to parity with the Mac engine
 - [ ] Windows support (WASAPI loopback)
 
 ---
 
 ## For Meetily users
 
-If you're here because Meetily didn't compile on your Linux distro — welcome. heed was built specifically to fill that gap. No Electron. No broken deps. No cmake nightmares. Just `npx create-heed` and you're running in 2 minutes.
+If you love the idea of local, open-source meeting notes, you'll feel at home here.
+
+Meetily is a great project, and on macOS and Windows it's first-class. On Linux, though, it's build-from-source — you install the CUDA/ROCm/Vulkan SDKs, run cmake, and hope it links. heed's whole install story is one line: `npx create-heed`, no SDK, no cmake, no build gymnastics, on either OS.
+
+Once you're in, heed adds a few things you may have been missing: it recognizes recurring speakers by voice across meetings, detects when two people talk over each other, and — on Apple Silicon — runs its entire ASR + diarization engine on the Neural Engine at up to ~140x real-time. Same local-first principle, less friction, more signal.
 
 ---
 
@@ -333,7 +367,7 @@ PRs welcome. The codebase is clean and typed. Start with `bun run dev` and explo
 
 ## Acknowledgments
 
-Inspired by [trx](https://github.com/crafter-station/trx) by CrafterStation.
+Inspired by [trx](https://github.com/crafter-station/trx) by [CrafterStation](https://www.crafterstation.com/). Apple Silicon inference is powered by [FluidAudio](https://github.com/FluidInference/FluidAudio).
 
 ---
 

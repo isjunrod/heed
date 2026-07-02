@@ -6,7 +6,7 @@ Opens heed in a standalone Chrome/Chromium window (no tabs, no URL bar).
 Optionally sets the window to always-on-top so it floats over Zoom/Meet.
 
 Usage:
-  python3 packages/desktop/main.py          # connects to running dev server (:5000)
+  python3 packages/desktop/main.py          # connects to running dev server (:5170)
   python3 packages/desktop/main.py --prod   # connects to built app (:5001)
 
 Requires: Google Chrome or Chromium installed.
@@ -20,7 +20,7 @@ import signal
 import platform
 
 PROD_MODE = "--prod" in sys.argv
-DEV_URL = "http://localhost:5000"
+DEV_URL = "http://localhost:5170"
 PROD_URL = "http://localhost:5001"
 APP_URL = PROD_URL if PROD_MODE else DEV_URL
 

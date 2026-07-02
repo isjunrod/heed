@@ -7,7 +7,9 @@ const SERVER_URL = process.env.VITE_API_BASE || "http://localhost:5001";
 export default defineConfig({
 	plugins: [react()],
 	server: {
-		port: 5000,
+		// 5170 (not 5000): macOS AirPlay Receiver squats on :5000, so a fresh Mac whose browser resolves
+		// localhost to IPv4 would hit AirPlay instead of heed. 5170 is free and Vite-adjacent (default 5173).
+		port: 5170,
 		strictPort: true,
 		proxy: {
 			"/api": {

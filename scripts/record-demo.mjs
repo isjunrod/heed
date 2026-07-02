@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 
 const WIDTH = 1920;
 const HEIGHT = 1550;
-const BASE = "http://localhost:5000";
+const BASE = "http://localhost:5170";
 
 const SPEAKERS = [
   { name: "Me", color: "#2563EB" },

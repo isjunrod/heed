@@ -7,3 +7,6 @@
 {"label": "produccion-final", "dedup": true, "echo_in_mic": 0.0, "junior_kept": 0.77, "score": 0.73, "n_echo_samples": 8, "n_jun_samples": 11}
 {"label": "gate0.008+dedup", "dedup": true, "echo_in_mic": 0.0, "junior_kept": 0.747, "score": 0.708, "n_echo_samples": 8, "n_jun_samples": 11}
 {"label": "gate0.012+dedup", "dedup": true, "echo_in_mic": 0.0, "junior_kept": 0.705, "score": 0.67, "n_echo_samples": 8, "n_jun_samples": 11}
+{"label": "relgate+dedup", "dedup": true, "echo_in_mic": 0.0, "junior_kept": 0.706, "score": 0.642, "n_echo_samples": 8, "n_jun_samples": 11}
+{"label": "relgate0.25+dedup", "dedup": true, "echo_in_mic": 0.0, "junior_kept": 0.733, "score": 0.679, "n_echo_samples": 8, "n_jun_samples": 11}
+{"label": "final-v2", "dedup": true, "echo_in_mic": 0.0, "junior_kept": 0.747, "score": 0.698, "n_echo_samples": 8, "n_jun_samples": 11}

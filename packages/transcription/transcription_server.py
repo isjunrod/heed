@@ -271,8 +271,16 @@ def dedup_echo(mic_txt, sys_txt, thr=None):
 #   - Qwen 2.5:  qwenlm.github.io/blog/qwen2.5 (Sept 2024)
 #   - Gemma 3:   blog.google (March 2025)
 #   - Gemma 4:   blog.google (April 2026), Apache 2.0, multimodal, 256K ctx
-PYANNOTE_RESERVE_MB = 1500   # pyannote 3.1 model + clustering tensors
+PYANNOTE_RESERVE_MB = 1500   # pyannote 3.1 model + clustering tensors (Linux/CUDA only)
 SAFETY_MARGIN_MB = 500       # transient PyTorch allocator overhead
+# Apple Silicon has unified memory (no separate VRAM) and diarizes with FluidAudio on the ANE
+# (not pyannote), so the pyannote reserve does NOT apply. We only hold back headroom for the OS +
+# browser + heed's own ANE model working set, per the "use ~70-80%, leave 20-30% ceiling" target.
+MAC_HEADROOM_RESERVE_MB = 3000
+# The DEFAULT recommendation on Mac stays deliberately conservative: pick the best model that fits in
+# roughly half of unified memory, so a live meeting (Zoom + browser + heed on the ANE) never swaps.
+# The user can still choose a bigger model — this only bounds the auto-suggested default.
+MAC_DEFAULT_BUDGET_FRACTION = 0.5
 
 MODEL_CATALOG = [
     # --- Llama family (Meta) ---
@@ -370,13 +378,17 @@ MODEL_CATALOG = [
 ]
 
 
-def model_fits_gpu(model, free_vram_mb):
-    """A model is GPU-safe if loading it leaves enough VRAM for pyannote + safety margin."""
-    needed = model["vram_mb"] + PYANNOTE_RESERVE_MB + SAFETY_MARGIN_MB
+def model_fits_gpu(model, free_vram_mb, pyannote_reserve=PYANNOTE_RESERVE_MB):
+    """A model is GPU-safe if loading it leaves enough memory for the diarizer + safety margin.
+
+    On Linux/CUDA, pyannote shares the GPU so we reserve PYANNOTE_RESERVE_MB. On Apple Silicon the
+    diarizer is FluidAudio on the ANE (negligible unified-memory cost) → caller passes pyannote_reserve=0.
+    """
+    needed = model["vram_mb"] + pyannote_reserve + SAFETY_MARGIN_MB
     return free_vram_mb >= needed
 
 
-def pick_default_model(free_vram_mb):
+def pick_default_model(free_vram_mb, pyannote_reserve=PYANNOTE_RESERVE_MB):
     """Pick the highest-quality model that fits the GPU.
 
     Tie-break: respect catalog order (Llama before Qwen before Gemma) so the picker
@@ -384,7 +396,7 @@ def pick_default_model(free_vram_mb):
     is honored. Falls back to the smallest LLM if nothing fits.
     """
     quality_rank = {"good": 1, "very_good": 2, "excellent": 3, "best": 4}
-    fitting = [(i, m) for i, m in enumerate(MODEL_CATALOG) if model_fits_gpu(m, free_vram_mb)]
+    fitting = [(i, m) for i, m in enumerate(MODEL_CATALOG) if model_fits_gpu(m, free_vram_mb, pyannote_reserve)]
     if fitting:
         # Highest quality desc, then earliest in catalog asc
         fitting.sort(key=lambda x: (-quality_rank.get(x[1].get("quality"), 0), x[0]))
@@ -394,11 +406,45 @@ def pick_default_model(free_vram_mb):
     return cpu_fallback[0] if cpu_fallback else None
 
 
+def _apple_chip_name():
+    """Best-effort Apple Silicon chip label, e.g. 'Apple M5'. Falls back to 'Apple Silicon'."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, timeout=2,
+        )
+        name = (out.stdout or "").strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return "Apple Silicon"
+
+
+def apple_unified_memory_info():
+    """Single source of truth for Apple Silicon 'GPU' memory (unified RAM).
+
+    BOTH get_hardware_info() (the AI-notes model picker / GPU-fit warning) and get_device_config()
+    (transcription device placement) read THIS, so the two can never again disagree about the same
+    chip — which was exactly the bug that made a 16GB M5 report "doesn't fit in your GPU".
+    """
+    ram_mb = get_system_ram_mb()
+    return {
+        "gpu_name": _apple_chip_name(),
+        "total_vram_mb": ram_mb,  # unified memory
+        # Stable budget: total minus OS/browser/ANE-working-set headroom. No transient "free VRAM"
+        # concept on unified memory (nothing hogs a separate pool the way Steam/Chrome hog CUDA VRAM).
+        "free_vram_mb": max(0, ram_mb - MAC_HEADROOM_RESERVE_MB),
+    }
+
+
 def get_hardware_info():
     """Return current hardware capabilities + which models are GPU-compatible.
 
-    Frontend uses this to render the model picker, hiding/disabling models
-    that would crash pyannote.
+    Frontend uses this to render the model picker + the AI-notes GPU/CPU warning. On Apple Silicon
+    "GPU" means Metal over unified memory (Ollama) and the diarizer is FluidAudio on the ANE, so the
+    CUDA probe below never applies — the Apple branch fills the same fields from unified RAM instead.
     """
     info = {
         "gpu_available": False,
@@ -411,16 +457,38 @@ def get_hardware_info():
         "default_model": None,
         "models": [],
     }
+    # How much memory to hold back for the diarizer when deciding if an LLM fits (0 on Mac — FluidAudio
+    # runs on the ANE, not in the unified-memory pool Ollama draws from).
+    pyannote_reserve = PYANNOTE_RESERVE_MB
+
+    # Apple Silicon: detect WITHOUT importing torch (a Mac-lite install has none). Must precede the
+    # `import torch` CUDA probe, and mirrors get_device_config()'s torchless Apple branch.
     try:
-        import torch
-        if torch.cuda.is_available():
-            free_b, total_b = torch.cuda.mem_get_info(0)
-            info["gpu_available"] = True
-            info["gpu_name"] = torch.cuda.get_device_name(0)
-            info["total_vram_mb"] = int(total_b // 1024 // 1024)
-            info["free_vram_mb"] = int(free_b // 1024 // 1024)
-    except Exception as e:
-        print(f"[heed] hardware probe failed: {e}", flush=True)
+        import engines
+        _apple = engines.is_apple_silicon()
+    except Exception:
+        _apple = False
+
+    if _apple:
+        mem = apple_unified_memory_info()  # shared with get_device_config — single source of truth
+        info["gpu_available"] = True
+        info["gpu_name"] = mem["gpu_name"]
+        info["total_vram_mb"] = mem["total_vram_mb"]
+        info["free_vram_mb"] = mem["free_vram_mb"]
+        info["pyannote_reserve_mb"] = 0
+        pyannote_reserve = 0
+        print(f"[heed] Apple Silicon hardware: {info['gpu_name']} ({info['total_vram_mb']}MB unified)", flush=True)
+    else:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info(0)
+                info["gpu_available"] = True
+                info["gpu_name"] = torch.cuda.get_device_name(0)
+                info["total_vram_mb"] = int(total_b // 1024 // 1024)
+                info["free_vram_mb"] = int(free_b // 1024 // 1024)
+        except Exception as e:
+            print(f"[heed] hardware probe failed: {e}", flush=True)
 
     # Tier classifies the HARDWARE (use total VRAM), not current state.
     # Free VRAM is what we use to filter individual models below.
@@ -445,8 +513,8 @@ def get_hardware_info():
     # uses this to warn the user if they need to free memory before installing a
     # large model — but it does NOT use it to hide models from the catalog.
     for m in MODEL_CATALOG:
-        gpu_ok = info["gpu_available"] and model_fits_gpu(m, total)
-        runtime_ok = info["gpu_available"] and model_fits_gpu(m, free)
+        gpu_ok = info["gpu_available"] and model_fits_gpu(m, total, pyannote_reserve)
+        runtime_ok = info["gpu_available"] and model_fits_gpu(m, free, pyannote_reserve)
         info["models"].append({
             **m,
             "gpu_compatible": gpu_ok,
@@ -459,7 +527,12 @@ def get_hardware_info():
     # Ollama loads it, steals VRAM from pyannote, and everything OOMs.
     # The catalog still uses TOTAL (so we don't hide models), but "recommended"
     # must be something that runs on first click without closing anything.
-    default = pick_default_model(free)
+    #
+    # On Mac, unified memory is shared LIVE with the meeting apps (Zoom/browser), so the auto-suggested
+    # default stays in ~half of RAM — a comfortable sweet-spot, not the biggest model that fits. The
+    # user can always pick a bigger one; `gpu_runtime_ok` above still permits it.
+    default_budget = int(total * MAC_DEFAULT_BUDGET_FRACTION) if _apple else free
+    default = pick_default_model(default_budget, pyannote_reserve)
     info["default_model"] = default["id"] if default else None
     return info
 
@@ -476,26 +549,44 @@ def get_device_config():
     - <1.5GB free: both on CPU
     - No CUDA: both on CPU
     """
-    import torch
-
     cpu_count = os.cpu_count() or 0
     ram_mb = get_system_ram_mb()
 
-    # Apple Silicon MPS (Metal Performance Shaders) support
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        print(f"[heed] Apple Silicon MPS detected ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
-        print("[heed] Strategy: pyannote on MPS, whisper on CPU", flush=True)
+    # Apple Silicon: detect WITHOUT importing torch. On Mac the engine is Parakeet/FluidAudio running on
+    # the ANE via the Swift sidecar — torch is only a Linux/CPU-fallback dep, and a Mac-lite install has
+    # NO torch. This branch MUST come before `import torch` or a torchless Mac crashes at boot.
+    try:
+        import engines
+        _apple = engines.is_apple_silicon()
+    except Exception:
+        _apple = False
+    if _apple:
+        mem = apple_unified_memory_info()  # shared with get_hardware_info — single source of truth
+        print(f"[heed] Apple Silicon detected: {mem['gpu_name']} ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
+        print("[heed] Strategy: diarization on Metal/ANE (FluidAudio), whisper fallback on CPU", flush=True)
         return {
-            "whisper": "cpu",  # faster-whisper uses CTranslate2, not PyTorch — CPU is fastest
-            "pyannote": "mps",
+            "whisper": "cpu",  # faster-whisper (fallback) uses CTranslate2, not PyTorch — CPU is fastest
+            "pyannote": "mps",  # placeholder; on Mac-parakeet pyannote is never loaded (FluidAudio diarizes)
             "gpu_available": True,
-            "gpu_name": "Apple Silicon (MPS)",
-            "total_vram_mb": ram_mb,  # MPS shares system RAM
-            "free_vram_mb": ram_mb // 2,  # conservative estimate
+            "gpu_name": mem["gpu_name"],
+            "total_vram_mb": mem["total_vram_mb"],  # unified memory
+            "free_vram_mb": mem["free_vram_mb"],
+            "cpu_count": cpu_count,
+            "ram_mb": ram_mb,
+        }
+
+    # non-Apple (Linux/Windows): torch is needed to probe CUDA. Torchless → all CPU (never crash).
+    try:
+        import torch
+    except Exception:
+        print(f"[heed] torch unavailable — CPU for all models ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
+        return {
+            "whisper": "cpu", "pyannote": "cpu", "gpu_available": False, "gpu_name": None,
+            "free_vram_mb": 0, "total_vram_mb": 0, "cpu_count": cpu_count, "ram_mb": ram_mb,
         }
 
     if not torch.cuda.is_available():
-        print(f"[heed] No CUDA/MPS — using CPU for all models ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
+        print(f"[heed] No CUDA — using CPU for all models ({cpu_count} cores, {ram_mb}MB RAM)", flush=True)
         return {
             "whisper": "cpu",
             "pyannote": "cpu",
@@ -751,7 +842,13 @@ def load_models():
     global whisper_model, whisper_model_live, diarize_pipeline, whisper_model_name, whisper_model_live_name, whisper_runtime_info, pyannote_runtime_info, diarize_backend
     global live_governor, _devices, _warmup_path, live_tuning, active_engine, models_warm
 
-    devices = get_device_config()
+    try:
+        devices = get_device_config()
+    except Exception as e:
+        print(f"[heed] device detection failed ({str(e)[:60]}) — CPU defaults", flush=True)
+        devices = {"whisper": "cpu", "pyannote": "cpu", "gpu_available": False, "gpu_name": None,
+                   "free_vram_mb": 0, "total_vram_mb": 0, "cpu_count": os.cpu_count() or 0,
+                   "ram_mb": get_system_ram_mb()}
     _devices = devices
     print(f"[heed] Transcription profile: {TRANSCRIPTION_PROFILE}", flush=True)
 
@@ -811,21 +908,28 @@ def load_models():
         pass
 
     t = time.time()
-    whisper_model, whisper_model_name = _load_whisper_with_fallback(whisper_model_name, devices, _warmup_path, "final")
-    models_ready["whisper"] = True
-    print(f"[heed] Whisper final={whisper_model_name} ready in {time.time()-t:.1f}s ({engine_kind})", flush=True)
-
-    # Live preview: a SEPARATE, lighter model for low latency. Reuse the final instance if they
-    # ended up the same name (saves memory). Live also degrades gracefully on its own.
-    if whisper_model_live_name and whisper_model_live_name != whisper_model_name:
-        t_live = time.time()
-        print(f"[heed] Loading live whisper {whisper_model_live_name} ({engine_kind})...", flush=True)
-        whisper_model_live, whisper_model_live_name = _load_whisper_with_fallback(whisper_model_live_name, devices, _warmup_path, "live")
-        print(f"[heed] Whisper live={whisper_model_live_name} ready in {time.time()-t_live:.1f}s", flush=True)
+    # On Apple Silicon the ENGINE is Parakeet (ANE) for both live and post-stop — Whisper is only ever
+    # touched by the file-upload path (/api/transcribe → /process-stream) and the non-parakeet live
+    # chunk mode. So DON'T load Whisper at boot on parakeet: it wasted ~1-3GB of RAM and slowed the
+    # cold-start. It lazy-loads on first file upload via _ensure_whisper(). (Linux/CPU: unchanged.)
+    if engine_kind != "parakeet":
+        whisper_model, whisper_model_name = _load_whisper_with_fallback(whisper_model_name, devices, _warmup_path, "final")
+        models_ready["whisper"] = True
+        print(f"[heed] Whisper final={whisper_model_name} ready in {time.time()-t:.1f}s ({engine_kind})", flush=True)
+        # Live preview: a SEPARATE, lighter model for low latency. Reuse the final instance if they
+        # ended up the same name (saves memory). Live also degrades gracefully on its own.
+        if whisper_model_live_name and whisper_model_live_name != whisper_model_name:
+            t_live = time.time()
+            print(f"[heed] Loading live whisper {whisper_model_live_name} ({engine_kind})...", flush=True)
+            whisper_model_live, whisper_model_live_name = _load_whisper_with_fallback(whisper_model_live_name, devices, _warmup_path, "live")
+            print(f"[heed] Whisper live={whisper_model_live_name} ready in {time.time()-t_live:.1f}s", flush=True)
+        else:
+            whisper_model_live = whisper_model
+            whisper_model_live_name = whisper_model_name
+            print(f"[heed] Whisper live = final (same {whisper_model_live_name} instance, saves RAM)", flush=True)
     else:
-        whisper_model_live = whisper_model
-        whisper_model_live_name = whisper_model_name
-        print(f"[heed] Whisper live = final (same {whisper_model_live_name} instance, saves RAM)", flush=True)
+        models_ready["whisper"] = True  # parakeet handles transcription; whisper lazy-loads if needed
+        print(f"[heed] Whisper NOT loaded at boot (engine=parakeet) — lazy on file-upload only, frees ~1-3GB RAM", flush=True)
 
     # Arm the RuntimeGovernor for the live preview: it self-corrects the live model under
     # recording-time contention (the 8-15s regression). Ceiling = the policy's live pick so it
@@ -866,23 +970,31 @@ def load_models():
     # Non-blocking: the server is ready immediately; the warm finishes within seconds of boot. If
     # the user records before it finishes, the lazy path still works (just the old cold-start).
     if engine_kind == "parakeet":
-        warm_clip = _warmup_path
+        # Warm with a REAL-VOICE clip (not silence): silence skips the ANE kernels that real mel
+        # features exercise, so the first real inference still paid a compile cost (part of the ~10s
+        # cold-start). A 2s speech clip compiles the same path the first record hits → first text <1s.
+        _voice_clip = os.path.join(os.path.dirname(__file__), "_warmup_voice.wav")
+        warm_clip = _voice_clip if os.path.exists(_voice_clip) else _warmup_path
         def _prewarm_stream():
             global models_warm
             try:
-                eng = engines.get_parakeet()
+                asr = engines.get_parakeet()            # ASR sidecar (ANE)
                 have_clip = bool(warm_clip) and os.path.exists(warm_clip)
                 for ch in ("mic", "sys"):
-                    eng.stream_start("en", ch)
+                    asr.stream_start("en", ch)
                     if have_clip:
-                        eng.stream_feed(warm_clip, ch)
-                    eng.stream_finish(ch)
-                eng.diar_start()
-                if have_clip:
-                    eng.diar_feed(warm_clip)
-                eng.diar_finish()
+                        asr.stream_feed(warm_clip, ch)
+                    asr.stream_finish(ch)
+                # Warm the DEDICATED diarization sidecar (GPU) — the live /diar/live path is the offline
+                # `diarize`. Runs in parallel with ASR so warming it doesn't stall the ASR warm.
+                try:
+                    diar = engines.get_parakeet_diar()
+                    if have_clip:
+                        diar.diarize(warm_clip)
+                except Exception:
+                    pass
                 models_warm = True
-                print("[heed] Live models pre-warmed (ASR mic+sys + diarization) — first record is instant", flush=True)
+                print("[heed] Live models pre-warmed (ASR sidecar + diarization sidecar) — first record is instant", flush=True)
             except Exception as e:
                 models_warm = True  # don't block recording forever if warm fails
                 print(f"[heed] Stream pre-warm skipped: {str(e)[:80]}", flush=True)
@@ -905,7 +1017,7 @@ def load_models():
     if engine_kind == "parakeet" and engines.parakeet_available():
         try:
             t = time.time()
-            engines.get_parakeet()  # warms the sidecar (ASR + diarization models) if not already
+            engines.get_parakeet_diar()  # ensure the dedicated diarization sidecar (GPU) is up
             diarize_backend = "parakeet"
             models_ready["pyannote"] = True
             pyannote_runtime_info = {
@@ -1023,8 +1135,34 @@ def assess_audio_quality(text, audio_s, peak):
     return {"ok": True, "reason": "", "hint": ""}
 
 
+def _ensure_whisper():
+    """Lazy-load the final Whisper model on first use. On parakeet (Apple Silicon) the boot skips
+    loading Whisper to save RAM; the only callers are the file-upload paths, so we pay the load once
+    here, on demand."""
+    global whisper_model, whisper_model_name
+    if whisper_model is None:
+        with whisper_lock:
+            if whisper_model is None:
+                name = whisper_model_name or "small"
+                whisper_model, whisper_model_name = _load_whisper_with_fallback(name, _devices, _warmup_path, "final-lazy")
+                models_ready["whisper"] = True
+                print(f"[heed] Whisper lazy-loaded ({whisper_model_name}) for file upload", flush=True)
+    return whisper_model
+
+
+def _ensure_whisper_live():
+    """Lazy-load the live Whisper model (non-parakeet live chunk mode). Reuses the final instance."""
+    global whisper_model_live, whisper_model_live_name
+    if whisper_model_live is None:
+        m = _ensure_whisper()
+        whisper_model_live = m
+        whisper_model_live_name = whisper_model_name
+    return whisper_model_live
+
+
 def transcribe(wav_path, language="auto", srt_output=None):
     lang = None if language == "auto" else language
+    _ensure_whisper()
     # Lock: whisper model is not thread-safe — serialize access.
     with whisper_lock:
         segments_gen, info = whisper_model.transcribe(wav_path, language=lang, **WHISPER_OPTS)
@@ -1119,7 +1257,10 @@ def current_backend():
 #   wespeaker  : 0.5, tuned on M5 (FluidAudio WeSpeaker v2, 256-dim L2-normalized). Measured a
 #                huge separation: SAME voice across disjoint 70s windows = 0.71 (near windows 0.94),
 #                DIFFERENT voices = ~0.0 (orthogonal). 0.5 sits well clear of both sides.
-MATCH_THRESHOLD = {"pyannote": 0.7, "wespeaker": 0.5}
+MATCH_THRESHOLD = {"pyannote": 0.7, "wespeaker": 0.5}  # wespeaker 0.5: RECOGNITION-first (do not break
+# the brilliant post-stop). A higher threshold (0.78) missed a real saved voice matching at 0.70 while a
+# different speaker matched at 0.76 → no threshold separates them. Reliable naming needs CLEAN voiceprints
+# (enrollment), not a threshold. 0.5 keeps recognizing known voices as before.
 
 def cosine_similarity(a, b):
     import math
@@ -1154,9 +1295,14 @@ def save_voice(name, embedding, backend):
     save_voices(voices)
     return len(voices)
 
+UPDATE_COUNT_CAP = 8       # cap the averaging weight so a voice never becomes a blurry "attractor"
+UPDATE_DRIFT_MIN = 0.6     # reject an update whose sample is far from the current print (contamination)
+
 def update_voice(name, embedding, backend):
-    """Running-mean update so a recognized voice's profile sharpens over sessions (decision 4).
-    Re-normalizes (embeddings are L2-normalized) and bumps the sample count."""
+    """Running-mean update so a recognized voice's profile sharpens over sessions — but CONSERVATIVE:
+    the averaging weight is capped (so a voice can't become a blurry magnet that matches everyone, which
+    is how a saved voice got corrupted matching a different-gender speaker), and an update whose sample
+    drifts far from the current print is rejected (that would be a wrong match contaminating the voice)."""
     import math
     voices = load_voices()
     entry = voices.get(name)
@@ -1165,13 +1311,343 @@ def update_voice(name, embedding, backend):
     old = entry.get("embedding", [])
     if len(old) != len(embedding):
         return
-    count = int(entry.get("count", 1))
+    # drift guard: only average in a sample that's clearly the SAME voice as the current print
+    if cosine_similarity(old, embedding) < UPDATE_DRIFT_MIN:
+        return
+    count = min(int(entry.get("count", 1)), UPDATE_COUNT_CAP)  # cap the weight
     merged = [(o * count + n) / (count + 1) for o, n in zip(old, embedding)]
     norm = math.sqrt(sum(x * x for x in merged)) or 1.0
     merged = [x / norm for x in merged]
-    entry.update({"embedding": merged, "count": count + 1, "updatedAt": _now_iso()})
+    entry.update({"embedding": merged, "count": min(count + 1, UPDATE_COUNT_CAP + 1), "updatedAt": _now_iso()})
     voices[name] = entry
     save_voices(voices)
+
+
+# --- Live rolling diarization session (the "post-stop en vivo" approach) -----------------------
+# Instead of streaming Sortformer (which over-segments one speaker into phantom Speaker 2/3), we run
+# the OFFLINE diarizer (same engine as the brilliant post-stop) on a rolling window every ~2s and
+# reconcile speakers across windows by their 256-dim voiceprint. Proven in eval_diar/ over Junior's 3
+# recordings: 0 phantom speakers, conservative naming (never a wrong name). See eval_diar/DIAR_TUNING.md.
+def _emb_avg(vecs, weights):
+    n = len(vecs[0]); out = [0.0] * n; tw = sum(weights) or 1.0
+    for v, w in zip(vecs, weights):
+        for i in range(n):
+            out[i] += v[i] * w
+    return [x / tw for x in out]
+
+
+class DiarSession:
+    """Per-recording live diarization state. feed() takes one window's offline-diarizer output
+    (segments + per-speaker embeddings) and returns the STABLE, conservatively-named speaker talking
+    NOW. Reset at record start via diar_live_reset()."""
+    # Tuned via eval_diar sweep over the 4 recent recordings (0 phantoms, 0 flickers, echo-robust).
+    MERGE = 0.45         # collapse a single speaker the short window split (diff people ≤0.19 → safe)
+    RECON = 0.55         # match a window speaker to an existing session speaker (kept conservative)
+    CONSOLIDATE = 0.5    # merge accidental session-speaker splits
+    NAME_THR = 0.62      # recognition-first (reverted from 0.78, which missed a real voice at 0.70).
+                         # Reliable naming needs clean voiceprints (enrollment), not a high threshold.
+    NAME_MARGIN = 0.08   # top1 must beat top2 by this → no ambiguous names
+    NAME_MINDUR = 4.0    # accumulated speech before a name is allowed
+    CUR_SLICE = 1.5      # "who talks NOW" = dominant speaker in the last N s of the window
+    CONFIRM = 2          # hysteresis: a NEW speaker must dominate this many consecutive windows before
+                         # the shown label switches → kills 1-2 tick flickers (what Junior saw as the
+                         # "man split in 2"). First speaker (from None) shows immediately.
+    backend = "wespeaker"
+
+    def __init__(self):
+        self.speakers = []   # {label, emb, dur, name, name_score}
+        self.alias = {}
+        self.n = 0
+        self._shown = None   # currently displayed session label (post-hysteresis)
+        self._cand = None    # candidate label building confirmations
+        self._cand_n = 0
+
+    def _resolve(self, label):
+        seen = set()
+        while label in self.alias and label not in seen:
+            seen.add(label); label = self.alias[label]
+        return label
+
+    def _merge_within(self, embs, durs):
+        groups = []
+        for sid in sorted(embs.keys(), key=lambda k: -durs.get(k, 0)):
+            hit = None
+            for g in groups:
+                if cosine_similarity(embs[sid], g["emb"]) >= self.MERGE:
+                    hit = g; break
+            if hit is None:
+                groups.append({"ids": [sid], "emb": list(embs[sid]), "dur": durs[sid]})
+            else:
+                hit["emb"] = _emb_avg([hit["emb"], embs[sid]], [hit["dur"], durs[sid]])
+                hit["dur"] += durs[sid]; hit["ids"].append(sid)
+        return groups
+
+    def _reconcile(self, groups):
+        mapping = {}
+        for gi, g in enumerate(groups):
+            best, bs = None, 0.0
+            for sp in self.speakers:
+                c = cosine_similarity(g["emb"], sp["emb"])
+                if c > bs:
+                    bs, best = c, sp
+            if best is None or bs < self.RECON:
+                self.n += 1
+                best = {"label": f"Speaker {self.n}", "emb": list(g["emb"]), "dur": 0.0,
+                        "name": None, "name_score": 0.0}
+                self.speakers.append(best)
+            else:
+                best["emb"] = _emb_avg([best["emb"], g["emb"]], [best["dur"], g["dur"]])
+            best["dur"] += g["dur"]
+            mapping[gi] = best["label"]
+        return mapping
+
+    def _consolidate(self):
+        order = sorted(self.speakers, key=lambda s: -s["dur"]); merged = []
+        for sp in order:
+            hit = next((m for m in merged if cosine_similarity(sp["emb"], m["emb"]) >= self.CONSOLIDATE), None)
+            if hit is None:
+                merged.append(sp)
+            else:
+                hit["emb"] = _emb_avg([hit["emb"], sp["emb"]], [hit["dur"], sp["dur"]]); hit["dur"] += sp["dur"]
+                if sp["name"] and sp["name_score"] > hit["name_score"]:
+                    hit["name"], hit["name_score"] = sp["name"], sp["name_score"]
+                self.alias[sp["label"]] = hit["label"]
+        self.speakers = merged
+
+    def _name(self):
+        voices = [(nm, e) for nm, e in load_voices().items() if e.get("backend") == self.backend]
+        for sp in self.speakers:
+            if sp["dur"] < self.NAME_MINDUR:
+                continue
+            scored = sorted((cosine_similarity(sp["emb"], e.get("embedding", [])), nm) for nm, e in voices)
+            if not scored:
+                continue
+            top_s, top_n = scored[-1]
+            second_s = scored[-2][0] if len(scored) > 1 else 0.0
+            if top_s >= self.NAME_THR and (top_s - second_s) >= self.NAME_MARGIN and top_s > sp["name_score"]:
+                sp["name"], sp["name_score"] = top_n, top_s
+
+    def _display(self, label):
+        label = self._resolve(label)
+        for sp in self.speakers:
+            if sp["label"] == label:
+                return sp["name"] or sp["label"]
+        return label
+
+    def feed(self, segments, embeddings, window_s=None):
+        durs = {}
+        for s in segments:
+            k = str(s["speaker"]); durs[k] = durs.get(k, 0.0) + (float(s["end"]) - float(s["start"]))
+        embs = {str(k): v for k, v in embeddings.items() if str(k) in durs and v}
+        if not embs:
+            return {"speaker": None, "label": None,
+                    "speakers": [sp["name"] or sp["label"] for sp in self.speakers]}
+        groups = self._merge_within(embs, durs)
+        mapping = self._reconcile(groups)
+        self._consolidate()
+        self._name()
+        # who talks NOW = dominant speaker in the last CUR_SLICE s of the window, anchored at the
+        # window END (== the current recording position) so silence at the tail doesn't shift it.
+        now = float(window_s) if window_s else max(float(s["end"]) for s in segments)
+        lo = now - self.CUR_SLICE
+        best_s, best_ov = None, 0.0
+        for s in segments:
+            ov = min(now, float(s["end"])) - max(lo, float(s["start"]))
+            if ov > best_ov:
+                best_ov, best_s = ov, s
+        raw_label = None
+        if best_s is not None:
+            gi = next((i for i, g in enumerate(groups) if str(best_s["speaker"]) in g["ids"]), None)
+            if gi is not None:
+                raw_label = self._resolve(mapping[gi])   # stable session identity of who talks now
+        # Hysteresis: switch the SHOWN speaker only when a NEW one is confirmed across CONFIRM windows.
+        # From silence/first-ever speaker, switch immediately (no flicker risk). A 1-tick blip never
+        # reaches CONFIRM → the shown label stays put. Brief None (gap) keeps the last shown speaker.
+        if raw_label is not None:
+            if raw_label == self._shown:
+                self._cand, self._cand_n = None, 0
+            elif self._shown is None:
+                self._shown = raw_label; self._cand, self._cand_n = None, 0
+            else:
+                if raw_label == self._cand:
+                    self._cand_n += 1
+                else:
+                    self._cand, self._cand_n = raw_label, 1
+                if self._cand_n >= self.CONFIRM:
+                    self._shown = raw_label; self._cand, self._cand_n = None, 0
+        shown = self._shown
+        cur = self._display(shown) if shown is not None else None
+        return {"speaker": cur, "label": shown, "raw_label": raw_label,
+                "speakers": [sp["name"] or sp["label"] for sp in self.speakers]}
+
+
+_diar_session = DiarSession()
+
+
+class MicFilter(DiarSession):
+    """Keeps ONLY the owner's (Junior's) voice on the mic channel; suppresses foreign audio the laptop
+    mic picks up acoustically (external TV, another person in the room) — the case the 3 echo layers
+    can't touch (no system-channel reference for external audio). Uses the voice RAG: diarize the mic,
+    identify the owner cluster (matched to the saved voice, else the dominant cluster since it's HIS
+    mic), and suppress anything that's a DIFFERENT voice. Conservative: a single-voice mic is always
+    kept (never drops the owner); with a weak owner voiceprint it only suppresses a clearly-matched
+    owner's counterpart. Auto-learns the owner's voiceprint from the consistent cluster (never the TV,
+    which is far from the print)."""
+    OWNER = "Junior"
+    OWNER_MATCH = 0.45     # cosine to the saved owner voice to call a cluster "the owner" (for learn)
+    OWNER_KEEP = 0.30      # keep the mic if the CURRENT voice is at least this close to the owner print.
+                           # Owner splits (quiet/noisy mic) stay >0.3; a foreign voice (TV) is <0.15 →
+                           # clean separation, and we NEVER drop the owner over a noisy split.
+    LEARN_CONSISTENT = 0.40  # only learn from a cluster within this cosine of the existing print
+    STRONG_COUNT = 5       # owner voiceprint is "strong" enough to filter at/after this sample count
+    FOREIGN_CONFIRM = 2    # require N consecutive foreign windows before gating → never drop a brief
+                           # noisy owner segment; instantly un-gate the moment the owner is detected
+
+    def __init__(self):
+        super().__init__()
+        self._foreign_streak = 0
+
+    def _owner_cluster(self):
+        """(label, score, how) of the cluster that is the owner. how: 'matched'|'dominant'|'none'."""
+        ov = load_voices().get(self.OWNER)
+        if ov and ov.get("backend") == self.backend and self.speakers:
+            emb = ov.get("embedding", [])
+            best, bs = None, 0.0
+            for sp in self.speakers:
+                c = cosine_similarity(sp["emb"], emb)
+                if c > bs:
+                    bs, best = c, sp
+            if best and bs >= self.OWNER_MATCH:
+                return best["label"], bs, "matched"
+        if self.speakers:
+            dom = max(self.speakers, key=lambda s: s["dur"])
+            return dom["label"], 0.0, "dominant"
+        return None, 0.0, "none"
+
+    def classify(self, segments, embeddings, window_s=None):
+        """-> {keep: bool, reason}. keep=False means the current mic voice is NOT the owner (filter it).
+        Decision is DIRECT: cosine(current voice, owner voiceprint). Robust to the owner's own mic being
+        split into several clusters (a noisy/quiet mic) — every owner split still sits well above the
+        threshold, while a foreign voice (TV) is near-orthogonal. Only filters with a STRONG print;
+        a weak/absent print keeps everything (never drop the owner)."""
+        res = self.feed(segments, embeddings, window_s)
+        cur = res.get("label")
+        if cur is None:
+            return {"keep": True, "reason": "silence"}
+        ov = load_voices().get(self.OWNER)
+        if not ov or ov.get("backend") != self.backend or int(ov.get("count", 1)) < self.STRONG_COUNT:
+            return {"keep": True, "reason": "weak-owner-keep"}   # not enough voiceprint yet → keep all
+        lab = self._resolve(cur)
+        sp = next((s for s in self.speakers if s["label"] == lab), None)
+        if sp is None:
+            return {"keep": True, "reason": "no-cluster"}
+        sim = cosine_similarity(sp["emb"], ov.get("embedding", []))
+        if sim >= self.OWNER_KEEP:
+            self._foreign_streak = 0
+            return {"keep": True, "reason": f"owner({sim:.2f})"}
+        # foreign — but only GATE after CONFIRM consecutive foreign windows (never drop a brief noisy
+        # owner segment), and un-gate instantly the moment the owner is heard again.
+        self._foreign_streak += 1
+        if self._foreign_streak >= self.FOREIGN_CONFIRM:
+            return {"keep": False, "reason": f"foreign({sim:.2f})"}
+        return {"keep": True, "reason": f"foreign-pending({sim:.2f})"}
+
+    def learn(self):
+        """Strengthen the owner voiceprint from the cluster consistent with the existing print (never
+        the TV, which is far). If no print yet, seed from the dominant cluster (his mic = him)."""
+        if not self.speakers:
+            return None
+        ov = load_voices().get(self.OWNER)
+        if not ov or ov.get("backend") != self.backend:
+            dom = max(self.speakers, key=lambda s: s["dur"])
+            if dom["dur"] >= 8.0:
+                save_voice(self.OWNER, dom["emb"], self.backend)
+                return ("seed", dom["dur"])
+            return None
+        emb = ov.get("embedding", [])
+        best, bs = None, 0.0
+        for sp in self.speakers:
+            c = cosine_similarity(sp["emb"], emb)
+            if c > bs:
+                bs, best = c, sp
+        if best and bs >= self.LEARN_CONSISTENT and best["dur"] >= 5.0:
+            update_voice(self.OWNER, best["emb"], self.backend)
+            return ("update", round(bs, 3))
+        return None
+
+
+_mic_session = MicFilter()
+
+def diar_live_reset():
+    global _diar_session, _mic_session
+    _diar_session = DiarSession()
+    _mic_session = MicFilter()
+
+
+def _sys_silent_frames(sys_path, frame_s=0.25, thr=0.01):
+    """Per-frame boolean 'system is SILENT' mask for the system channel (RMS < thr). Used to learn the
+    owner's voice ONLY from mic moments with no system audio playing → no laptop-echo contamination."""
+    try:
+        import wave as _w, struct as _s
+        with _w.open(sys_path) as wf:
+            sr = wf.getframerate() or 16000
+            fr = wf.readframes(wf.getnframes())
+        n = len(fr) // 2
+        smp = _s.unpack("<" + "h" * n, fr)
+        fl = max(1, int(frame_s * sr))
+        mask = []
+        for i in range(0, n, fl):
+            seg = smp[i:i + fl]
+            rms = (sum(x * x for x in seg) / len(seg)) ** 0.5 / 32768.0 if seg else 0.0
+            mask.append(rms < thr)
+        return mask, frame_s
+    except Exception:
+        return [], frame_s
+
+
+def learn_owner_voice(mic_path, sys_path, owner="Junior"):
+    """Refined auto-learn (Junior's plan): learn the OWNER's voiceprint from the MIC channel, using the
+    cluster that talks the most while the SYSTEM is SILENT (clean, no echo) — the dominant, recurring
+    voice. Consistency-checked against the existing print so the TV (which varies) never overwrites it;
+    bootstraps if there's no print yet and one voice clearly dominates the clean speech."""
+    import engines
+    try:
+        md = engines.get_parakeet_diar().diarize(mic_path)
+    except Exception as e:
+        return {"learned": None, "reason": f"diar-failed:{str(e)[:40]}"}
+    segs = md.get("segments", []); embs = md.get("embeddings", {})
+    if not embs:
+        return {"learned": None, "reason": "no-mic-voice"}
+    mask, fs = _sys_silent_frames(sys_path) if sys_path else ([], 0.25)
+
+    def clean_dur(a, b):
+        if not mask:
+            return b - a           # no system channel → treat all as clean
+        i0 = int(a / fs); i1 = max(i0 + 1, int(b / fs))
+        sil = sum(1 for i in range(i0, min(i1, len(mask))) if mask[i])
+        return sil * fs
+
+    clean, total = {}, {}
+    for s in segs:
+        sid = str(s["speaker"]); total[sid] = total.get(sid, 0.0) + (s["end"] - s["start"])
+        clean[sid] = clean.get(sid, 0.0) + clean_dur(s["start"], s["end"])
+    clean = {k: v for k, v in clean.items() if k in embs}
+    if not clean or max(clean.values()) < 4.0:
+        return {"learned": None, "reason": "too-little-clean-speech"}
+    owner_sid = max(clean, key=clean.get)
+    owner_emb = embs.get(owner_sid)
+    ov = load_voices().get(owner)
+    if ov and ov.get("backend") == "wespeaker" and ov.get("embedding"):
+        sim = cosine_similarity(owner_emb, ov["embedding"])
+        if sim < 0.35:   # dominant clean voice is NOT the known owner (TV-heavy recording) → skip
+            return {"learned": None, "reason": f"inconsistent-skip({sim:.2f})"}
+        update_voice(owner, owner_emb, "wespeaker")
+        return {"learned": "update", "sim": round(sim, 3), "clean_s": round(clean[owner_sid], 1)}
+    # bootstrap: no print yet → only seed if one voice clearly dominates the CLEAN speech
+    if clean[owner_sid] >= 0.6 * sum(clean.values()):
+        save_voice(owner, owner_emb, "wespeaker")
+        return {"learned": "seed", "clean_s": round(clean[owner_sid], 1)}
+    return {"learned": None, "reason": "ambiguous-bootstrap"}
 
 
 # --- Diarization ---
@@ -1180,6 +1656,120 @@ def update_voice(name, embedding, backend):
 # total speech is tiny both absolutely and relative to the rest, reassigning their segments to
 # the temporally-nearest surviving speaker (keeps all transcript text, just fixes the label).
 # Model-agnostic: applied to both FluidAudio and pyannote output.
+# --- Voice-embedding clustering backbone (heed's own diarization, per-segment cosine) --------------
+# Thresholds calibrated on the measured cosine landscape of real meetings: max inter-speaker ≈ 0.36,
+# same-person/echo cross-channel ≈ 0.71-0.86. Bias = OVER-DETECT (a HIGHER threshold = MORE clusters,
+# never lose a speaker; the user merges with one click). Tune via eval_diar sweep on real audio.
+AGGLO_THRESHOLD = 0.55       # assign a segment to a cluster only if cosine >= this, else new cluster
+PHANTOM_MERGE_COS = 0.62     # 2nd pass: collapse clusters whose centroids are this close (same voice split)
+SEED_MIN_DUR = 1.0           # only segments >= this may SEED a new cluster (short embeddings are noisy)
+CLUSTER_MIN_DUR = 2.5        # 3rd pass: absorb clusters totalling less than this into their nearest voice
+
+
+def _assign_by_overlap(seg, clusters, segments):
+    """Cluster id whose segments overlap `seg` most in time (fallback for no-emb / short segments)."""
+    best_cid, best_ov = None, 0.0
+    for cid, c in clusters.items():
+        for j in c["idxs"]:
+            ov = min(seg["end"], segments[j]["end"]) - max(seg["start"], segments[j]["start"])
+            if ov > best_ov:
+                best_ov, best_cid = ov, cid
+    return best_cid
+
+
+def cluster_segments(segments, threshold=AGGLO_THRESHOLD, merge_cos=PHANTOM_MERGE_COS):
+    """Agglomerative cosine clustering over PER-SEGMENT voice embeddings — heed's diarization backbone.
+
+    segments: list of {"start","end","emb":[256 floats], ...}. Returns (labels, clusters):
+      labels[i]  -> cluster id for segments[i]
+      clusters   -> {cid: {"emb": centroid, "dur": seconds, "idxs": [segment indices]}}
+    Robust to noisy per-segment embeddings (same voice ranges 0.14-1.0 cosine): only long segments
+    seed clusters, short ones join their best match, and tiny leftover clusters are absorbed — so we
+    separate the speakers FluidAudio merged WITHOUT exploding into junk singletons.
+    """
+    labels = [None] * len(segments)
+    clusters = {}
+    next_id = 0
+    # Phase A — assign; longest segments first (reliable anchors). A short segment may JOIN its best
+    # cluster but never SEED one (its embedding is too noisy to trust as a new voice).
+    order = sorted((i for i, s in enumerate(segments) if s.get("emb")),
+                   key=lambda i: (segments[i]["end"] - segments[i]["start"]), reverse=True)
+    for i in order:
+        s = segments[i]
+        emb = s["emb"]
+        dur = max(1e-3, s["end"] - s["start"])
+        best_cid, best_c = None, -1.0
+        for cid, c in clusters.items():
+            cc = cosine_similarity(emb, c["emb"])
+            if cc > best_c:
+                best_c, best_cid = cc, cid
+        if best_cid is not None and best_c >= threshold:
+            c = clusters[best_cid]
+            c["emb"] = _emb_avg([c["emb"], emb], [c["dur"], dur])
+            c["dur"] += dur
+            c["idxs"].append(i)
+            labels[i] = best_cid
+        elif dur >= SEED_MIN_DUR:
+            clusters[next_id] = {"emb": list(emb), "dur": dur, "idxs": [i]}
+            labels[i] = next_id
+            next_id += 1
+        # else: short + no good cluster -> leave for the post-hoc time-overlap pass
+
+    def _consolidate(min_cos):
+        merged = True
+        while merged and len(clusters) > 1:
+            merged = False
+            ids = list(clusters.keys())
+            for a in range(len(ids)):
+                done = False
+                for b in range(a + 1, len(ids)):
+                    ca, cb = ids[a], ids[b]
+                    if cosine_similarity(clusters[ca]["emb"], clusters[cb]["emb"]) >= min_cos:
+                        A, B = clusters[ca], clusters[cb]
+                        A["emb"] = _emb_avg([A["emb"], B["emb"]], [A["dur"], B["dur"]])
+                        A["dur"] += B["dur"]
+                        A["idxs"].extend(B["idxs"])
+                        for j in B["idxs"]:
+                            labels[j] = ca
+                        del clusters[cb]
+                        merged = done = True
+                        break
+                if done:
+                    break
+
+    # Phase B — consolidate near-identical clusters (same voice split by assignment order).
+    _consolidate(merge_cos)
+
+    # Phase C — absorb tiny clusters (noise / a couple of bad segments) into their nearest voice by
+    # centroid cosine, UNCONDITIONALLY (they're too small to be a real distinct speaker). Kills singletons.
+    for cid in [c for c in clusters if clusters[c]["dur"] < CLUSTER_MIN_DUR]:
+        if len(clusters) <= 1 or cid not in clusters:
+            continue
+        best_to, best_c = None, -1.0
+        for other in clusters:
+            if other == cid:
+                continue
+            cc = cosine_similarity(clusters[cid]["emb"], clusters[other]["emb"])
+            if cc > best_c:
+                best_c, best_to = cc, other
+        if best_to is not None:
+            A, B = clusters[best_to], clusters[cid]
+            A["emb"] = _emb_avg([A["emb"], B["emb"]], [A["dur"], B["dur"]])
+            A["dur"] += B["dur"]
+            A["idxs"].extend(B["idxs"])
+            for j in B["idxs"]:
+                labels[j] = best_to
+            del clusters[cid]
+
+    # Post-hoc — segments not yet assigned (no emb, or short with no good cluster): by time overlap.
+    for i, s in enumerate(segments):
+        if labels[i] is not None:
+            continue
+        cid = _assign_by_overlap(s, clusters, segments)
+        labels[i] = cid if cid is not None else (next(iter(clusters)) if clusters else 0)
+    return labels, clusters
+
+
 def _filter_spurious_speakers(segments, min_fraction=0.12, min_abs_s=3.0):
     if not segments:
         return segments
@@ -1223,7 +1813,7 @@ def _diarize_parakeet(wav_path, srt_path=None, recognize_only=False):
     Cross-session voice naming works here too: the sidecar exposes per-speaker WeSpeaker
     embeddings, which we match against ~/.heed-app/voices.json (backend-tagged)."""
     import engines
-    diar = engines.get_parakeet().diarize(wav_path)  # {"segments":[...], "embeddings":{sid:[...]}}
+    diar = engines.get_parakeet_diar().diarize(wav_path)  # {"segments":[...], "embeddings":{sid:[...]}}
     raw_embeddings = diar.get("embeddings", {})       # keyed by RAW FluidAudio speaker id
     # Drop phantom speakers, then map remaining ids -> contiguous "Speaker 1/2/...".
     raw_segments = _filter_spurious_speakers([
@@ -1305,6 +1895,181 @@ def _name_known_voices(speakers_map, raw_embeddings, diar_segments, recognize_on
     return speaker_embeddings, auto_named
 
 
+def _ffmpeg_channel(wav_path, ch, out_path):
+    """Extract one channel (0 = mic, 1 = system) as mono 16 kHz — what the sidecar expects."""
+    import subprocess
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", wav_path,
+         "-filter_complex", f"[0:a]pan=mono|c0=c{ch},aresample=16000[a]",
+         "-map", "[a]", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", out_path],
+        check=True,
+    )
+
+
+def _dominant_diar_speaker(seg, diar_segs):
+    """Speaker whose diarization overlaps `seg` most; if none overlaps, snap to the nearest in time."""
+    best, best_ov = None, 0.0
+    for d in diar_segs:
+        ov = min(seg["end"], d["end"]) - max(seg["start"], d["start"])
+        if ov > best_ov:
+            best_ov, best = ov, d["speaker"]
+    if best:
+        return best
+    nearest, nd = None, 1e9
+    mid = (seg["start"] + seg["end"]) / 2.0
+    for d in diar_segs:
+        dist = 0.0 if d["start"] <= mid <= d["end"] else min(abs(mid - d["start"]), abs(mid - d["end"]))
+        if dist < nd:
+            nd, nearest = dist, d["speaker"]
+    return nearest
+
+
+# A mic voice whose cosine to any SYSTEM voice is >= this is the remote leaking through the speakers
+# (echo), not the owner. The owner's voice never loops back to the system channel, so it stays below.
+OWNER_ECHO_COS = 0.65
+
+
+def finalize_recording(wav_path, language="auto", is_dual=True):
+    """Post-stop pipeline (the real 'brilliant' one): re-transcribe BOTH channels with REAL Parakeet
+    timestamps, diarize the system channel (remote speakers), and — crucially for no-headphone setups —
+    acoustically strip the mic's echo by keeping only the mic voice that does NOT match any system
+    voice (the owner). Names known voices. Returns coherent, time-stamped, attributed turns.
+
+    Single source of truth: the /finalize endpoint and scripts/postmortem.py both call this.
+    Returns {"turns":[{start,end,speaker,text}], "speakers":[...], "embeddings":{...}, "auto_named":{...}}.
+    """
+    import engines
+    import tempfile
+    asr = engines.get_parakeet()
+
+    # Use the FluidAudio path directly on Apple Silicon so this works whether or not the server's
+    # boot set the `diarize_backend` global (the harness imports the module without booting).
+    def _diar(path):
+        if engines.is_apple_silicon():
+            return _diarize_parakeet(path)
+        return diarize(path)
+
+    def segs_for(path):
+        tok = asr.transcribe_ts(path, language)
+        return engines.tokens_to_segments(tok.get("tokens", []))
+
+    tmp = []
+    try:
+        if not is_dual:
+            mono = tempfile.mktemp(suffix=".wav"); tmp.append(mono)
+            _ffmpeg_channel(wav_path, 0, mono)
+            d = _diar(mono)
+            turns = [{**s, "speaker": _dominant_diar_speaker(s, d["segments"]) or "Speaker 1", "channel": "sys"}
+                     for s in segs_for(mono)]
+            turns.sort(key=lambda x: x["start"])
+            return {"turns": turns, "speakers": d.get("speakers", []),
+                    "embeddings": d.get("embeddings", {}), "auto_named": d.get("auto_named", {})}
+
+        mic = tempfile.mktemp(suffix=".wav"); tmp.append(mic); _ffmpeg_channel(wav_path, 0, mic)
+        sysw = tempfile.mktemp(suffix=".wav"); tmp.append(sysw); _ffmpeg_channel(wav_path, 1, sysw)
+
+        # Acoustically cancel the system out of the mic (no-headphones echo), then transcribe both.
+        mic_clean = _aec_clean(mic, sysw)
+        if mic_clean != mic:
+            tmp.append(mic_clean)
+        sys_segs = segs_for(sysw)
+        mic_segs = segs_for(mic_clean)
+
+        # --- Voice-clustering backbone: diarize BOTH channels per-segment, pool, cluster by cosine. ---
+        # This finds the TRUE distinct voices (FluidAudio merged them per-channel; the %-filter deleted
+        # minorities). Echo folds in for free: the presenter's mic-echo (cos ~0.86 to their sys voice)
+        # clusters WITH their system cluster, so it never becomes a phantom speaker.
+        sys_raw = engines.get_parakeet_diar().diarize(sysw)
+        mic_raw = engines.get_parakeet_diar().diarize(mic_clean)
+        pool = []
+        for s in sys_raw.get("segments", []):
+            if s.get("emb"):
+                pool.append({"start": float(s["start"]), "end": float(s["end"]), "emb": s["emb"], "ch": "sys"})
+        for s in mic_raw.get("segments", []):
+            if s.get("emb"):
+                pool.append({"start": float(s["start"]), "end": float(s["end"]), "emb": s["emb"], "ch": "mic"})
+
+        labels, clusters = cluster_segments(pool)
+        for i, seg in enumerate(pool):
+            seg["cid"] = labels[i]
+
+        # Name each cluster via saved voiceprints (cross-session recognition); unmatched -> "Speaker N"
+        # in first-appearance order. The owner (e.g. "Junior") is recognized here when their voice is saved.
+        # NOTE: we do NOT try to split two soft in-room voices that share one mic — measured, their
+        # per-segment WeSpeaker embeddings interleave (a foreign line can sit 0.87 to the owner's print
+        # while the owner's own line sits 0.75), so no threshold separates them at that SNR. heed's
+        # over-detect + one-click merge in the UI is the escape hatch until enrollment/SOTA embeddings land.
+        backend = current_backend()
+        matched_name = {}
+        for cid, c in clusters.items():
+            m, _sc = match_voice(c["emb"], backend)
+            matched_name[cid] = m
+
+        # Per-cluster channel presence: a cluster with real SYSTEM duration is a remote/presenter voice
+        # (its mic segments are echo). A mic-only cluster is someone whose voice is only on the mic
+        # (the owner, or a person in the room) — keep their mic text.
+        cl_ch = {cid: {"mic": 0.0, "sys": 0.0} for cid in clusters}
+        for seg in pool:
+            cl_ch[seg["cid"]][seg["ch"]] += seg["end"] - seg["start"]
+        sys_based = {cid for cid in clusters if cl_ch[cid]["sys"] >= 1.0}
+
+        # "Speaker N" for the unmatched clusters, in first-appearance order.
+        first_start = {cid: min(pool[j]["start"] for j in clusters[cid]["idxs"]) for cid in clusters}
+        cluster_label, n = {}, 0
+        for cid in sorted(clusters, key=lambda c: first_start[c]):
+            if matched_name[cid]:
+                cluster_label[cid] = matched_name[cid]
+            else:
+                n += 1
+                cluster_label[cid] = f"Speaker {n}"
+
+        # Assign each TEXT segment to the cluster of the diarization segment it overlaps most (same channel).
+        diar_by_ch = {"mic": [s for s in pool if s["ch"] == "mic"], "sys": [s for s in pool if s["ch"] == "sys"]}
+
+        def cluster_for(seg, ch):
+            best, bo = None, 0.0
+            for d in diar_by_ch[ch]:
+                ov = min(seg["end"], d["end"]) - max(seg["start"], d["start"])
+                if ov > bo:
+                    bo, best = ov, d["cid"]
+            if best is None and diar_by_ch[ch]:
+                mid = (seg["start"] + seg["end"]) / 2.0
+                best = min(diar_by_ch[ch],
+                           key=lambda d: 0.0 if d["start"] <= mid <= d["end"] else min(abs(mid - d["start"]), abs(mid - d["end"])))["cid"]
+            return best
+
+        turns = []
+        for s in sys_segs:
+            cid = cluster_for(s, "sys")
+            if cid is None:
+                continue
+            turns.append({"start": s["start"], "end": s["end"], "text": s["text"], "speaker": cluster_label[cid], "channel": "sys"})
+        for s in mic_segs:
+            cid = cluster_for(s, "mic")
+            if cid is None or cid in sys_based:   # sys_based mic text = echo of a remote voice -> drop
+                continue
+            turns.append({"start": s["start"], "end": s["end"], "text": s["text"], "speaker": cluster_label[cid], "channel": "mic"})
+        turns.sort(key=lambda x: x["start"])
+
+        # Do NOT auto-average recognized voiceprints here: a post-stop cluster can silently contain a
+        # second quiet mic voice (measured: two soft in-room speakers fuse), and update_voice() on that
+        # blended centroid slowly turns a saved print into a blurry attractor that matches everyone —
+        # the exact corruption update_voice() warns about. Voiceprints are (re)saved only on an explicit
+        # user rename, where the identity is certain.
+        embeddings = {cluster_label[cid]: clusters[cid]["emb"] for cid in clusters}
+        auto_named = {cluster_label[cid]: {"name": matched_name[cid], "score": 1.0}
+                      for cid in clusters if matched_name[cid]}
+        return {"turns": turns, "speakers": sorted({t["speaker"] for t in turns}),
+                "embeddings": embeddings, "auto_named": auto_named}
+    finally:
+        for p in tmp:
+            try:
+                if p and os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
+
+
 def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None, recognize_only=False):
     if diarize_backend == "parakeet":
         return _diarize_parakeet(wav_path, srt_path, recognize_only)
@@ -1318,9 +2083,12 @@ def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None, recog
     if max_speakers:
         kwargs["max_speakers"] = int(max_speakers)
 
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass  # torchless (Mac-lite) — this is the pyannote/Linux path, unreached on Mac-parakeet
 
     try:
         result = diarize_pipeline(wav_path, **kwargs)
@@ -1361,9 +2129,20 @@ def diarize(wav_path, srt_path=None, min_speakers=None, max_speakers=None, recog
         })
     # Drop phantom over-counted speakers (reassign their segments to the nearest real speaker).
     diar_segments = _filter_spurious_speakers(diar_segments)
+    # Filtering can leave NON-CONTIGUOUS labels (e.g. "Speaker 4" with no "Speaker 3") — the Mac/live
+    # paths renumber but this pyannote path didn't (Linux-only bug). Renumber to contiguous "Speaker 1..N"
+    # in first-appearance order AND remap the embeddings the same way so cross-session naming stays aligned.
+    _relabel, _k = {}, 0
+    for s in sorted(diar_segments, key=lambda x: x["start"]):
+        if s["speaker"] not in _relabel:
+            _k += 1
+            _relabel[s["speaker"]] = f"Speaker {_k}"
+    for s in diar_segments:
+        s["speaker"] = _relabel[s["speaker"]]
     # Cross-session voice recognition (auto-rename known voices in place + average the profile).
-    # Re-key embeddings from raw labels -> "Speaker N" before matching (shared helper).
-    label_embeddings = {speakers_map[rl]: emb for rl, emb in raw_embeddings.items()}
+    # Re-key embeddings from raw labels -> renumbered "Speaker N" before matching (dropping filtered ones).
+    label_embeddings = {_relabel[speakers_map[rl]]: emb for rl, emb in raw_embeddings.items()
+                        if speakers_map[rl] in _relabel}
     sid_map = {lbl: lbl for lbl in label_embeddings}  # labels are already final "Speaker N"
     speaker_embeddings, auto_named = _name_known_voices(sid_map, label_embeddings, diar_segments)
     kept_speakers = {s["speaker"] for s in diar_segments}
@@ -1658,7 +2437,11 @@ class Handler(BaseHTTPRequestHandler):
                     # Double-talk (you + them, mic hot) passes through and is cleaned by the stop dedup.
                     relative_echo = (ref and sys_rms > SYS_ACTIVE_RMS and raw_rms < ECHO_GATE_RATIO * sys_rms)
                     absolute_low = (_rms is not None and MIC_GATE_RMS > 0 and _rms < MIC_GATE_RMS)
-                    if relative_echo or absolute_low:
+                    # VOICE-RAG gate: the mic is currently a foreign voice (external TV / another person),
+                    # not the owner → don't feed it, so it never enters the owner's transcript. Decided
+                    # by /mic/filter (voice identity); default True (owner) so we never gate by mistake.
+                    not_owner = (body.get("mic_is_owner", True) is False)
+                    if relative_echo or absolute_low or not_owner:
                         partial = _last_partial.get(ch, "")
                     else:
                         partial = engines.get_parakeet().stream_feed(wav_path, ch) if active_engine == "parakeet" else ""
@@ -1684,17 +2467,55 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"ok": False, "error": str(e)[:120]}, 200)
 
-        elif self.path in ("/diar/start", "/diar/feed", "/diar/finish"):
-            # Live streaming diarization (Sortformer) for the SYSTEM channel.
+        elif self.path == "/voices/repair":
+            # Fix a corrupted saved voice: {"name": "...", "action": "delete"|"reset"}. delete removes
+            # it; reset drops its averaging weight to 1 so the next clean recognition re-shapes it.
+            try:
+                voices = load_voices(); nm = body.get("name"); act = body.get("action", "reset")
+                if nm not in voices:
+                    self._json({"ok": False, "error": "no such voice"}, 200)
+                elif act == "delete":
+                    del voices[nm]; save_voices(voices); self._json({"ok": True, "deleted": nm})
+                else:
+                    voices[nm]["count"] = 1; save_voices(voices); self._json({"ok": True, "reset": nm})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)[:120]}, 200)
+
+        elif self.path == "/voices/learn":
+            # Refined auto-learn at STOP: strengthen the owner's voiceprint from clean mic audio
+            # (mic voice while the system is silent). Fire-and-forget from server.ts after recording.
+            try:
+                res = learn_owner_voice(body.get("mic_path"), body.get("sys_path"))
+                self._json({"ok": True, **res})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)[:120]}, 200)
+
+        elif self.path in ("/diar/start", "/diar/feed", "/diar/finish", "/diar/live", "/mic/filter"):
+            # Live diarization for the SYSTEM channel (/diar/live) and the MIC voice filter (/mic/filter,
+            # keeps only the owner's voice, suppresses external TV/room audio the mic picks up). Both run
+            # on the DEDICATED GPU sidecar so they never block ASR. /diar/feed (Sortformer) = rollback.
             try:
                 import engines
-                eng = engines.get_parakeet() if active_engine == "parakeet" else None
+                eng = engines.get_parakeet_diar() if active_engine == "parakeet" else None
                 if eng is None:
-                    self._json({"ok": False, "error": "no streaming diarizer"}, 200)
+                    self._json({"ok": False, "error": "no diarizer"}, 200)
                 elif self.path == "/diar/start":
-                    self._json({"ok": eng.diar_start()})
-                elif self.path in ("/diar/feed", "/diar/finish"):
-                    raw = eng.diar_feed(body["wav_path"]) if self.path == "/diar/feed" else eng.diar_finish()
+                    diar_live_reset()          # fresh session registry per recording (sys + mic)
+                    self._json({"ok": True})
+                elif self.path == "/diar/live":
+                    d = eng.diarize(body["wav_path"])  # offline diarize on the window
+                    res = _diar_session.feed(d.get("segments", []), d.get("embeddings", {}),
+                                             window_s=body.get("window_s"))
+                    self._json({"ok": True, **res})
+                elif self.path == "/mic/filter":
+                    d = eng.diarize(body["wav_path"])  # diarize the MIC window
+                    res = _mic_session.classify(d.get("segments", []), d.get("embeddings", {}),
+                                                window_s=body.get("window_s"))
+                    self._json({"ok": True, **res})
+                elif self.path == "/diar/finish":
+                    self._json({"ok": True})  # owner learning happens at stop via /voices/learn
+                elif self.path == "/diar/feed":
+                    raw = eng.diar_feed(body["wav_path"])  # Sortformer streaming (rollback path only)
                     segs = _renumber_speakers(_filter_spurious_speakers([
                         {"start": float(s["start"]), "end": float(s["end"]), "speaker": str(s["speaker"])}
                         for s in raw
@@ -1704,7 +2525,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": str(e)[:120]}, 200)
 
         elif self.path == "/transcribe-live":
-            # Live transcription using the auto-picked live model.
+            # Live transcription using the auto-picked live model (non-parakeet chunk mode only).
+            _ensure_whisper_live()  # parakeet boot skips Whisper; load on demand if this path is hit
             if not whisper_model_live:
                 self._json({"error": "live whisper not loaded"}, 503)
                 return
@@ -1773,6 +2595,21 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("max_speakers"),
                 bool(body.get("recognize_only", False)),
             )
+            result["time_ms"] = int((time.time() - t) * 1000)
+            self._json(result)
+
+        elif self.path == "/finalize":
+            # Post-stop: full re-transcription with real timestamps + diarization + mic echo removal.
+            t = time.time()
+            try:
+                result = finalize_recording(
+                    body["wav_path"],
+                    body.get("language", "auto"),
+                    bool(body.get("dual", True)),
+                )
+            except Exception as e:
+                self._json({"error": str(e)[:200], "turns": []}, 200)
+                return
             result["time_ms"] = int((time.time() - t) * 1000)
             self._json(result)
 
@@ -1848,6 +2685,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stream_dual(self, sse, wav_path, language, min_speakers, max_speakers):
         """Stream dual-channel processing with progressive segment emission."""
+        _ensure_whisper()  # file-upload path: load Whisper on demand (parakeet boot skipped it)
         mic_path, sys_path, mic_has, sys_has = split_stereo(wav_path)
 
         # Launch pyannote on GPU immediately (parallel with whisper)

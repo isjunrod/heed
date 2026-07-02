@@ -1,3 +1,4 @@
+import CoreML
 import FluidAudio
 import Foundation
 
@@ -20,23 +21,52 @@ func langEnum(_ s: String?) -> Language? {
     return Language(rawValue: s)
 }
 
+// --- Role split (KILLER parallelism): run ASR and diarization in SEPARATE sidecar processes so the
+// diarizer never blocks the transcriber. HEED_ROLE = "asr" | "diar" | "all" (default "all" = both,
+// backward compatible). The ASR process keeps the ANE; the DIAR process can be pinned to a different
+// compute unit (GPU/Metal) via HEED_DIAR_CU so ASR and diarization truly run on separate hardware.
+let role = ProcessInfo.processInfo.environment["HEED_ROLE"] ?? "all"
+let loadASR = (role == "asr" || role == "all")
+let loadDiar = (role == "diar" || role == "all")
+
 // --- Load models once (downloads CoreML from HuggingFace on first run — NO gated token) ---
-let asrModels = try await AsrModels.downloadAndLoad(version: .v3)
 // Two ASR managers, routed by language — measured: neither alone handles both well.
 //   English  -> UnifiedAsrManager (one-shot): full long-form English, fastest (~115x).
-//   Other    -> AsrManager + melChunkContext:false + dualDecodeArbitration:true + language hint:
-//               stops v3's English-bias drift (issue #594) so Spanish transcribes correctly.
-let asrEN = UnifiedAsrManager()
-try await asrEN.loadModels()
-let asrML = AsrManager(config: ASRConfig(melChunkContext: false, dualDecodeArbitration: true))
-try await asrML.loadModels(asrModels)
+//   Other    -> AsrManager + melChunkContext:false + dualDecodeArbitration:true + language hint.
+var asrEN: UnifiedAsrManager? = nil
+var asrML: AsrManager? = nil
+if loadASR {
+    let asrModels = try await AsrModels.downloadAndLoad(version: .v3)
+    let en = UnifiedAsrManager()
+    try await en.loadModels()
+    asrEN = en
+    let ml = AsrManager(config: ASRConfig(melChunkContext: false, dualDecodeArbitration: true))
+    try await ml.loadModels(asrModels)
+    asrML = ml
+}
 
 // clusteringThreshold 0.74 (default 0.7 over-split similar voices, e.g. a 2-host podcast → 3).
 // Measured: 0.74 yields the correct count on hard audio AND clean clips; >=0.76 over-merges.
 // The Python side also drops residual phantom speakers as a safety net (_filter_spurious_speakers).
-let diarizer = DiarizerManager(config: DiarizerConfig(clusteringThreshold: 0.74))
-let diarModels = try await DiarizerModels.downloadIfNeeded()
-diarizer.initialize(models: diarModels)
+var diarizer: DiarizerManager? = nil
+if loadDiar {
+    // heed re-clusters per-segment embeddings on the Python side, so we can OVER-segment here (lower
+    // threshold → more raw speakers, never merge two real voices) and let heed re-fuse. Overridable.
+    let ct = Float(ProcessInfo.processInfo.environment["HEED_DIAR_CLUSTER_THRESHOLD"] ?? "") ?? 0.74
+    let d = DiarizerManager(config: DiarizerConfig(clusteringThreshold: ct))
+    // Compute-unit pin: a dedicated DIAR process runs on GPU/Metal so it doesn't queue behind ASR on
+    // the ANE (single-process "all" keeps .all so CoreML schedules both). HEED_DIAR_CU overrides.
+    let cuName = ProcessInfo.processInfo.environment["HEED_DIAR_CU"] ?? (role == "diar" ? "gpu" : "all")
+    let mlcfg = MLModelConfiguration()
+    switch cuName {
+    case "gpu": mlcfg.computeUnits = .cpuAndGPU
+    case "ane": mlcfg.computeUnits = .cpuAndNeuralEngine
+    default: mlcfg.computeUnits = .all
+    }
+    let diarModels = try await DiarizerModels.downloadIfNeeded(configuration: mlcfg)
+    d.initialize(models: diarModels)
+    diarizer = d
+}
 
 let converter = AudioConverter()
 
@@ -79,7 +109,10 @@ var diarStream: SortformerDiarizer? = nil
 
 func ensureDiarStream() async throws -> SortformerDiarizer {
     if diarStream == nil {
-        let cfg = SortformerConfig.default
+        // Sortformer v2.1 (fast, ~1.04s confirmation latency): 40% better DER than v2, most robust
+        // in meeting scenarios. Explicit preset (SortformerConfig.default already resolves to v2.1
+        // via its init default, but we pin it so a future change to `default` can't regress us).
+        let cfg = SortformerConfig.fastV2_1
         let d = SortformerDiarizer(config: cfg)
         let models = try await SortformerModels.loadFromHuggingFace(config: cfg, computeUnits: .all)
         d.initialize(models: models)
@@ -107,6 +140,9 @@ while let line = readLine() {
             guard let wav = req["wav"] as? String else {
                 emit(["ok": false, "error": "no wav"]); continue
             }
+            guard let asrEN = asrEN, let asrML = asrML else {
+                emit(["ok": false, "error": "asr not loaded in this role"]); continue
+            }
             let samples = try converter.resampleAudioFile(path: wav)
             let lang = langEnum(req["language"] as? String)
             // English (or unspecified) -> Unified one-shot; everything else -> multilingual fix.
@@ -118,14 +154,39 @@ while let line = readLine() {
                 text = try await asrML.transcribe(samples, decoderState: &state, language: lang).text
             }
             emit(["ok": true, "text": text])
+        case "transcribe-ts":
+            // Like "transcribe" but returns per-token timestamps. ALWAYS uses the multilingual
+            // AsrManager (returns ASRResult.tokenTimings) — the fast English UnifiedAsrManager only
+            // yields a flat string. This is what the post-stop uses to rebuild a properly segmented,
+            // time-stamped transcript instead of stitching live karaoke fragments.
+            guard let wav = req["wav"] as? String else {
+                emit(["ok": false, "error": "no wav"]); continue
+            }
+            guard let asrML = asrML else {
+                emit(["ok": false, "error": "asr not loaded in this role"]); continue
+            }
+            let samples = try converter.resampleAudioFile(path: wav)
+            let lang = langEnum(req["language"] as? String)  // nil = auto
+            var state = try TdtDecoderState()
+            let result = try await asrML.transcribe(samples, decoderState: &state, language: lang)
+            let tokens: [[String: Any]] = (result.tokenTimings ?? []).map {
+                ["t": $0.token, "s": Double($0.startTime), "e": Double($0.endTime)] as [String: Any]
+            }
+            emit(["ok": true, "text": result.text, "tokens": tokens])
         case "diarize":
             guard let wav = req["wav"] as? String else {
                 emit(["ok": false, "error": "no wav"]); continue
             }
+            guard let diarizer = diarizer else {
+                emit(["ok": false, "error": "diarizer not loaded in this role"]); continue
+            }
             let samples = try converter.resampleAudioFile(path: wav)
             let result = try diarizer.performCompleteDiarization(samples, sampleRate: 16000)
+            // Per-SEGMENT embedding (the window's WeSpeaker vector, not the cluster centroid) so the
+            // Python backbone can re-cluster by cosine — the key to separating speakers FluidAudio merged.
             let segs = result.segments.map {
-                ["speaker": $0.speakerId, "start": Double($0.startTimeSeconds), "end": Double($0.endTimeSeconds)] as [String: Any]
+                ["speaker": $0.speakerId, "start": Double($0.startTimeSeconds), "end": Double($0.endTimeSeconds),
+                 "emb": $0.embedding.map { Double($0) }] as [String: Any]
             }
             let speakers = Array(Set(result.segments.map { $0.speakerId })).sorted()
             // Per-speaker 256-dim voice embedding (WeSpeaker v2) for cross-session recognition.
@@ -176,23 +237,20 @@ while let line = readLine() {
             _ = try await ensureDiarStream()
             emit(["ok": true])
         case "diar-feed":
-            // Append the NEW audio; return the LIVE speaker timeline. Include tentative segments,
-            // not just finalized, so a speaker shows up in ~1-2s instead of waiting ~5s for the
-            // Sortformer confirmation delay. Tentative labels may shift slightly but the live UI
-            // refines them, and the one-shot diarize at stop gives the precise final timeline.
+            // Append the NEW audio; return the LIVE speaker timeline. FINALIZED segments ONLY —
+            // tentative segments are provisional (Sortformer revises them), so including them makes
+            // speaker labels flip/mix in real time ("the diarization fails"). With the v2.1 fast
+            // config the confirmation latency is ~1s, so finalized shows up fast AND stable. Names
+            // for known voices are overlaid live by the periodic recognizer on the server side.
             guard let wav = req["wav"] as? String, let d = diarStream else {
                 emit(["ok": false, "error": "no diar session"]); continue
             }
             let samples = try converter.resampleAudioFile(path: wav)
             d.addAudio(samples)
             _ = try d.process()
-            var allSegs: [DiarizerSegment] = []
-            for sp in d.timeline.speakers.values {
-                allSegs.append(contentsOf: sp.finalizedSegments)
-                allSegs.append(contentsOf: sp.tentativeSegments)
-            }
-            allSegs.sort { $0.startTime < $1.startTime }
-            let segs = allSegs.map { ["speaker": $0.speakerIndex, "start": Double($0.startTime), "end": Double($0.endTime)] as [String: Any] }
+            let segs = d.timeline.speakers.values.flatMap { $0.finalizedSegments }
+                .sorted { $0.startTime < $1.startTime }
+                .map { ["speaker": $0.speakerIndex, "start": Double($0.startTime), "end": Double($0.endTime)] as [String: Any] }
             emit(["ok": true, "segments": segs])
         case "diar-finish":
             guard let d = diarStream else { emit(["ok": false, "error": "no diar session"]); continue }

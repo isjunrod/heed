@@ -44,20 +44,27 @@ def main():
         state["plan"] = plan
         return True, f"final={plan.final_model}, live={plan.live_model}"
 
-    def whisper_check():
+    def transcription_check():
+        # Engine-agnostic: make_engine returns Parakeet (ANE) on Mac, MLX or faster-whisper otherwise.
         import engines
         caps, plan = state["caps"], state["plan"]
         dev = {"whisper": "cuda" if caps.accelerator == "cuda" else "cpu", "gpu_name": caps.gpu_name or ""}
         eng = engines.make_engine(plan.live_model, dev)
         segs, _ = eng.transcribe(capability.BUNDLED_SAMPLE, language="en")
         text = " ".join(s.text for s in segs).strip()
-        return len(text) > 0, f'transcribed "{text[:45]}..."'
+        return len(text) > 0, f'{caps.engine} → "{text[:40]}..."'
 
-    def pyannote_check():
+    def diarization_check():
+        # Mac: FluidAudio via the Parakeet diar sidecar (CoreML, no token). Linux: pyannote.
+        import engines
+        if engines.is_apple_silicon() and engines.parakeet_available():
+            r = engines.get_parakeet_diar().diarize(capability.BUNDLED_SAMPLE)
+            n = len(set(str(s.get("speaker")) for s in r.get("segments", [])))
+            return True, f"FluidAudio (CoreML, no token) — {n} speaker(s) on sample"
         os.environ["HF_HUB_OFFLINE"] = "1"
         from pyannote.audio import Pipeline
         Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-        return True, "speaker diarization available"
+        return True, "pyannote speaker diarization available"
 
     def ollama_check():
         import urllib.request
@@ -68,9 +75,9 @@ def main():
         _check("ffmpeg (audio I/O)", ffmpeg_check),
         _check("hardware probe", probe_check),
         _check("model policy", policy_check),
-        _check("whisper transcription", whisper_check),
+        _check("transcription", transcription_check),
     ]
-    diar_ok = _check("diarization (optional)", pyannote_check)
+    diar_ok = _check("diarization (optional)", diarization_check)
     notes_ok = _check("notes engine / Ollama (optional)", ollama_check)
 
     print(flush=True)

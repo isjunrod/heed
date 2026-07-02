@@ -1,6 +1,7 @@
 """Transcription engine abstraction — pick the FASTEST backend per hardware/OS.
 
-  Apple Silicon  → MLX-Whisper        (Apple GPU via Metal; ~5x faster than CTranslate2-on-CPU)
+  Apple Silicon  → Parakeet TDT v3    (FluidAudio, Apple Neural Engine — the fastest, the default)
+                   MLX-Whisper is only a FALLBACK when the Parakeet sidecar isn't built.
   NVIDIA (CUDA)  → faster-whisper      (CTranslate2 on CUDA, float16)
   CPU-only       → faster-whisper      (CTranslate2 on CPU, int8)
 
@@ -131,6 +132,7 @@ class MLXEngine:
 _SIDECAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "heed-parakeet")
 _SIDECAR_BIN = os.path.join(_SIDECAR_DIR, ".build", "release", "heed-parakeet")
 _parakeet_singleton = None
+_parakeet_diar_singleton = None
 _parakeet_lock = threading.Lock()
 
 
@@ -153,10 +155,17 @@ class ParakeetEngine:
 
     kind = "parakeet"
 
-    def __init__(self):
+    def __init__(self, role="all", diar_cu=None):
+        # role: "asr" (transcription, ANE) | "diar" (diarization, GPU) | "all" (both, single process).
+        # Splitting ASR and diarization into two processes on different compute units lets them run
+        # TRULY in parallel — the diarizer never blocks the transcriber (measured: +2ms contention).
+        env = dict(os.environ, HEED_ROLE=role)
+        if diar_cu:
+            env["HEED_DIAR_CU"] = diar_cu
+        self.role = role
         self.proc = subprocess.Popen(
             [_SIDECAR_BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env,
         )
         self.lock = threading.Lock()
         self.proc.stdout.readline()  # consume the {"ready":...} line
@@ -187,6 +196,17 @@ class ParakeetEngine:
         text = (r.get("text", "") if r.get("ok") else "").strip()
         segs = [_Seg(0.0, _wav_duration(wav_path), text)] if text else []
         return iter(segs), _Info(language or "auto")
+
+    def transcribe_ts(self, wav_path, language=None):
+        """Full transcription WITH per-token timestamps (for post-stop re-transcription). Returns
+        {"text": str, "tokens": [{"t","s","e"}, ...]}. Uses the multilingual manager in the sidecar,
+        which — unlike the fast English one-shot — exposes Parakeet TDT tokenTimings."""
+        lang = language if language else "auto"
+        # A long file can emit noisy E5RT lines before the (single) JSON response; give it headroom.
+        r = self._request({"cmd": "transcribe-ts", "wav": wav_path, "language": lang}, timeout_lines=2000)
+        if not r.get("ok"):
+            return {"text": "", "tokens": []}
+        return {"text": r.get("text", ""), "tokens": r.get("tokens", [])}
 
     def diarize(self, wav_path):
         """Speaker segments + per-speaker 256-dim voice embeddings via FluidAudio CoreML
@@ -225,17 +245,90 @@ class ParakeetEngine:
         return r.get("segments", []) if r.get("ok") else []
 
 
+def tokens_to_segments(tokens, max_gap=0.7, max_dur=12.0):
+    """Merge Parakeet subword tokens into sentence-ish segments with real timestamps.
+
+    Parakeet TDT emits SentencePiece tokens where a LEADING SPACE marks a word start (e.g. " dé",
+    "j", "ame" -> "déjame"). We first stitch tokens into words, then group words into segments,
+    breaking on sentence-final punctuation, a pause longer than max_gap, or max_dur seconds.
+    Returns [{"start": float, "end": float, "text": str}].
+    """
+    # 1) tokens -> words
+    words = []
+    for tk in tokens:
+        t = tk.get("t", "")
+        s = float(tk.get("s", 0.0))
+        e = float(tk.get("e", 0.0))
+        if t.startswith(" ") or not words:
+            words.append({"start": s, "end": e, "text": t.strip()})
+        else:
+            words[-1]["text"] += t
+            words[-1]["end"] = e
+    words = [w for w in words if w["text"]]
+
+    # 2) words -> segments
+    segs = []
+    cur = None
+    for i, w in enumerate(words):
+        if cur is None:
+            cur = {"start": w["start"], "end": w["end"], "text": w["text"]}
+        else:
+            cur["text"] += " " + w["text"]
+            cur["end"] = w["end"]
+        ends_sentence = cur["text"][-1:] in ".?!…"
+        too_long = (cur["end"] - cur["start"]) > max_dur
+        next_gap = (words[i + 1]["start"] - w["end"]) if i + 1 < len(words) else 1e9
+        if ends_sentence or too_long or next_gap > max_gap:
+            segs.append(cur)
+            cur = None
+    if cur:
+        segs.append(cur)
+    return segs
+
+
 def get_parakeet():
-    """Lazy shared sidecar (one process for live + final)."""
+    """Lazy ASR sidecar (transcription/streaming, on the ANE). Diarization goes to get_parakeet_diar()
+    so the two run on separate processes + compute units and never block each other."""
     global _parakeet_singleton
     with _parakeet_lock:
         if _parakeet_singleton is None:
-            _parakeet_singleton = ParakeetEngine()
+            _parakeet_singleton = ParakeetEngine(role="asr")
         return _parakeet_singleton
 
 
+def get_parakeet_diar():
+    """Lazy DIARIZATION sidecar — a SECOND process pinned to GPU/Metal (HEED_DIAR_CU=gpu) so the
+    diarizer runs in parallel with ASR on the ANE. Used for live /diar/live AND post-stop /diarize."""
+    global _parakeet_diar_singleton
+    with _parakeet_lock:
+        if _parakeet_diar_singleton is None:
+            _parakeet_diar_singleton = ParakeetEngine(role="diar", diar_cu="gpu")
+        return _parakeet_diar_singleton
+
+
+def _engine_override():
+    """Explicit engine pick, precedence env > ~/.heed-app/overrides.json. Used by the fallback flow:
+    when Parakeet is broken, `create-heed fallback` writes HEED_ENGINE=mlx so the server stops trying it."""
+    val = os.environ.get("HEED_ENGINE")
+    if not val:
+        try:
+            with open(os.path.join(os.path.expanduser("~"), ".heed-app", "overrides.json")) as f:
+                val = json.load(f).get("engine")
+        except Exception:
+            val = None
+    return val if val in ("parakeet", "mlx", "ctranslate2") else None
+
+
 def select_engine_kind(device_cfg=None):
-    """Apple Silicon with the Parakeet sidecar built → 'parakeet'; else mlx; else ctranslate2."""
+    """Apple Silicon with the Parakeet sidecar built → 'parakeet'; else mlx; else ctranslate2.
+    An explicit override (HEED_ENGINE / overrides.json) wins when its engine is actually available."""
+    override = _engine_override()
+    if override == "parakeet" and parakeet_available():
+        return "parakeet"
+    if override == "mlx" and mlx_available():
+        return "mlx"
+    if override == "ctranslate2":
+        return "ctranslate2"
     if parakeet_available():
         return "parakeet"
     if mlx_available():

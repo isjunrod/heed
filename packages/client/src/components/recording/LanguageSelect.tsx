@@ -10,7 +10,7 @@ interface Props {
 }
 
 export function LanguageSelect({ value, onChange }: Props) {
-	const [stored, setStored] = useLocalStorage<string>("heed-language", "es");
+	const [stored, setStored] = useLocalStorage<string>("heed-language", pickLanguageDefault(undefined));
 	const langs = useHealthStore((s) => s.health.languages);
 	const current = value ?? stored;
 

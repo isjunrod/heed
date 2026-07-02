@@ -79,6 +79,7 @@
 }
 
 .status {
+	position: relative;
 	display: flex;
 	gap: 6px;
 	align-items: center;
@@ -123,6 +124,20 @@
 
 .dotErr {
 	background: var(--red);
+}
+
+/* A component is down → the badge becomes an actionable button (opens the QuickFix popover). */
+.statusItemDown {
+	cursor: pointer;
+	border-color: rgba(239, 68, 68, 0.45);
+	background: rgba(239, 68, 68, 0.05);
+}
+
+.statusItemDown:hover,
+.statusItemDown:focus-visible {
+	border-color: rgba(239, 68, 68, 0.7);
+	background: rgba(239, 68, 68, 0.08);
+	box-shadow: 0 4px 12px rgba(239, 68, 68, 0.12);
 }
 
 .label {
@@ -234,6 +249,55 @@
 	font-size: 10px;
 	line-height: 1.45;
 	color: var(--text-3);
+}
+
+.floatChip {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	padding: 3px 9px 3px 8px;
+	border-radius: 999px;
+	border: 1px solid var(--border-light);
+	background: rgba(255, 255, 255, 0.92);
+	font-family: var(--mono);
+	font-size: 10px;
+	font-weight: 600;
+	color: var(--text-2);
+	cursor: pointer;
+	transition: transform 150ms ease, border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
+	margin-right: 6px;
+}
+
+.floatChip:hover {
+	transform: translateY(-1px);
+	border-color: var(--blue);
+	color: var(--text);
+	background: rgba(59, 130, 246, 0.04);
+	box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+}
+
+.floatChip:focus-visible {
+	outline: none;
+	transform: translateY(-1px);
+	border-color: var(--blue);
+	background: rgba(59, 130, 246, 0.06);
+	box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
+}
+
+.floatChipIcon {
+	font-size: 12px;
+	line-height: 1;
+	color: var(--text-3);
+	transition: color 140ms ease;
+}
+
+.floatChip:hover .floatChipIcon,
+.floatChip:focus-visible .floatChipIcon {
+	color: var(--blue);
+}
+
+.floatChipLabel {
+	color: var(--text-2);
 }
 
 .modelChip {

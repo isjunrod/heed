@@ -1,8 +1,12 @@
-import { useEffect } from "react";
+import { useEffect, useState, useCallback } from "react";
+import type { SetupCheckResult } from "@heed/shared";
 import { useUIStore, type Page } from "@/stores/ui.ts";
 import { useHealthStore } from "@/stores/health.ts";
 import { useModelsStore } from "@/stores/models.ts";
+import { setupApi } from "@/api/setup.ts";
+import { desktopApi } from "@/api/desktop.ts";
 import { ModelPicker } from "@/components/models/ModelPicker.tsx";
+import { StatusFix, type FixTarget } from "./StatusFix.tsx";
 import styles from "./Nav.module.css";
 
 const TABS: Array<{ id: Page; label: string }> = [
@@ -25,6 +29,7 @@ const WHISPER_SPEED_LABEL: Record<string, string> = {
 export function Nav() {
 	const currentPage = useUIStore((s) => s.currentPage);
 	const setPage = useUIStore((s) => s.setPage);
+	const showToast = useUIStore((s) => s.showToast);
 	const health = useHealthStore((s) => s.health);
 	const checkHealth = useHealthStore((s) => s.check);
 	const modelsData = useModelsStore((s) => s.data);
@@ -33,12 +38,50 @@ export function Nav() {
 	const openPicker = useModelsStore((s) => s.openPicker);
 	const closePicker = useModelsStore((s) => s.closePicker);
 
-	useEffect(() => {
+	// Setup granularity (installed vs running) so a down badge knows whether to offer Install or Start.
+	const [setup, setSetup] = useState<SetupCheckResult | null>(null);
+	// Which badge's QuickFix popover is open (null = none).
+	const [fixOpen, setFixOpen] = useState<FixTarget | null>(null);
+	// Until the first health poll resolves, show a neutral gray dot instead of a false red.
+	const [healthLoaded, setHealthLoaded] = useState(false);
+
+	const refreshSetup = useCallback(async () => {
+		try {
+			setSetup(await setupApi.check());
+		} catch {
+			// server down / not reachable — leave last known state
+		}
+	}, []);
+
+	const onFixed = useCallback(() => {
 		checkHealth();
+		refreshSetup();
+	}, [checkHealth, refreshSetup]);
+
+	// Open the floating desktop panel — a standalone Chrome window that floats over Zoom/Meet.
+	const openFloat = useCallback(async () => {
+		showToast("Opening floating panel…");
+		try {
+			const res = await desktopApi.float();
+			if (!res.ok && res.error) showToast(res.error);
+		} catch {
+			showToast("Could not open floating panel");
+		}
+	}, [showToast]);
+
+	useEffect(() => {
+		checkHealth().then(() => setHealthLoaded(true));
 		loadModels();
-		const id = setInterval(checkHealth, 60000);
+		refreshSetup();
+		const id = setInterval(() => {
+			checkHealth();
+			refreshSetup();
+		}, 60000);
 		return () => clearInterval(id);
-	}, [checkHealth, loadModels]);
+	}, [checkHealth, loadModels, refreshSetup]);
+
+	// Gray while loading, then green/red. Down badges are clickable → open the QuickFix popover.
+	const dotClass = (ok: boolean) => `${styles.dot} ${!healthLoaded ? "" : ok ? styles.dotOk : styles.dotErr}`;
 
 	const currentModel = modelsData?.models.find((m) => m.id === modelsData.current?.id);
 	const isCpuOnly = modelsData?.current?.num_gpu === 0;
@@ -79,6 +122,15 @@ export function Nav() {
 				<div className={styles.rightBlock}>
 					<div className={styles.status}>
 						<button
+							className={styles.floatChip}
+							onClick={openFloat}
+							title="Open the floating panel — a small always-on-top window that floats over your Zoom/Meet calls"
+							aria-label="Open floating panel"
+						>
+							<span className={styles.floatChipIcon} aria-hidden="true">⧉</span>
+							<span className={styles.floatChipLabel}>Float</span>
+						</button>
+						<button
 							className={styles.modelChip}
 							onClick={() => openPicker()}
 							title="Click to switch AI model"
@@ -93,11 +145,13 @@ export function Nav() {
 							<span className={styles.modelChipChevron} aria-hidden="true">⌄</span>
 						</button>
 						<div
-							className={`${styles.statusItem} ${styles.statusItemInfo}`}
+							className={`${styles.statusItem} ${styles.statusItemInfo} ${healthLoaded && !health.ollama ? styles.statusItemDown : ""}`}
 							tabIndex={0}
+							role={healthLoaded && !health.ollama ? "button" : undefined}
 							aria-label="Local notes engine (Ollama)"
+							onClick={healthLoaded && !health.ollama ? () => setFixOpen("ollama") : undefined}
 						>
-							<div className={`${styles.dot} ${health.ollama ? styles.dotOk : styles.dotErr}`} />
+							<div className={dotClass(health.ollama)} />
 							<span className={styles.label}>ollama</span>
 							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
 							<div className={styles.infoTooltip} role="tooltip">
@@ -111,11 +165,13 @@ export function Nav() {
 							</div>
 						</div>
 						<div
-							className={`${styles.statusItem} ${styles.statusItemInfo}`}
+							className={`${styles.statusItem} ${styles.statusItemInfo} ${healthLoaded && !health.whisper ? styles.statusItemDown : ""}`}
 							tabIndex={0}
+							role={healthLoaded && !health.whisper ? "button" : undefined}
 							aria-label="Transcription engine details"
+							onClick={healthLoaded && !health.whisper ? () => setFixOpen("engine") : undefined}
 						>
-							<div className={`${styles.dot} ${health.whisper ? styles.dotOk : styles.dotErr}`} />
+							<div className={dotClass(health.whisper)} />
 							<span className={styles.label}>{engineLabel}</span>
 							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
 							<div className={styles.infoTooltip} role="tooltip">
@@ -143,11 +199,13 @@ export function Nav() {
 							</div>
 						</div>
 						<div
-							className={`${styles.statusItem} ${styles.statusItemInfo}`}
+							className={`${styles.statusItem} ${styles.statusItemInfo} ${healthLoaded && !health.pyannote ? styles.statusItemDown : ""}`}
 							tabIndex={0}
+							role={healthLoaded && !health.pyannote ? "button" : undefined}
 							aria-label="Speaker diarization details"
+							onClick={healthLoaded && !health.pyannote ? () => setFixOpen("diar") : undefined}
 						>
-							<div className={`${styles.dot} ${health.pyannote ? styles.dotOk : styles.dotErr}`} />
+							<div className={dotClass(health.pyannote)} />
 							<span className={styles.label}>{diarLabel}</span>
 							<span className={styles.statusItemChevron} aria-hidden="true">⌄</span>
 							<div className={styles.infoTooltip} role="tooltip">
@@ -175,6 +233,14 @@ export function Nav() {
 								<div className={styles.infoTooltipReason}>{pyannoteInfo?.reason || "Tuning based on available hardware."}</div>
 							</div>
 						</div>
+						{fixOpen && (
+							<StatusFix
+								target={fixOpen}
+								setup={setup}
+								onClose={() => setFixOpen(null)}
+								onFixed={onFixed}
+							/>
+						)}
 					</div>
 				</div>
 			</div>

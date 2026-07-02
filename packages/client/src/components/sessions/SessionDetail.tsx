@@ -5,10 +5,12 @@ import { useTemplatesStore } from "@/stores/templates.ts";
 import { useModelsStore } from "@/stores/models.ts";
 import { useUIStore } from "@/stores/ui.ts";
 import { generateNotes } from "@/api/notes.ts";
-import { fmtDate, fmtDuration } from "@/lib/format.ts";
+import { fmtDate, fmtDuration, cpuFallbackWarning, estimateNotesSeconds } from "@/lib/format.ts";
 import { Tabs } from "@/components/shared/Tabs.tsx";
 import { SpeakerView } from "@/components/speakers/SpeakerView.tsx";
 import { NotesView } from "@/components/ai-notes/NotesView.tsx";
+import { NotesHardwareHint } from "@/components/ai-notes/NotesHardwareHint.tsx";
+import { Spinner } from "@/components/shared/Spinner.tsx";
 import { TitleInput } from "./TitleInput.tsx";
 import styles from "./SessionDetail.module.css";
 
@@ -162,10 +164,14 @@ export function SessionDetail({ session, onBack }: Props) {
 				/>
 			)}
 
+			{activeTab === "notes" && fitsGpu && !generating && (
+				<NotesHardwareHint model={currentModel} modelsData={modelsData} fitsGpu={fitsGpu} />
+			)}
+
 			{activeTab === "notes" && !fitsGpu && !generating && (
 				<div className={styles.gpuWarn}>
 					<span className={styles.gpuWarnText}>
-						{currentModel?.name || "Current model"} doesn't fit in your GPU right now. It will run on CPU (~3-4x slower).
+						{cpuFallbackWarning(currentModel?.name, modelsData?.gpu_name)}
 					</span>
 				</div>
 			)}
@@ -188,11 +194,11 @@ export function SessionDetail({ session, onBack }: Props) {
 						</select>
 						{fitsGpu ? (
 							<button className={styles.btn} onClick={() => handleGenerate(false)} disabled={generating}>
-								{generating ? "Generating..." : "Generate AI notes"}
+								{generating ? <><Spinner />Generating…</> : `Generate AI notes · ~${estimateNotesSeconds(currentModel?.vram_mb, true)}s`}
 							</button>
 						) : (
 							<button className={styles.btnCpu} onClick={() => handleGenerate(true)} disabled={generating}>
-								{generating ? "Generating on CPU..." : "Generate on CPU"}
+								{generating ? <><Spinner />Generating on CPU…</> : `Generate on CPU · ~${estimateNotesSeconds(currentModel?.vram_mb, false)}s`}
 							</button>
 						)}
 					</>

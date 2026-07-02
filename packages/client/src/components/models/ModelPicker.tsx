@@ -4,6 +4,7 @@ import type { CatalogModel, PullProgress } from "@heed/shared";
 import { useModelsStore } from "@/stores/models.ts";
 import { useUIStore } from "@/stores/ui.ts";
 import { modelsApi } from "@/api/models.ts";
+import { memoryWord } from "@/lib/format.ts";
 import styles from "./ModelPicker.module.css";
 
 interface Props {
@@ -118,7 +119,7 @@ export function ModelPicker({ open, onClose }: Props) {
 					<span>·</span>
 					<span title="Download size">{fmtMb(m.size_mb)} download</span>
 					<span>·</span>
-					<span title="VRAM when loaded">{m.vram_mb === 0 ? "CPU only" : `${fmtMb(m.vram_mb)} VRAM`}</span>
+					<span title={`${memoryWord(data?.gpu_name)} when loaded`}>{m.vram_mb === 0 ? "CPU only" : `${fmtMb(m.vram_mb)} ${memoryWord(data?.gpu_name)}`}</span>
 				</div>
 				<div className={styles.tags}>
 					<span className={`${styles.tag} ${styles[`q_${m.quality}`]}`}>{QUALITY_LABEL[m.quality]}</span>
@@ -157,7 +158,7 @@ export function ModelPicker({ open, onClose }: Props) {
 						<h2 className={styles.title}>Pick your AI model</h2>
 						<p className={styles.subtitle}>
 							{data?.gpu_name
-								? `${data.gpu_name} · ${fmtMb(data.total_vram_mb)} VRAM · ${fmtMb(data.free_vram_mb)} free · tier ${data.tier}`
+								? `${data.gpu_name} · ${fmtMb(data.total_vram_mb)} ${memoryWord(data.gpu_name)} · ${fmtMb(data.free_vram_mb)} free · tier ${data.tier}`
 								: "Detecting hardware..."}
 						</p>
 					</div>
@@ -178,7 +179,9 @@ export function ModelPicker({ open, onClose }: Props) {
 						<div className={styles.section}>
 							CPU only on your hardware
 							<span className={styles.sectionHint}>
-								(slower, but won't crash diarization — keeps {fmtMb(data.pyannote_reserve_mb)} VRAM free for speaker diarization)
+								{data.pyannote_reserve_mb > 0
+									? `(slower, but won't crash diarization — keeps ${fmtMb(data.pyannote_reserve_mb)} VRAM free for speaker diarization)`
+									: `(slower — these models are larger than your ${data.gpu_name || "hardware"} runs comfortably)`}
 							</span>
 						</div>
 						<div className={styles.grid}>{grouped.cpu.map(renderModel)}</div>

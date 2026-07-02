@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import type { CatalogModel, InstallProgress, PullProgress, SetupCheckResult } from "@heed/shared";
 import { setupApi } from "@/api/setup.ts";
 import { modelsApi } from "@/api/models.ts";
+import { memoryWord } from "@/lib/format.ts";
 import { useModelsStore } from "@/stores/models.ts";
 import { useSetup } from "@/hooks/useSetup.ts";
 import { useUIStore } from "@/stores/ui.ts";
@@ -334,7 +335,7 @@ function StepModel({ check, locale, onComplete, forced, onFinish }: StepModelPro
 					{!m.gpu_compatible && <span className={styles.modelCpuBadge}>CPU</span>}
 				</div>
 				<div className={styles.modelMeta}>
-					{m.vendor} · {fmtMb(m.size_mb)} · {m.gpu_compatible ? `${fmtMb(m.vram_mb)} VRAM` : "CPU"}
+					{m.vendor} · {fmtMb(m.size_mb)} · {m.gpu_compatible ? `${fmtMb(m.vram_mb)} ${memoryWord(modelsData?.gpu_name)}` : "CPU"}
 				</div>
 				{m.description && <div className={styles.modelDesc}>{m.description}</div>}
 				{showRuntimeWarn && (
@@ -387,7 +388,7 @@ function StepModel({ check, locale, onComplete, forced, onFinish }: StepModelPro
 					{modelsData.gpu_available ? (
 						<>
 							<div className={styles.hardwareName}>
-								{modelsData.gpu_name} · {totalGb} GB VRAM
+								{modelsData.gpu_name} · {totalGb} GB {memoryWord(modelsData.gpu_name)}
 								<span className={styles.hardwareFree}> ({freeGb} GB free now)</span>
 							</div>
 							<div className={styles.hardwareExplain}>

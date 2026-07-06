@@ -82,6 +82,8 @@ diarize_pipeline = None
 diarize_backend = None
 models_ready = {"whisper": False, "pyannote": False}
 models_warm = False  # True once the live ASR + diarization are pre-warmed (first record is instant)
+load_error = None  # actionable message if model loading failed fatally — surfaced in /health so the UI
+                   # and `doctor` can tell the user what to do instead of an eternal silent "ready:false".
 
 # --- Live mic echo gate (Layer 1 of echo handling) ---
 # When YOU aren't really talking, the mic only carries faint LEAKAGE of the system audio (measured
@@ -2356,6 +2358,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pyannote_info": pyannote_runtime_info,
                 "live_tuning": live_tuning,
                 "languages": _language_support(),
+                "load_error": load_error,
             })
         elif self.path == "/voices":
             self._json({"voices": list(load_voices().keys())})
@@ -2813,9 +2816,29 @@ class Handler(BaseHTTPRequestHandler):
         })
 
 
+def _load_models_guarded():
+    """Run load_models but NEVER let the loader thread die silently. On a fatal failure, record an
+    actionable reason in `load_error` (exposed by /health) so the UI and `doctor` can guide the user
+    instead of leaving them staring at a permanent 'ready:false'."""
+    global load_error
+    try:
+        load_models()
+    except Exception as e:
+        import traceback
+        msg = str(e)
+        if any(s in msg for s in ("no whisper model could be loaded", "faster_whisper", "No module named")):
+            load_error = ("No transcription engine is available. On Apple Silicon build the Parakeet "
+                          "sidecar (needs Xcode: run `xcode-select --install` then `npx create-heed`), "
+                          "or install the fallback engine: `npx create-heed fallback`.")
+        else:
+            load_error = f"Model loading failed: {msg[:200]}"
+        print(f"[heed] FATAL load_models: {msg}", flush=True)
+        traceback.print_exc()
+
+
 if __name__ == "__main__":
     # Load models in background
-    loader = threading.Thread(target=load_models, daemon=True)
+    loader = threading.Thread(target=_load_models_guarded, daemon=True)
     loader.start()
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

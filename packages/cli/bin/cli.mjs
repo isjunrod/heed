@@ -129,6 +129,20 @@ function run(command, label) {
 	}
 }
 
+// Bring the managed install in sync with origin/main, self-healing from a diverged or REWRITTEN
+// upstream history (e.g. after a maintainer force-push). A plain `git pull` fails hard on divergence
+// and leaves the user on stale code — the exact way an existing clone breaks after history is rewritten.
+// The install dir holds heed's OWN code (user data lives in ~/.heed-app), so realigning it to the
+// remote is safe: fast-forward when we cleanly can, otherwise hard-reset to origin/main.
+function syncRepoToMain(dir) {
+	if (!cmd(`cd "${dir}" && git fetch origin main 2>&1`)) cmd(`cd "${dir}" && git fetch origin 2>&1`);
+	// HEAD is an ancestor of origin/main → a clean fast-forward is possible (prudent: no reset needed).
+	const canFF = cmd(`cd "${dir}" && git merge-base --is-ancestor HEAD origin/main && echo ok`) === "ok";
+	if (canFF && run(`cd "${dir}" && git merge --ff-only origin/main`, "Updated")) return;
+	if (!canFF) warn("Local copy diverged from upstream (history was rewritten) — realigning to latest.");
+	run(`cd "${dir}" && git reset --hard origin/main`, "Realigned to latest");
+}
+
 // Poll the transcription server's /health until it reports ready (models loaded), or time out. Used
 // to open the UI exactly when heed is usable — no arbitrary sleep that opens a dead page or waits too long.
 async function waitForHealth(timeoutMs = 90000) {
@@ -292,7 +306,7 @@ async function main() {
 	if (existsSync(targetDir)) {
 		ok(`heed already exists at ${targetDir}`);
 		info("Pulling latest changes...");
-		run(`cd "${targetDir}" && git pull`, "Updated");
+		syncRepoToMain(targetDir);
 	} else {
 		info("Cloning from GitHub...");
 		run(`git clone https://github.com/isjunrod/heed.git "${targetDir}"`, "Downloaded");
@@ -559,34 +573,28 @@ async function update() {
 		}
 	}
 
-	const behind = cmd(`cd "${heedDir}" && git rev-list --count HEAD..origin/main`) || "0";
-	if (behind === "0") {
+	// Compare by hash — works even if upstream history was REWRITTEN (where HEAD..origin/main is meaningless).
+	const localFull = cmd(`cd "${heedDir}" && git rev-parse HEAD`);
+	const remoteFull = cmd(`cd "${heedDir}" && git rev-parse origin/main`);
+	if (localFull && remoteFull && localFull === remoteFull) {
 		ok("Already up to date!");
 		process.exit(0);
 	}
 
-	info(`${C.bold}${behind}${C.reset} new commit(s) available`);
-
-	// Show changelog
-	const changelog = cmd(`cd "${heedDir}" && git log --oneline HEAD..origin/main`);
+	// Show a changelog only for a clean fast-forward (a rewritten/diverged history has no linear log to show).
+	const changelog = cmd(`cd "${heedDir}" && git merge-base --is-ancestor HEAD origin/main && git log --oneline HEAD..origin/main`);
 	if (changelog) {
 		log("");
-		changelog.split("\n").forEach((line) => {
-			log(`  ${C.dim}${line}${C.reset}`);
-		});
+		changelog.split("\n").forEach((line) => log(`  ${C.dim}${line}${C.reset}`));
 		log("");
 	}
 
-	// Pull
+	// Sync — fast-forward when possible, else self-heal a diverged/rewritten history (no confusing pull error).
 	info("Downloading updates...");
-	if (!cmd(`cd "${heedDir}" && git pull origin main`)) {
-		err("Pull failed. You may have local changes.");
-		warn(`Run: cd "${heedDir}" && git stash && npx create-heed update && git stash pop`);
-		process.exit(1);
-	}
+	syncRepoToMain(heedDir);
 
-	// Check what changed
-	const diffFiles = cmd(`cd "${heedDir}" && git diff --name-only HEAD~${behind} HEAD`) || "";
+	// Check what changed (diff the pre-update commit against the new HEAD — safe across a history rewrite).
+	const diffFiles = cmd(`cd "${heedDir}" && git diff --name-only ${currentHash} HEAD`) || "";
 
 	if (diffFiles.includes("package.json") || diffFiles.includes("bun.lock")) {
 		info("Dependencies changed, installing...");
@@ -625,7 +633,7 @@ async function update() {
 
 	const newHash = cmd(`cd "${heedDir}" && git rev-parse --short HEAD`);
 	log("");
-	ok(`Updated! ${C.dim}${currentHash}${C.reset} → ${C.bold}${newHash}${C.reset} (${behind} commits)`);
+	ok(`Updated! ${C.dim}${currentHash}${C.reset} → ${C.bold}${newHash}${C.reset}`);
 	log(`  ${C.dim}Restart heed to apply: ${C.reset}${C.bold}cd "${heedDir}" && bun run dev${C.reset}`);
 	log("");
 }

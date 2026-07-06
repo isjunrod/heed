@@ -1,8 +1,32 @@
 # create-heed
 
-One-command installer for [heed](https://github.com/isjunrod/heed) — local-first meeting transcription with real speaker diarization.
+One command to install [**heed**](https://github.com/isjunrod/heed) — local-first meeting transcription with real speaker diarization. Built for Apple Silicon, running on Linux too.
 
-Your audio never leaves your machine. Ever.
+```bash
+npx create-heed
+```
+
+**Your audio never leaves your machine. Ever.** No API keys, no cloud, no subscription.
+
+---
+
+## Why heed
+
+Every other meeting tool ships your conversations to someone else's servers. heed doesn't. It transcribes, separates every voice, and writes AI notes **entirely on your computer** — so your work calls (NDAs, client data, strategy) and your private ones stay yours.
+
+- **100% local & private** — transcription, diarization, and AI notes all run on-device. Nothing is uploaded.
+- **Real-time _and_ post-stop** — live captions as people talk, plus a precise re-pass with real timestamps when you stop.
+- **Real speaker diarization** — tells people apart by how they *sound*, not by login name — even on a single mic.
+- **Voice memory** — name a speaker once; heed recognizes their voice in every future meeting.
+- **Overlap detection** — catches two people talking at once instead of blending them into one line.
+- **Floating panel** — an always-on-top window over Zoom, Meet, Teams, or Discord.
+- **AI notes** — summaries and action items via a local LLM (Ollama), sized to your hardware.
+
+## The engine
+
+- **macOS (Apple Silicon)** — **Parakeet** ASR + **FluidAudio** diarization run on the **Apple Neural Engine** via CoreML. No CUDA, no gated tokens, ~50× real-time. This is heed's fastest, most accurate path.
+- **Linux** — faster-whisper + pyannote on CUDA (or CPU). Supported and actively evolving.
+- **Windows** — coming.
 
 ## Install
 
@@ -10,7 +34,7 @@ Your audio never leaves your machine. Ever.
 npx create-heed
 ```
 
-The installer detects your OS, checks dependencies (Bun, Python, ffmpeg, Ollama), and walks you through each step.
+The installer detects your machine and sets everything up: Bun, a supported Python, ffmpeg, the on-device AI engine, and (optionally) Ollama for AI notes. One command, no config. Then heed opens on `http://localhost:5170`.
 
 ## Update
 
@@ -18,18 +42,17 @@ The installer detects your OS, checks dependencies (Bun, Python, ffmpeg, Ollama)
 npx create-heed update
 ```
 
-Only downloads what changed. Auto-reinstalls dependencies if needed.
+Pulls the latest, syncs dependencies, and rebuilds the engine only if it changed.
 
-## What is heed?
+## Troubleshooting
 
-Self-hosted meeting transcription that works on top of Zoom, Meet, Teams, Discord — without anyone knowing.
+```bash
+npx create-heed doctor     # check your install end-to-end
+npx create-heed fallback   # install the fallback engine if the fast one isn't available
+```
 
-- **100% local** — Whisper, pyannote, and Ollama run on your machine. No API keys. No subscriptions.
-- **Real speaker diarization** — Identifies people by how they sound, not by login name.
-- **Voice memory** — Rename a speaker once, heed remembers their voice forever.
-- **Channel-based overlap detection** — Detects when two people speak at once.
-- **Hardware-aware** — Auto-picks the best AI model for your GPU/CPU.
+---
 
-Linux + macOS. Open source. MIT license.
+Local. Open. Yours. · MIT · Inspired by [trx](https://github.com/crafter-station/trx) from [CrafterStation](https://www.crafterstation.com/)
 
-[GitHub](https://github.com/isjunrod/heed) | [Report issues](https://github.com/isjunrod/heed/issues)
+[GitHub](https://github.com/isjunrod/heed) · [Report an issue](https://github.com/isjunrod/heed/issues)
